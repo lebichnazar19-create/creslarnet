@@ -286,26 +286,34 @@ html, body {
   backdrop-filter: blur(6px);
 }
 
-/* ---------- floating axis dimension tags ---------- */
-.axis-tag {
+/* ---------- engineering-style dimension lines on the selected object ---------- */
+.dimension-overlay {
   position: fixed;
-  top: 0;
-  left: 0;
-  transform: translate(-50%, -50%);
+  inset: 0;
+  width: 100%;
+  height: 100%;
   z-index: 16;
+  pointer-events: none;
+}
+.dim-group.hidden { display: none; }
+.dim-line { stroke-width: 1.5; }
+.dim-line-x { stroke: #d83e3e; }
+.dim-line-y { stroke: #3aa85a; }
+.dim-line-z { stroke: #3a6cd8; }
+.dim-text {
   font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 11px;
   font-weight: 700;
-  padding: 2px 6px;
-  border-radius: 6px;
-  color: #fff;
-  pointer-events: none;
-  white-space: nowrap;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  paint-order: stroke;
+  stroke: rgba(20, 18, 26, 0.85);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  text-anchor: middle;
+  dominant-baseline: middle;
 }
-.axis-tag-x { background: rgba(216, 62, 62, 0.88); }
-.axis-tag-y { background: rgba(58, 168, 90, 0.88); }
-.axis-tag-z { background: rgba(58, 108, 216, 0.88); }
+.dim-text-x { fill: #ff8f8f; }
+.dim-text-y { fill: #7be09a; }
+.dim-text-z { fill: #8fb4ff; }
 
 /* ---------- object dimension readout ---------- */
 .dim-readout {

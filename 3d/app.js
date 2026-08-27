@@ -547,8 +547,23 @@ function select(record) {
   if (selected === record) return;
   deselect();
   selected = record;
-  outlineHelper = new THREE.BoxHelper(record.root, 0x8338ec);
-  scene.add(outlineHelper);
+
+  if (record.kind === 'ground') {
+    // no outline on an 80 m plane — a box around it isn't useful
+  } else if (record.kind === 'window') {
+    // a window really is boxy — BoxHelper is the honest shape for it
+    outlineHelper = new THREE.BoxHelper(record.root, 0x8338ec);
+    scene.add(outlineHelper);
+  } else if (record.root.isMesh) {
+    // Hugs the object's own silhouette (round for a cylinder, sharp for a
+    // cube) instead of always drawing a box — geometry edges beyond a small
+    // angle threshold, added as a child so it tracks transform for free.
+    const edges = new THREE.EdgesGeometry(record.root.geometry, 10);
+    outlineHelper = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x8338ec }));
+    outlineHelper.update = () => {}; // no-op — kept so existing outlineHelper?.update() call sites stay valid
+    record.root.add(outlineHelper);
+  }
+
   if (record.kind !== 'ground' && record.kind !== 'sketchLine') {
     axesHelper = new THREE.AxesHelper(axisGizmoLocalSize(record));
     record.root.add(axesHelper); // child — tracks position/rotation/scale for free
@@ -558,9 +573,14 @@ function select(record) {
 }
 
 function deselect() {
-  if (outlineHelper) { scene.remove(outlineHelper); outlineHelper = null; }
+  if (outlineHelper) {
+    outlineHelper.parent?.remove(outlineHelper);
+    outlineHelper.geometry?.dispose();
+    outlineHelper.material?.dispose();
+    outlineHelper = null;
+  }
   if (axesHelper) { axesHelper.parent?.remove(axesHelper); axesHelper = null; }
-  hideEl(axisLabelEls.x); hideEl(axisLabelEls.y); hideEl(axisLabelEls.z);
+  hideDimensionOverlay();
   selected = null;
   holeToolActive = false;
   moveMode = false;
@@ -603,21 +623,26 @@ function axisGizmoLocalSize(record) {
 }
 
 // ---------------------------------------------------------------------------
-// Live-updated "N mm" tags hovering at the tip of each axis of the selected
-// object's own local frame — the on-screen answer to "what does this axis
-// mean". Uses the object's actual local bounding box (not an assumed
-// centre) so it's correct even for a merged object whose geometry isn't
-// centred at its own origin.
+// Live-updated engineering-style dimension lines — an arrow-to-arrow line
+// spanning the selected object's actual X/Y/Z extent (e.g. one side of a
+// cylinder to the other for its diameter), with the mm value labelled
+// alongside, drawn as SVG so real arrowheads are free. Uses the object's
+// actual local bounding box (not an assumed centre) so it's correct even
+// for a merged object whose geometry isn't centred at its own origin.
 // ---------------------------------------------------------------------------
-const axisLabelEls = {
-  x: document.getElementById('axisLabelX'),
-  y: document.getElementById('axisLabelY'),
-  z: document.getElementById('axisLabelZ'),
+const dimGroups = {
+  x: { g: document.getElementById('dimGroupX'), line: document.querySelector('#dimGroupX .dim-line'), text: document.querySelector('#dimGroupX .dim-text') },
+  y: { g: document.getElementById('dimGroupY'), line: document.querySelector('#dimGroupY .dim-line'), text: document.querySelector('#dimGroupY .dim-text') },
+  z: { g: document.getElementById('dimGroupZ'), line: document.querySelector('#dimGroupZ .dim-line'), text: document.querySelector('#dimGroupZ .dim-text') },
 };
+
+function hideDimensionOverlay() {
+  for (const axis of ['x', 'y', 'z']) dimGroups[axis].g.classList.add('hidden');
+}
 
 function updateAxisLabels() {
   if (!selected || selected.kind === 'ground' || selected.kind === 'sketchLine' || mode !== 'edit') {
-    hideEl(axisLabelEls.x); hideEl(axisLabelEls.y); hideEl(axisLabelEls.z);
+    hideDimensionOverlay();
     return;
   }
   const root = selected.root;
@@ -634,22 +659,35 @@ function updateAxisLabels() {
     sizeMm = root.geometry.boundingBox.getSize(new THREE.Vector3()).multiply(root.scale);
   }
   const localCenter = localMin.clone().add(localMax).multiplyScalar(0.5);
-  const tips = {
-    x: new THREE.Vector3(localMax.x, localCenter.y, localCenter.z),
-    y: new THREE.Vector3(localCenter.x, localMax.y, localCenter.z),
-    z: new THREE.Vector3(localCenter.x, localCenter.y, localMax.z),
+  // one arrow-to-arrow span per axis, running edge-to-edge through the centre
+  const ends = {
+    x: [new THREE.Vector3(localMin.x, localCenter.y, localCenter.z), new THREE.Vector3(localMax.x, localCenter.y, localCenter.z)],
+    y: [new THREE.Vector3(localCenter.x, localMin.y, localCenter.z), new THREE.Vector3(localCenter.x, localMax.y, localCenter.z)],
+    z: [new THREE.Vector3(localCenter.x, localCenter.y, localMin.z), new THREE.Vector3(localCenter.x, localCenter.y, localMax.z)],
   };
-  const texts = { x: `X: ${formatMm(sizeMm.x)} мм`, y: `Y: ${formatMm(sizeMm.y)} мм`, z: `Z: ${formatMm(sizeMm.z)} мм` };
+  const texts = { x: `${formatMm(sizeMm.x)} мм`, y: `${formatMm(sizeMm.y)} мм`, z: `${formatMm(sizeMm.z)} мм` };
+
+  const toScreen = (v) => {
+    const ndc = v.clone().applyMatrix4(root.matrixWorld).project(camera);
+    return { x: (ndc.x * 0.5 + 0.5) * window.innerWidth, y: (-ndc.y * 0.5 + 0.5) * window.innerHeight, behind: ndc.z < -1 || ndc.z > 1 };
+  };
 
   for (const axis of ['x', 'y', 'z']) {
-    const worldTip = tips[axis].clone().applyMatrix4(root.matrixWorld);
-    const ndc = worldTip.project(camera);
-    const el = axisLabelEls[axis];
-    if (ndc.z < -1 || ndc.z > 1 || ndc.x < -1.2 || ndc.x > 1.2 || ndc.y < -1.2 || ndc.y > 1.2) { hideEl(el); continue; }
-    el.style.left = `${(ndc.x * 0.5 + 0.5) * window.innerWidth}px`;
-    el.style.top = `${(-ndc.y * 0.5 + 0.5) * window.innerHeight}px`;
-    el.textContent = texts[axis];
-    showEl(el);
+    const [aLocal, bLocal] = ends[axis];
+    const a = toScreen(aLocal), b = toScreen(bLocal);
+    const { g, line, text } = dimGroups[axis];
+    if (a.behind || b.behind || Math.hypot(a.x - b.x, a.y - b.y) < 6) { g.classList.add('hidden'); continue; }
+    line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
+    line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+    // offset the label a little off the line itself so it doesn't sit on top of the arrow shaft
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len; // perpendicular unit vector
+    text.setAttribute('x', mx + nx * 12);
+    text.setAttribute('y', my + ny * 12);
+    text.textContent = texts[axis];
+    g.classList.remove('hidden');
   }
 }
 

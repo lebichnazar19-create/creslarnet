@@ -43,10 +43,33 @@
     <span id="scaleBarLabel" class="scale-bar-label">—</span>
   </div>
 
-  <!-- Live "N mm" tags at the tip of the selected object's own X/Y/Z axes -->
-  <div id="axisLabelX" class="axis-tag axis-tag-x hidden"></div>
-  <div id="axisLabelY" class="axis-tag axis-tag-y hidden"></div>
-  <div id="axisLabelZ" class="axis-tag axis-tag-z hidden"></div>
+  <!-- Engineering-style dimension lines (arrow-to-arrow + mm label) spanning
+       the selected object's own X/Y/Z extents -->
+  <svg id="dimensionOverlay" class="dimension-overlay">
+    <defs>
+      <marker id="dimArrowX" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#d83e3e"></path>
+      </marker>
+      <marker id="dimArrowY" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#3aa85a"></path>
+      </marker>
+      <marker id="dimArrowZ" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#3a6cd8"></path>
+      </marker>
+    </defs>
+    <g id="dimGroupX" class="dim-group hidden">
+      <line class="dim-line dim-line-x" marker-start="url(#dimArrowX)" marker-end="url(#dimArrowX)"></line>
+      <text class="dim-text dim-text-x"></text>
+    </g>
+    <g id="dimGroupY" class="dim-group hidden">
+      <line class="dim-line dim-line-y" marker-start="url(#dimArrowY)" marker-end="url(#dimArrowY)"></line>
+      <text class="dim-text dim-text-y"></text>
+    </g>
+    <g id="dimGroupZ" class="dim-group hidden">
+      <line class="dim-line dim-line-z" marker-start="url(#dimArrowZ)" marker-end="url(#dimArrowZ)"></line>
+      <text class="dim-text dim-text-z"></text>
+    </g>
+  </svg>
 
   <!-- Selection contextual panel (shown when an object is picked) -->
   <div id="selectionPanel" class="panel selection-panel hidden"></div>
