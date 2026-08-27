@@ -191,10 +191,9 @@ let sketchLineColor = PALETTE[0];
 let drawStartWorld = null;
 
 // Free-camera navigation: one finger down free (not claimed by move/paper
-// drawing) looks around; the joystick or WASD/arrows move; two fingers
-// pinch-scale the selected object instead of the camera.
-let joyVec = { x: 0, y: 0 };
-let joyPointerId = null;
+// drawing) looks around; WASD/arrows move on desktop. Two fingers pinch —
+// resizes the selected object if one is picked, otherwise moves the camera
+// forward/back (spread apart = forward, pinch together = back).
 let lookPointerId = null;
 let lastLookX = 0, lastLookY = 0;
 let primaryPointerId = null;
@@ -1180,10 +1179,10 @@ function insertWindowAt(clientX, clientY) {
 // ---------------------------------------------------------------------------
 let downX = 0, downY = 0, downTime = 0;
 
-// Desktop bonus: the mouse wheel has no pinch to claim, so it flies the
-// camera forward/back along the view direction — scaled the same way the
-// joystick's fly speed is, so a tick feels equally fine-grained up close
-// or brisk out in the open.
+// Desktop bonus: the mouse wheel flies the camera forward/back along the
+// view direction, scaled by what's ahead so a tick feels equally
+// fine-grained up close or brisk out in the open (same idea as the
+// touch pinch-to-move gesture below).
 canvas.addEventListener('wheel', (e) => {
   if (mode !== 'edit' || moveMode || paperDrawing) return;
   e.preventDefault();
@@ -1218,9 +1217,10 @@ canvas.addEventListener('pointerdown', (e) => {
       lookPointerId = e.pointerId;
       lastLookX = e.clientX; lastLookY = e.clientY;
     }
-  } else if (activePointers.size === 2 && mode === 'edit' && selected && !moveMode && !paperDrawing) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing) {
     pinchStartDist = currentPinchDist();
-    pinchStartScale = selected.root.scale.clone();
+    // with something selected, pinch resizes it; otherwise it drives the camera
+    pinchStartScale = selected ? selected.root.scale.clone() : null;
     lookPointerId = null; // second finger arrived — hand off from look to pinch
   }
 });
@@ -1228,13 +1228,26 @@ canvas.addEventListener('pointerdown', (e) => {
 canvas.addEventListener('pointermove', (e) => {
   if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-  if (activePointers.size === 2 && pinchStartScale && selected) {
+  if (activePointers.size === 2 && !moveMode && !paperDrawing) {
     const dist = currentPinchDist();
-    if (pinchStartDist > 10) {
-      const ratio = Math.max(0.05, dist / pinchStartDist);
-      selected.root.scale.copy(pinchStartScale).multiplyScalar(ratio);
-      outlineHelper?.update();
-      refreshSizeInputs();
+    if (selected && pinchStartScale) {
+      if (pinchStartDist > 10) {
+        const ratio = Math.max(0.05, dist / pinchStartDist);
+        selected.root.scale.copy(pinchStartScale).multiplyScalar(ratio);
+        outlineHelper?.update();
+        refreshSizeInputs();
+      }
+    } else if (!selected && pinchStartDist > 0) {
+      // navigation pinch: spreading fingers apart moves forward, pinching
+      // together moves back — tracked incrementally so continuing the
+      // gesture keeps moving rather than saturating at one ratio
+      const delta = dist - pinchStartDist;
+      const dir = new THREE.Vector3();
+      camera.getWorldDirection(dir);
+      const refDist = forwardHitDistance();
+      camera.position.addScaledVector(dir, delta * refDist * 0.004);
+      if (mode === 'walk') camera.position.y = EYE_HEIGHT;
+      pinchStartDist = dist;
     }
     return;
   }
@@ -1260,7 +1273,7 @@ canvas.addEventListener('pointermove', (e) => {
 });
 
 function endPointer(e) {
-  const wasPinching = activePointers.size >= 2 && !!pinchStartScale;
+  const wasPinching = activePointers.size >= 2 && pinchStartDist > 0;
   activePointers.delete(e.pointerId);
   if (activePointers.size < 2) { pinchStartScale = null; pinchStartDist = 0; }
   if (lookPointerId === e.pointerId) lookPointerId = null;
@@ -1347,12 +1360,12 @@ function handleEditTap(x, y) {
 // ---------------------------------------------------------------------------
 // Free camera navigation — shared by edit mode (fly anywhere, build) and
 // walk mode (human eye-height tour, hidden UI). One finger not claimed by
-// move/paper-draw looks around; the joystick or WASD/arrows move.
+// move/paper-draw looks around; WASD/arrows move on desktop; on touch, a
+// two-finger pinch moves forward/back (spread = forward, pinch = back) —
+// the same gesture resizes the selected object instead when one is picked.
 // ---------------------------------------------------------------------------
 const walkExitBtn = document.getElementById('walkExit');
 const crosshairEl = document.getElementById('crosshair');
-const joystickEl = document.getElementById('joystick');
-const joystickNubEl = document.getElementById('joystickNub');
 const walkToggleBtn = document.getElementById('walkToggle');
 const resetViewBtn = document.getElementById('resetViewBtn');
 
@@ -1391,32 +1404,6 @@ function exitWalkMode() {
 walkToggleBtn.addEventListener('click', () => { mode === 'walk' ? exitWalkMode() : enterWalkMode(); });
 walkExitBtn.addEventListener('click', exitWalkMode);
 
-joystickEl.addEventListener('pointerdown', (e) => {
-  joyPointerId = e.pointerId;
-  joystickEl.setPointerCapture(e.pointerId);
-  updateJoystick(e);
-});
-joystickEl.addEventListener('pointermove', (e) => { if (e.pointerId === joyPointerId) updateJoystick(e); });
-function endJoystick(e) {
-  if (e.pointerId !== joyPointerId) return;
-  joyPointerId = null;
-  joyVec = { x: 0, y: 0 };
-  joystickNubEl.style.transform = 'translate(0px, 0px)';
-}
-joystickEl.addEventListener('pointerup', endJoystick);
-joystickEl.addEventListener('pointercancel', endJoystick);
-
-function updateJoystick(e) {
-  const rect = joystickEl.getBoundingClientRect();
-  const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
-  const r = rect.width / 2;
-  let dx = e.clientX - cx, dy = e.clientY - cy;
-  const len = Math.hypot(dx, dy);
-  if (len > r) { dx = (dx / len) * r; dy = (dy / len) * r; }
-  joyVec = { x: dx / r, y: dy / r };
-  joystickNubEl.style.transform = `translate(${dx}px, ${dy}px)`;
-}
-
 function handleFreeLook(e) {
   const dx = e.clientX - lastLookX, dy = e.clientY - lastLookY;
   lastLookX = e.clientX; lastLookY = e.clientY;
@@ -1431,7 +1418,10 @@ function handleFreeLook(e) {
 function updateFreeCamera(dt, refDist) {
   camera.rotation.set(pitch, yaw, 0, 'YXZ');
 
-  let mx = joyVec.x, my = joyVec.y;
+  // On touch there is no strafe input any more (pinch only drives forward/
+  // back) — turn to face where you want to go, same as most simple 3D
+  // walkthroughs. Desktop keeps full WASD/arrow freedom.
+  let mx = 0, my = 0;
   if (keys.has('KeyW') || keys.has('ArrowUp')) my -= 1;
   if (keys.has('KeyS') || keys.has('ArrowDown')) my += 1;
   if (keys.has('KeyA') || keys.has('ArrowLeft')) mx -= 1;

@@ -441,31 +441,6 @@ html, body {
   backdrop-filter: blur(8px);
 }
 
-.joystick {
-  position: fixed;
-  left: max(18px, env(safe-area-inset-left));
-  bottom: max(28px, env(safe-area-inset-bottom));
-  z-index: 18;
-  width: 108px;
-  height: 108px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  touch-action: none;
-}
-
-.joystick-nub {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 46px;
-  height: 46px;
-  margin: -23px 0 0 -23px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.5);
-}
-
 @media (min-width: 720px) {
   .panel { width: 340px; }
 }
