@@ -21,8 +21,13 @@ const WINDOW_WIDTH = 1000;
 const WINDOW_HEIGHT = 1200;
 const EYE_HEIGHT = 1650;
 const WALK_SPEED = 3200; // mm / second (≈ a brisk walking pace)
+const PAPER_COLOR = '#f7f4ec'; // warm paper white, distinct from the neutral default object tint
 
-const KIND_LABELS = { cube: 'Куб', cylinder: 'Циліндр', pipe: 'Труба', sphere: 'Сфера', cone: 'Конус', wall: 'Стіна', window: 'Вікно' };
+const KIND_LABELS = {
+  cube: 'Куб', cylinder: 'Циліндр', pipe: 'Труба', sphere: 'Сфера', cone: 'Конус',
+  wall: 'Стіна', window: 'Вікно', paper: 'Папір', sketchLine: 'Лінія на папері',
+  rebar: 'Арматура', beam: 'Балка',
+};
 
 // Quantize to the coordinate system's stated resolution: 0.1 mm.
 const roundMm = (v) => Math.round(v * 10) / 10;
@@ -156,6 +161,10 @@ let holeToolActive = false;
 let holeRadius = 80; // mm
 let moveMode = false;
 let moveDragging = false;
+let paperDrawing = false;
+let paperDrawDragging = false;
+let sketchLineColor = PALETTE[0];
+let drawStartWorld = null;
 
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
@@ -247,6 +256,12 @@ function registerObject(kind, root, extra = {}) {
 }
 
 function removeObject(record) {
+  // Unconverted ink marks belong to their sheet — throw the paper away and
+  // they go with it. Already-converted rebar/pipe/beam are independent by
+  // then (registered under their own kind), so they're untouched.
+  if (record.kind === 'paper') {
+    objects.filter((r) => r.kind === 'sketchLine' && r.paperId === record.id).forEach(removeObject);
+  }
   scene.remove(record.root);
   record.root.traverse((o) => {
     if (o.isMesh) {
@@ -289,12 +304,14 @@ const KIND_DEFS = {
   cone: { build: () => ({ geometry: new THREE.ConeGeometry(500, 1000, 32), restY: 500 }) },
   cylinder: { build: () => ({ geometry: new THREE.CylinderGeometry(500, 500, 1000, 32), restY: 500 }) },
   pipe: { build: () => ({ geometry: buildPipeGeometry(), restY: 220, isPipe: true }) },
+  // A4-proportioned virtual sheet of paper — a drawing surface, not a solid prop.
+  paper: { build: () => ({ geometry: new THREE.BoxGeometry(210, 3, 297), restY: 1.5 }) },
 };
 
 function addObject(kind, point) {
   const def = KIND_DEFS[kind];
   const built = def.build();
-  const material = createPaintMaterial(DEFAULT_PAINT);
+  const material = createPaintMaterial(kind === 'paper' ? PAPER_COLOR : DEFAULT_PAINT);
   const mesh = new THREE.Mesh(built.geometry, material);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
@@ -316,6 +333,136 @@ function addWallSegment(p1, p2, color) {
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   return registerObject('wall', mesh, { wallLength: length });
+}
+
+// ---------------------------------------------------------------------------
+// Virtual paper — a flat sheet you draw ink lines on, each line later
+// convertible into a real 3D object (rebar / pipe / beam). Paper is always
+// placed upright like every other object, so a line drawn on it only ever
+// varies in world X/Z — the same box-between-two-points shape as a wall
+// segment covers it, just thin and flush with the sheet instead of tall.
+// ---------------------------------------------------------------------------
+const LINE_WIDTH = 4;   // mm, ink stroke width
+const LINE_HEIGHT = 1;  // mm, stroke thickness (sits just above the paper)
+const MIN_LINE_LENGTH = 3; // mm — ignore an accidental micro-tap
+
+function lineBoxGeometry(aWorld, bWorld) {
+  const dx = bWorld.x - aWorld.x, dz = bWorld.z - aWorld.z;
+  const length = Math.hypot(dx, dz);
+  return { length, rotationY: Math.atan2(-dz, dx) };
+}
+
+let previewLineMesh = null;
+function updatePreviewLine(aWorld, bWorld) {
+  clearPreviewLine();
+  const { length, rotationY } = lineBoxGeometry(aWorld, bWorld);
+  if (length < 1) return;
+  const geometry = new THREE.BoxGeometry(length, LINE_HEIGHT, LINE_WIDTH);
+  const material = new THREE.MeshBasicMaterial({ color: sketchLineColor, transparent: true, opacity: 0.75 });
+  previewLineMesh = new THREE.Mesh(geometry, material);
+  previewLineMesh.position.set((aWorld.x + bWorld.x) / 2, (aWorld.y + bWorld.y) / 2 + LINE_HEIGHT, (aWorld.z + bWorld.z) / 2);
+  previewLineMesh.rotation.y = rotationY;
+  scene.add(previewLineMesh);
+}
+function clearPreviewLine() {
+  if (!previewLineMesh) return;
+  scene.remove(previewLineMesh);
+  previewLineMesh.geometry.dispose();
+  previewLineMesh.material.dispose();
+  previewLineMesh = null;
+}
+
+function addSketchLine(paperRecord, aWorld, bWorld, color) {
+  const { length, rotationY } = lineBoxGeometry(aWorld, bWorld);
+  if (length < MIN_LINE_LENGTH) return null;
+  const geometry = new THREE.BoxGeometry(length, LINE_HEIGHT, LINE_WIDTH);
+  const material = createPaintMaterial(color);
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.position.set((aWorld.x + bWorld.x) / 2, (aWorld.y + bWorld.y) / 2 + LINE_HEIGHT, (aWorld.z + bWorld.z) / 2);
+  mesh.rotation.y = rotationY;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  return registerObject('sketchLine', mesh, {
+    paperId: paperRecord.id,
+    lineLength: length,
+    lineStart: aWorld.clone(),
+    lineEnd: bWorld.clone(),
+  });
+}
+
+// Converting a line into a solid: build geometry along local +X (matching
+// the pipe convention), then aim +X at the line's actual direction and drop
+// it at the midpoint — independent of the line's length or the paper's tilt.
+const CONVERT_DEFS = {
+  rebar: {
+    buildGeometry: (length) => { const g = new THREE.CylinderGeometry(6, 6, length, 12); g.rotateZ(Math.PI / 2); return g; },
+    buildMaterial: () => createMaterial('metal', undefined, scene.environment),
+    extra: {},
+  },
+  pipe: {
+    buildGeometry: (length) => buildPipeGeometry(70, 55, length, 16),
+    buildMaterial: () => createMaterial('metal', undefined, scene.environment),
+    extra: { isPipe: true },
+  },
+  beam: {
+    buildGeometry: (length) => new THREE.BoxGeometry(length, 100, 50),
+    buildMaterial: () => createMaterial('wood', undefined, scene.environment),
+    extra: {},
+  },
+};
+
+function convertSketchLine(record, targetKind) {
+  const def = CONVERT_DEFS[targetKind];
+  const a = record.lineStart, b = record.lineEnd;
+  const dir = new THREE.Vector3().subVectors(b, a);
+  const length = dir.length();
+  if (length < 1) { toast('Лінія замала для перетворення'); return; }
+  dir.normalize();
+
+  const geometry = def.buildGeometry(length);
+  const material = def.buildMaterial();
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir);
+  mesh.position.copy(a).add(b).multiplyScalar(0.5);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+
+  removeObject(record);
+  const newRecord = registerObject(targetKind, mesh, def.extra);
+  select(newRecord);
+  toast(`Перетворено на: ${KIND_LABELS[targetKind]}`);
+}
+
+function enterPaperDrawMode() {
+  if (!selected || selected.kind !== 'paper') return;
+  paperDrawing = true;
+  orbit.enabled = false;
+  hideEl(selectionPanelEl);
+  renderPaperDrawPill();
+  showEl(modePillEl);
+  toast('Тягніть по паперу, щоб намалювати лінію');
+}
+
+function exitPaperDrawMode() {
+  paperDrawing = false;
+  paperDrawDragging = false;
+  drawStartWorld = null;
+  clearPreviewLine();
+  orbit.enabled = mode === 'edit';
+  hideEl(modePillEl);
+  if (selected) renderSelectionPanel();
+}
+
+function renderPaperDrawPill() {
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = 'Малюйте лінії на папері';
+  modePillEl.appendChild(label);
+  modePillEl.appendChild(colorSwatchRow(sketchLineColor, (c) => { sketchLineColor = c; }));
+  const done = document.createElement('button');
+  done.textContent = '✓ Готово';
+  done.addEventListener('click', exitPaperDrawMode);
+  modePillEl.appendChild(done);
 }
 
 function buildWindowGroup(width, height, thickness, frameColor) {
@@ -366,6 +513,10 @@ function deselect() {
   holeToolActive = false;
   moveMode = false;
   moveDragging = false;
+  paperDrawing = false;
+  paperDrawDragging = false;
+  drawStartWorld = null;
+  clearPreviewLine();
   orbit.enabled = mode === 'edit';
   hideEl(selectionPanelEl);
   hideEl(modePillEl);
@@ -461,7 +612,10 @@ function attachSelectedPipe() {
 
   const pipe = selected.root;
   pipe.updateMatrixWorld(true);
-  const localHalf = 700; // matches the default pipe length (1400 mm) / 2 — pipes aren't resizable yet
+  // Read the actual length from the geometry — pipes converted from a drawn
+  // line can be any length, not just the freestanding-primitive default.
+  pipe.geometry.computeBoundingBox();
+  const localHalf = pipe.geometry.boundingBox.getSize(new THREE.Vector3()).x / 2;
   const endA = new THREE.Vector3(localHalf, 0, 0).applyMatrix4(pipe.matrixWorld);
   const endB = new THREE.Vector3(-localHalf, 0, 0).applyMatrix4(pipe.matrixWorld);
 
@@ -519,6 +673,36 @@ function renderSelectionPanel() {
   title.textContent = KIND_LABELS[selected.kind] || selected.kind;
   selectionPanelEl.appendChild(title);
 
+  if (selected.kind === 'sketchLine') {
+    const info = document.createElement('p');
+    info.className = 'dim-readout';
+    info.textContent = `Довжина: ${formatMm(selected.lineLength)} мм`;
+    selectionPanelEl.appendChild(info);
+
+    const hint = document.createElement('p');
+    hint.className = 'dim-readout';
+    hint.textContent = 'Перетворити на реальний об’єкт:';
+    selectionPanelEl.appendChild(hint);
+
+    const convertRow = document.createElement('div');
+    convertRow.className = 'panel-row';
+    for (const kind of ['rebar', 'pipe', 'beam']) {
+      const b = document.createElement('button');
+      b.className = 'pbtn';
+      b.textContent = `→ ${KIND_LABELS[kind]}`;
+      b.addEventListener('click', () => convertSketchLine(selected, kind));
+      convertRow.appendChild(b);
+    }
+    selectionPanelEl.appendChild(convertRow);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'pbtn danger wide';
+    delBtn.textContent = '🗑 Видалити лінію';
+    delBtn.addEventListener('click', () => removeObject(selected));
+    selectionPanelEl.appendChild(delBtn);
+    return;
+  }
+
   const size = getObjectSizeMm(selected);
   const dims = document.createElement('p');
   dims.className = 'dim-readout';
@@ -545,6 +729,13 @@ function renderSelectionPanel() {
   moveBtn.className = 'pbtn'; moveBtn.textContent = '✥ Перемістити';
   moveBtn.addEventListener('click', enterMoveMode);
   actions.appendChild(moveBtn);
+
+  if (selected.kind === 'paper') {
+    const drawBtn = document.createElement('button');
+    drawBtn.className = 'pbtn'; drawBtn.textContent = '✎ Малювати лінії';
+    drawBtn.addEventListener('click', enterPaperDrawMode);
+    actions.appendChild(drawBtn);
+  }
 
   if (selected.root.isMesh) {
     const holeBtn = document.createElement('button');
@@ -638,7 +829,7 @@ function buildPopoverContent(panel) {
   if (panel === 'objects') {
     const h = document.createElement('h3'); h.textContent = 'Додати об’єкт'; popoverEl.appendChild(h);
     const row = document.createElement('div'); row.className = 'panel-row';
-    for (const kind of ['cube', 'cylinder', 'pipe', 'sphere', 'cone']) {
+    for (const kind of ['cube', 'cylinder', 'pipe', 'sphere', 'cone', 'paper']) {
       const b = document.createElement('button');
       b.className = 'pbtn' + (placingKind === kind ? ' on' : '');
       b.textContent = KIND_LABELS[kind];
@@ -792,6 +983,14 @@ canvas.addEventListener('pointerdown', (e) => {
   if (mode === 'edit' && moveMode && selected) {
     moveDragging = true;
   }
+  if (mode === 'edit' && paperDrawing && selected) {
+    scene.updateMatrixWorld(true);
+    const hits = rayFromClient(e.clientX, e.clientY).intersectObject(selected.root, false);
+    if (hits.length) {
+      drawStartWorld = hits[0].point.clone();
+      paperDrawDragging = true;
+    }
+  }
 });
 
 canvas.addEventListener('pointermove', (e) => {
@@ -804,6 +1003,9 @@ canvas.addEventListener('pointermove', (e) => {
       selected.root.position.z = roundMm(hit.z);
       outlineHelper?.update();
     }
+  } else if (mode === 'edit' && paperDrawing && paperDrawDragging && selected && drawStartWorld) {
+    const hits = rayFromClient(e.clientX, e.clientY).intersectObject(selected.root, false);
+    if (hits.length) updatePreviewLine(drawStartWorld, hits[0].point);
   } else if (mode === 'walk') {
     handleWalkLook(e);
   }
@@ -814,6 +1016,21 @@ window.addEventListener('pointerup', (e) => {
   pointerActive = false;
 
   if (mode === 'edit' && moveMode) { moveDragging = false; return; }
+  if (mode === 'edit' && paperDrawing) {
+    if (paperDrawDragging && drawStartWorld && selected) {
+      const hits = rayFromClient(e.clientX, e.clientY).intersectObject(selected.root, false);
+      clearPreviewLine();
+      if (hits.length) {
+        const line = addSketchLine(selected, drawStartWorld, hits[0].point, sketchLineColor);
+        if (!line) toast('Занадто коротка лінія');
+      } else {
+        toast('Лінія має лишатися на папері');
+      }
+    }
+    paperDrawDragging = false;
+    drawStartWorld = null;
+    return;
+  }
   if (mode === 'walk') { endWalkLook(e); return; }
 
   const dx = e.clientX - downX, dy = e.clientY - downY;
@@ -996,6 +1213,8 @@ function saveProject() {
       const mesh = rec.root;
       data.objects.push({
         id: rec.id, kind: rec.kind, isPipe: !!rec.isPipe, wallLength: rec.wallLength,
+        paperId: rec.paperId, lineLength: rec.lineLength,
+        lineStart: rec.lineStart?.toArray(), lineEnd: rec.lineEnd?.toArray(),
         geometry: mesh.geometry.toJSON(),
         material: { type: mesh.material.userData.creslarnetType, color: mesh.material.userData.creslarnetColor },
         position: mesh.position.toArray(),
@@ -1059,7 +1278,12 @@ function loadProject(data) {
       if (item.scale) mesh.scale.fromArray(item.scale);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
-      registerObject(item.kind, mesh, { isPipe: !!item.isPipe, wallLength: item.wallLength });
+      registerObject(item.kind, mesh, {
+        isPipe: !!item.isPipe, wallLength: item.wallLength,
+        paperId: item.paperId, lineLength: item.lineLength,
+        lineStart: item.lineStart && new THREE.Vector3().fromArray(item.lineStart),
+        lineEnd: item.lineEnd && new THREE.Vector3().fromArray(item.lineEnd),
+      });
     }
   }
   nextId = maxId + 1;
@@ -1109,5 +1333,5 @@ toast('Оберіть інструмент внизу, щоб додати пе�
 window.__creslarnet3d = {
   get objects() { return objects; },
   get selected() { return selected; },
-  scene, camera, renderer,
+  scene, camera, renderer, orbit,
 };

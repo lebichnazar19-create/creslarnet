@@ -275,7 +275,7 @@ html, body {
   color: var(--hud-text-muted);
 }
 
-/* ---------- transient mode pill (move / hole placement) ---------- */
+/* ---------- transient mode pill (move / hole placement / paper drawing) ---------- */
 .mode-pill {
   position: fixed;
   left: 50%;
@@ -284,10 +284,13 @@ html, body {
   z-index: 21;
   display: flex;
   align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
   gap: 10px;
+  max-width: calc(100vw - 16px);
   background: var(--hud-bg-solid);
   border: 1px solid var(--accent);
-  border-radius: 999px;
+  border-radius: 16px;
   padding: 8px 8px 8px 16px;
   font-size: 13px;
   box-shadow: 0 12px 32px -10px rgba(0, 0, 0, 0.55);
