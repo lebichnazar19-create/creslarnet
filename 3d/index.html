@@ -28,6 +28,7 @@
   <canvas id="viewport"></canvas>
 
   <a href="../index.html" class="back-link" title="Повернутись до 2D-режиму">← 2D</a>
+  <button id="resetViewBtn" class="back-link reset-view-btn" title="Скинути камеру до початкового вигляду">⌂ Початковий вигляд</button>
 
   <div id="crosshair" class="crosshair hidden" aria-hidden="true">
     <svg viewBox="0 0 24 24"><path d="M12 4v6M12 14v6M4 12h6M14 12h6"/></svg>
@@ -35,7 +36,8 @@
 
   <button id="walkExit" class="walk-exit hidden">✕ Вихід із прогулянки</button>
 
-  <div id="joystick" class="joystick hidden">
+  <!-- Always available in edit mode too now — it's how you fly, not just walk. -->
+  <div id="joystick" class="joystick">
     <div id="joystickNub" class="joystick-nub"></div>
   </div>
 

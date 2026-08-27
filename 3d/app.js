@@ -1,5 +1,4 @@
 import * as THREE from './vendor/three/three.module.min.js';
-import { OrbitControls } from './vendor/three/OrbitControls.js';
 import { RoomEnvironment } from './vendor/three/RoomEnvironment.js';
 import { CSG } from './csg.js';
 import { createMaterial, createPaintMaterial, MATERIAL_LABELS } from './materials.js';
@@ -74,11 +73,13 @@ scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 pmrem.dispose();
 
 // Near/far start wide and get tightened every frame by updateAdaptiveClipping()
-// to whatever the current camera-to-target distance calls for — a fixed pair
-// can't cover "2 mm from a bolt" and "80 m across a plot" at once even with
-// a logarithmic depth buffer.
+// to whatever's actually ahead of the camera — a fixed pair can't cover
+// "2 mm from a bolt" and "80 m across a plot" at once even with a
+// logarithmic depth buffer.
 const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 1000000);
-camera.position.set(6000, 5000, 9000);
+camera.rotation.order = 'YXZ';
+const INITIAL_CAMERA_POS = new THREE.Vector3(6000, 5000, 9000);
+camera.position.copy(INITIAL_CAMERA_POS);
 
 const hemi = new THREE.HemisphereLight(0xffffff, 0x8a7a63, 0.9);
 scene.add(hemi);
@@ -108,24 +109,46 @@ grid.material.transparent = true;
 grid.position.y = 1;
 scene.add(grid);
 
-const orbit = new OrbitControls(camera, renderer.domElement);
-orbit.target.set(0, 1000, 0);
-orbit.enableDamping = true;
-orbit.maxPolarAngle = Math.PI / 2 - 0.02;
-// A 5 mm test-piece and a 3 m room both need to be reachable by scrolling:
-// get within 2 mm of a tiny object, or back off 150 m to frame a whole site.
-orbit.minDistance = 2;
-orbit.maxDistance = 150000;
-orbit.zoomSpeed = 1.15;
+// Free camera state — no orbit pivot, just where the camera is and which
+// way it's looking. yaw/pitch are the single source of truth for
+// orientation; camera.rotation is rebuilt from them every frame.
+let yaw = 0, pitch = 0;
+function faceDirection(dir) {
+  // camera's horizontal forward under rotation.set(pitch, yaw, 0, 'YXZ') is
+  // (-sin(yaw), 0, -cos(yaw)); solve yaw/pitch backward from a look direction.
+  yaw = Math.atan2(-dir.x, -dir.z);
+  pitch = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+}
+faceDirection(new THREE.Vector3(0, 1000, 0).sub(camera.position).normalize());
+camera.rotation.set(pitch, yaw, 0, 'YXZ');
 
-// Perspective zoom is naturally "real" — dolly distance scales multiplicatively,
-// so a scroll tick feels the same whether you're 5 mm or 5 m from the target.
-// What breaks across a huge range is the depth buffer, so the clip planes are
-// re-fit to the current distance every frame instead of using one fixed pair.
-function updateAdaptiveClipping() {
-  const dist = camera.position.distanceTo(orbit.target);
-  const near = Math.max(0.1, dist / 200);
-  const far = Math.max(200000, dist * 200);
+function resetView() {
+  camera.position.copy(INITIAL_CAMERA_POS);
+  faceDirection(new THREE.Vector3(0, 1000, 0).sub(INITIAL_CAMERA_POS).normalize());
+  toast('Вигляд скинуто');
+}
+
+// How far away is whatever the camera is actually looking at? Used to keep
+// the depth buffer, the scale bar, and the fly speed all matched to "how
+// zoomed in are we right now" — a tiny object needs a slow, fine approach
+// and a near plane a fraction of a millimetre; an open plot needs speed and
+// clip planes tens of metres out.
+function forwardHitDistance() {
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  raycaster.set(camera.position, dir);
+  const hits = raycaster.intersectObjects(raycastTargets.concat(ground), false);
+  if (hits.length) return hits[0].distance;
+  return Math.max(1000, Math.abs(camera.position.y) * 3, 3000);
+}
+
+// Perspective zoom is naturally "real" — moving at a distance-scaled speed
+// feels the same whether you're 5 mm or 5 m from what's ahead. What breaks
+// across a huge range is the depth buffer, so the clip planes are re-fit
+// to the current reference distance every frame instead of a fixed pair.
+function updateAdaptiveClipping(refDist) {
+  const near = Math.max(0.1, refDist / 200);
+  const far = Math.max(200000, refDist * 200);
   if (Math.abs(camera.near - near) > 1e-6 || Math.abs(camera.far - far) > 1) {
     camera.near = near;
     camera.far = far;
@@ -166,6 +189,19 @@ let paperDrawDragging = false;
 let sketchLineColor = PALETTE[0];
 let drawStartWorld = null;
 
+// Free-camera navigation: one finger down free (not claimed by move/paper
+// drawing) looks around; the joystick or WASD/arrows move; two fingers
+// pinch-scale the selected object instead of the camera.
+let joyVec = { x: 0, y: 0 };
+let joyPointerId = null;
+let lookPointerId = null;
+let lastLookX = 0, lastLookY = 0;
+let primaryPointerId = null;
+const keys = new Set();
+const activePointers = new Map(); // pointerId -> {x, y}, for pinch detection
+let pinchStartDist = 0;
+let pinchStartScale = null;
+
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -192,19 +228,19 @@ function toast(msg, ms = 2400) {
 
 // ---------------------------------------------------------------------------
 // Scale bar — the honest way to show "zoom level" in a perspective view:
-// how many millimetres a fixed on-screen length covers at the orbit target's
-// depth, rounded to a friendly 1-2-5 step (same idea as a map's scale bar).
+// how many millimetres a fixed on-screen length covers at whatever the
+// camera is looking at, rounded to a friendly 1-2-5 step (same idea as a
+// map's scale bar).
 // ---------------------------------------------------------------------------
 const scaleBarEl = document.getElementById('scaleBar');
 const scaleBarFillEl = document.getElementById('scaleBarFill');
 const scaleBarLabelEl = document.getElementById('scaleBarLabel');
 const TARGET_BAR_PX = 90;
 
-function updateScaleBar() {
-  const dist = camera.position.distanceTo(orbit.target);
+function updateScaleBar(refDist) {
   const vFov = (camera.fov * Math.PI) / 180;
   const screenPx = renderer.domElement.clientHeight || window.innerHeight;
-  const mmPerPixel = (2 * dist * Math.tan(vFov / 2)) / screenPx;
+  const mmPerPixel = (2 * refDist * Math.tan(vFov / 2)) / screenPx;
   const mm = niceMm(mmPerPixel * TARGET_BAR_PX);
   scaleBarFillEl.style.width = `${(mm / mmPerPixel).toFixed(1)}px`;
   scaleBarLabelEl.textContent = `${formatMm(mm, 0)} мм`;
@@ -436,7 +472,6 @@ function convertSketchLine(record, targetKind) {
 function enterPaperDrawMode() {
   if (!selected || selected.kind !== 'paper') return;
   paperDrawing = true;
-  orbit.enabled = false;
   hideEl(selectionPanelEl);
   renderPaperDrawPill();
   showEl(modePillEl);
@@ -448,7 +483,6 @@ function exitPaperDrawMode() {
   paperDrawDragging = false;
   drawStartWorld = null;
   clearPreviewLine();
-  orbit.enabled = mode === 'edit';
   hideEl(modePillEl);
   if (selected) renderSelectionPanel();
 }
@@ -517,7 +551,6 @@ function deselect() {
   paperDrawDragging = false;
   drawStartWorld = null;
   clearPreviewLine();
-  orbit.enabled = mode === 'edit';
   hideEl(selectionPanelEl);
   hideEl(modePillEl);
 }
@@ -528,13 +561,90 @@ function deselect() {
 function getObjectSizeMm(record) {
   if (record.kind === 'window') {
     const p = record.root.userData.windowParams;
-    return new THREE.Vector3(p.width, p.height, p.thickness);
+    return new THREE.Vector3(p.width, p.height, p.thickness).multiply(record.root.scale);
   }
   const mesh = record.root;
   mesh.geometry.computeBoundingBox(); // cheap; re-run in case CSG just replaced the geometry
   const size = mesh.geometry.boundingBox.getSize(new THREE.Vector3());
   size.multiply(mesh.scale);
   return size;
+}
+
+// The UNSCALED local size along one axis — needed to work out what scale
+// factor turns "current geometry" into "the mm the user just typed in".
+function getBaseAxisSizeMm(record, axis) {
+  if (record.kind === 'window') {
+    const p = record.root.userData.windowParams;
+    return { x: p.width, y: p.height, z: p.thickness }[axis];
+  }
+  record.root.geometry.computeBoundingBox();
+  return record.root.geometry.boundingBox.getSize(new THREE.Vector3())[axis] || 1;
+}
+
+// Live-updated while a two-finger pinch is scaling the selected object, so
+// the panel's own size inputs stay in sync without a full DOM rebuild.
+let sizeInputRefs = null;
+function refreshSizeInputs() {
+  if (!sizeInputRefs || sizeInputRefs.record !== selected) return;
+  const size = getObjectSizeMm(selected);
+  sizeInputRefs.x.value = formatMm(size.x);
+  sizeInputRefs.y.value = formatMm(size.y);
+  sizeInputRefs.z.value = formatMm(size.z);
+}
+
+function applyAxisSizeMm(record, axis, mm) {
+  mm = Math.max(0.5, roundMm(mm));
+  const base = getBaseAxisSizeMm(record, axis);
+  record.root.scale[axis] = mm / base;
+  outlineHelper?.update();
+  refreshSizeInputs();
+}
+
+function buildSizeSection(record) {
+  const section = document.createElement('div');
+  section.className = 'size-section';
+  const refs = {};
+  for (const axis of ['x', 'y', 'z']) {
+    const row = document.createElement('div');
+    row.className = 'size-row';
+
+    const label = document.createElement('span');
+    label.className = 'axis-label';
+    label.textContent = axis.toUpperCase();
+
+    const minus = document.createElement('button');
+    minus.type = 'button'; minus.className = 'stepper-btn'; minus.textContent = '–';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.inputMode = 'decimal';
+    input.className = 'size-input';
+
+    const plus = document.createElement('button');
+    plus.type = 'button'; plus.className = 'stepper-btn'; plus.textContent = '+';
+
+    const unit = document.createElement('span');
+    unit.className = 'unit-label';
+    unit.textContent = 'мм';
+
+    const current = () => getObjectSizeMm(record)[axis];
+    const step = () => Math.max(0.5, current() * 0.1); // 10% nudge — sane at both mm and metre scale
+    input.value = formatMm(current());
+
+    minus.addEventListener('click', () => applyAxisSizeMm(record, axis, current() - step()));
+    plus.addEventListener('click', () => applyAxisSizeMm(record, axis, current() + step()));
+    input.addEventListener('change', () => {
+      const v = parseFloat(input.value.replace(',', '.'));
+      if (Number.isFinite(v) && v > 0) applyAxisSizeMm(record, axis, v);
+      else input.value = formatMm(current());
+    });
+
+    row.append(label, minus, input, plus, unit);
+    section.appendChild(row);
+    refs[axis] = input;
+  }
+  sizeInputRefs = { record, ...refs };
+  return section;
 }
 
 function currentPaintColor(record) {
@@ -703,11 +813,7 @@ function renderSelectionPanel() {
     return;
   }
 
-  const size = getObjectSizeMm(selected);
-  const dims = document.createElement('p');
-  dims.className = 'dim-readout';
-  dims.textContent = `${formatMm(size.x)} × ${formatMm(size.y)} × ${formatMm(size.z)} мм`;
-  selectionPanelEl.appendChild(dims);
+  selectionPanelEl.appendChild(buildSizeSection(selected));
 
   selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
   selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
@@ -761,7 +867,6 @@ function renderSelectionPanel() {
 
 function enterMoveMode() {
   moveMode = true;
-  orbit.enabled = false;
   hideEl(selectionPanelEl);
   modePillEl.innerHTML = '';
   const label = document.createElement('span');
@@ -770,7 +875,6 @@ function enterMoveMode() {
   done.textContent = '✓ Готово';
   done.addEventListener('click', () => {
     moveMode = false;
-    orbit.enabled = mode === 'edit';
     hideEl(modePillEl);
     renderSelectionPanel();
   });
@@ -972,29 +1076,74 @@ function insertWindowAt(clientX, clientY) {
 }
 
 // ---------------------------------------------------------------------------
-// Pointer interaction (edit mode: tap-to-place / select / draw / cut)
+// Pointer interaction — priority order per touch count:
+//   2 fingers + an object selected  → pinch-scale that object
+//   1 finger, moveMode active       → drag the object across the floor
+//   1 finger, paperDrawing active   → ink a line on the active sheet
+//   1 finger, otherwise             → look around (free camera)
+//   (on release) short tap, no drag → select / place / draw a wall point / cut
 // ---------------------------------------------------------------------------
-let downX = 0, downY = 0, downTime = 0, pointerActive = false;
+let downX = 0, downY = 0, downTime = 0;
+
+// Desktop bonus: the mouse wheel has no pinch to claim, so it flies the
+// camera forward/back along the view direction — scaled the same way the
+// joystick's fly speed is, so a tick feels equally fine-grained up close
+// or brisk out in the open.
+canvas.addEventListener('wheel', (e) => {
+  if (mode !== 'edit' || moveMode || paperDrawing) return;
+  e.preventDefault();
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  const refDist = forwardHitDistance();
+  camera.position.addScaledVector(dir, -e.deltaY * refDist * 0.002);
+}, { passive: false });
+
+function currentPinchDist() {
+  const pts = [...activePointers.values()];
+  return pts.length < 2 ? 0 : Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+}
 
 canvas.addEventListener('pointerdown', (e) => {
-  pointerActive = true;
-  downX = e.clientX; downY = e.clientY; downTime = performance.now();
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-  if (mode === 'edit' && moveMode && selected) {
-    moveDragging = true;
-  }
-  if (mode === 'edit' && paperDrawing && selected) {
-    scene.updateMatrixWorld(true);
-    const hits = rayFromClient(e.clientX, e.clientY).intersectObject(selected.root, false);
-    if (hits.length) {
-      drawStartWorld = hits[0].point.clone();
-      paperDrawDragging = true;
+  if (activePointers.size === 1) {
+    primaryPointerId = e.pointerId;
+    downX = e.clientX; downY = e.clientY; downTime = performance.now();
+
+    if (mode === 'edit' && moveMode && selected) {
+      moveDragging = true;
+    } else if (mode === 'edit' && paperDrawing && selected) {
+      scene.updateMatrixWorld(true);
+      const hits = rayFromClient(e.clientX, e.clientY).intersectObject(selected.root, false);
+      if (hits.length) {
+        drawStartWorld = hits[0].point.clone();
+        paperDrawDragging = true;
+      }
+    } else if (!moveMode && !paperDrawing) {
+      lookPointerId = e.pointerId;
+      lastLookX = e.clientX; lastLookY = e.clientY;
     }
+  } else if (activePointers.size === 2 && mode === 'edit' && selected && !moveMode && !paperDrawing) {
+    pinchStartDist = currentPinchDist();
+    pinchStartScale = selected.root.scale.clone();
+    lookPointerId = null; // second finger arrived — hand off from look to pinch
   }
 });
 
 canvas.addEventListener('pointermove', (e) => {
-  if (mode === 'edit' && moveMode && moveDragging && selected) {
+  if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (activePointers.size === 2 && pinchStartScale && selected) {
+    const dist = currentPinchDist();
+    if (pinchStartDist > 10) {
+      const ratio = Math.max(0.05, dist / pinchStartDist);
+      selected.root.scale.copy(pinchStartScale).multiplyScalar(ratio);
+      outlineHelper?.update();
+      refreshSizeInputs();
+    }
+    return;
+  }
+  if (mode === 'edit' && moveMode && moveDragging && selected && e.pointerId === primaryPointerId) {
     const ray = rayFromClient(e.clientX, e.clientY);
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -selected.root.position.y);
     const hit = new THREE.Vector3();
@@ -1003,21 +1152,33 @@ canvas.addEventListener('pointermove', (e) => {
       selected.root.position.z = roundMm(hit.z);
       outlineHelper?.update();
     }
-  } else if (mode === 'edit' && paperDrawing && paperDrawDragging && selected && drawStartWorld) {
+    return;
+  }
+  if (mode === 'edit' && paperDrawing && paperDrawDragging && selected && drawStartWorld && e.pointerId === primaryPointerId) {
     const hits = rayFromClient(e.clientX, e.clientY).intersectObject(selected.root, false);
     if (hits.length) updatePreviewLine(drawStartWorld, hits[0].point);
-  } else if (mode === 'walk') {
-    handleWalkLook(e);
+    return;
+  }
+  if (lookPointerId !== null && e.pointerId === lookPointerId) {
+    handleFreeLook(e);
   }
 });
 
-window.addEventListener('pointerup', (e) => {
-  if (!pointerActive) return;
-  pointerActive = false;
+function endPointer(e) {
+  const wasPinching = activePointers.size >= 2 && !!pinchStartScale;
+  activePointers.delete(e.pointerId);
+  if (activePointers.size < 2) { pinchStartScale = null; pinchStartDist = 0; }
+  if (lookPointerId === e.pointerId) lookPointerId = null;
+
+  if (e.type === 'pointercancel') {
+    if (mode === 'edit' && moveMode) moveDragging = false;
+    if (mode === 'edit' && paperDrawing) { paperDrawDragging = false; drawStartWorld = null; clearPreviewLine(); }
+    return;
+  }
 
   if (mode === 'edit' && moveMode) { moveDragging = false; return; }
   if (mode === 'edit' && paperDrawing) {
-    if (paperDrawDragging && drawStartWorld && selected) {
+    if (paperDrawDragging && drawStartWorld && selected && e.pointerId === primaryPointerId) {
       const hits = rayFromClient(e.clientX, e.clientY).intersectObject(selected.root, false);
       clearPreviewLine();
       if (hits.length) {
@@ -1026,20 +1187,24 @@ window.addEventListener('pointerup', (e) => {
       } else {
         toast('Лінія має лишатися на папері');
       }
+      paperDrawDragging = false;
+      drawStartWorld = null;
     }
-    paperDrawDragging = false;
-    drawStartWorld = null;
     return;
   }
-  if (mode === 'walk') { endWalkLook(e); return; }
+  if (wasPinching) return; // a pinch finger lifting is never a tap
+  if (mode === 'walk') return; // walk mode has no tap-to-place/select
+  if (e.pointerId !== primaryPointerId) return;
 
   const dx = e.clientX - downX, dy = e.clientY - downY;
   const dt = performance.now() - downTime;
-  if (dx * dx + dy * dy > 49 || dt > 600) return; // treat as a camera-orbit drag, not a tap
+  if (dx * dx + dy * dy > 49 || dt > 600) return; // a look-drag, not a tap
   if (e.target !== canvas) return;
 
   handleEditTap(e.clientX, e.clientY);
-});
+}
+window.addEventListener('pointerup', endPointer);
+window.addEventListener('pointercancel', endPointer);
 
 function handleEditTap(x, y) {
   // A mesh's matrixWorld only refreshes on render; force it here so a tap
@@ -1072,22 +1237,20 @@ function handleEditTap(x, y) {
 }
 
 // ---------------------------------------------------------------------------
-// Walk mode (first-person)
+// Free camera navigation — shared by edit mode (fly anywhere, build) and
+// walk mode (human eye-height tour, hidden UI). One finger not claimed by
+// move/paper-draw looks around; the joystick or WASD/arrows move.
 // ---------------------------------------------------------------------------
 const walkExitBtn = document.getElementById('walkExit');
 const crosshairEl = document.getElementById('crosshair');
 const joystickEl = document.getElementById('joystick');
 const joystickNubEl = document.getElementById('joystickNub');
 const walkToggleBtn = document.getElementById('walkToggle');
+const resetViewBtn = document.getElementById('resetViewBtn');
 
-let yaw = 0, pitch = 0;
-let joyVec = { x: 0, y: 0 };
-let joyPointerId = null;
-let lookPointerId = null;
-let lastLookX = 0, lastLookY = 0;
-const keys = new Set();
 window.addEventListener('keydown', (e) => keys.add(e.code));
 window.addEventListener('keyup', (e) => keys.delete(e.code));
+resetViewBtn.addEventListener('click', resetView);
 
 function enterWalkMode() {
   mode = 'walk';
@@ -1095,18 +1258,10 @@ function enterWalkMode() {
   closePopover();
   hideEl(document.getElementById('toolbar'));
   hideEl(scaleBarEl);
-  orbit.enabled = false;
+  hideEl(resetViewBtn);
   showEl(crosshairEl);
-  showEl(joystickEl);
   showEl(walkExitBtn);
-
-  const dir = new THREE.Vector3();
-  camera.getWorldDirection(dir);
-  // camera's horizontal forward is (-sin(yaw), 0, -cos(yaw)); solve for yaw from the current direction
-  yaw = Math.atan2(-dir.x, -dir.z);
-  pitch = Math.asin(Math.max(-1, Math.min(1, dir.y)));
   camera.position.y = EYE_HEIGHT;
-  camera.rotation.order = 'YXZ';
   // Walking tours human-scale space, not mm-level inspection — a fixed,
   // generous pair is simpler and plenty for that.
   camera.near = 10;
@@ -1117,14 +1272,12 @@ function enterWalkMode() {
 function exitWalkMode() {
   mode = 'edit';
   hideEl(crosshairEl);
-  hideEl(joystickEl);
   hideEl(walkExitBtn);
   showEl(document.getElementById('toolbar'));
   showEl(scaleBarEl);
-  const forward = new THREE.Vector3();
-  camera.getWorldDirection(forward);
-  orbit.target.copy(camera.position).add(forward.multiplyScalar(5));
-  orbit.enabled = true;
+  showEl(resetViewBtn);
+  // edit mode re-fits near/far itself every frame; no repositioning needed —
+  // there's no orbit pivot to recentre, the camera just stays put and flies on.
 }
 
 walkToggleBtn.addEventListener('click', () => { mode === 'walk' ? exitWalkMode() : enterWalkMode(); });
@@ -1156,13 +1309,7 @@ function updateJoystick(e) {
   joystickNubEl.style.transform = `translate(${dx}px, ${dy}px)`;
 }
 
-canvas.addEventListener('pointerdown', (e) => {
-  if (mode !== 'walk') return;
-  lookPointerId = e.pointerId;
-  lastLookX = e.clientX; lastLookY = e.clientY;
-});
-function handleWalkLook(e) {
-  if (e.pointerId !== lookPointerId) return;
+function handleFreeLook(e) {
   const dx = e.clientX - lastLookX, dy = e.clientY - lastLookY;
   lastLookX = e.clientX; lastLookY = e.clientY;
   const sens = 0.0035;
@@ -1170,9 +1317,10 @@ function handleWalkLook(e) {
   pitch -= dy * sens;
   pitch = Math.max(-1.3, Math.min(1.3, pitch));
 }
-function endWalkLook(e) { if (e.pointerId === lookPointerId) lookPointerId = null; }
 
-function updateWalkMovement(dt) {
+// refDist is only meaningful (and only computed) in edit mode — walk mode
+// ignores it and always moves at human walking speed.
+function updateFreeCamera(dt, refDist) {
   camera.rotation.set(pitch, yaw, 0, 'YXZ');
 
   let mx = joyVec.x, my = joyVec.y;
@@ -1184,21 +1332,29 @@ function updateWalkMovement(dt) {
   my = Math.max(-1, Math.min(1, my));
   if (mx === 0 && my === 0) return;
 
-  // must match the horizontal forward/right implied by camera.rotation.set(pitch, yaw, 0, 'YXZ')
-  const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
   const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
-  const move = new THREE.Vector3()
-    .addScaledVector(forward, -my)
-    .addScaledVector(right, mx);
-  if (move.lengthSq() > 0) move.normalize().multiplyScalar(WALK_SPEED * dt);
+  let forward, speed;
+  if (mode === 'walk') {
+    // flattened to horizontal — you walk on the ground, you don't climb by looking up
+    forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+    speed = WALK_SPEED;
+  } else {
+    // true fly: forward follows the full look direction, pitch included
+    forward = new THREE.Vector3();
+    camera.getWorldDirection(forward);
+    speed = Math.max(150, Math.min(20000, refDist * 1.5));
+  }
+
+  const move = new THREE.Vector3().addScaledVector(forward, -my).addScaledVector(right, mx);
+  if (move.lengthSq() > 0) move.normalize().multiplyScalar(speed * dt);
   camera.position.add(move);
-  camera.position.y = EYE_HEIGHT;
+  if (mode === 'walk') camera.position.y = EYE_HEIGHT;
 }
 
 // ---------------------------------------------------------------------------
 // Save / load project
 // ---------------------------------------------------------------------------
-function saveProject() {
+function buildProjectData() {
   const data = { app: 'creslarnet-3d', version: 2, units: 'mm', objects: [] };
   for (const rec of objects) {
     if (rec.kind === 'window') {
@@ -1207,6 +1363,7 @@ function saveProject() {
         id: rec.id, kind: 'window',
         position: rec.root.position.toArray(),
         quaternion: rec.root.quaternion.toArray(),
+        scale: rec.root.scale.toArray(),
         width: p.width, height: p.height, thickness: p.thickness, frameColor: p.frameColor,
       });
     } else {
@@ -1223,16 +1380,47 @@ function saveProject() {
       });
     }
   }
-  const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  return data;
+}
+
+// A blob: URL behind an <a download> is not always honoured as a real save
+// on a phone — inside an installed PWA especially, it can silently do
+// nothing or just open the JSON in a blank tab instead of writing a file.
+// The File System Access API gives a genuine native "save to…" dialog with
+// a confirmed on-disk result, so it's tried first; the download-link method
+// remains as the fallback for browsers that don't support it (Safari,
+// Firefox, older Android WebViews).
+async function saveProject() {
+  const filename = 'creslarnet-3d-project.json';
+  const json = JSON.stringify(buildProjectData());
+
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: 'Проєкт Creslarnet 3D', accept: { 'application/json': ['.json'] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(json);
+      await writable.close();
+      toast('Проєкт збережено');
+      return;
+    } catch (e) {
+      if (e && e.name === 'AbortError') { toast('Збереження скасовано'); return; }
+      // fall through to the download-link method below on any other failure
+    }
+  }
+
+  const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'creslarnet-3d-project.json';
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 2000);
-  toast('Проєкт збережено у файл');
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  toast('Проєкт збережено у файл (перевірте папку "Завантаження")');
 }
 
 function clearScene() {
@@ -1265,6 +1453,7 @@ function loadProject(data) {
       const group = buildWindowGroup(item.width, item.height, item.thickness, item.frameColor);
       group.position.fromArray(item.position);
       group.quaternion.fromArray(item.quaternion);
+      if (item.scale) group.scale.fromArray(item.scale);
       group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
       registerObject('window', group);
     } else {
@@ -1316,11 +1505,12 @@ function animate() {
   lastFrame = now;
 
   if (mode === 'edit') {
-    orbit.update();
-    updateAdaptiveClipping();
-    updateScaleBar();
+    const refDist = forwardHitDistance();
+    updateAdaptiveClipping(refDist);
+    updateScaleBar(refDist);
+    updateFreeCamera(dt, refDist);
   } else if (mode === 'walk') {
-    updateWalkMovement(dt);
+    updateFreeCamera(dt, 0);
   }
   renderer.render(scene, camera);
 }
@@ -1333,5 +1523,13 @@ toast('Оберіть інструмент внизу, щоб додати пе�
 window.__creslarnet3d = {
   get objects() { return objects; },
   get selected() { return selected; },
-  scene, camera, renderer, orbit,
+  scene, camera, renderer,
+  // fly the camera to look at a world point from a fixed relative offset —
+  // handy for debugging/testing since there's no orbit pivot to aim any more
+  lookAt(pos, distance = 3000) {
+    const target = new THREE.Vector3(pos.x, pos.y, pos.z);
+    const offset = new THREE.Vector3(0.35, 0.35, 1).normalize().multiplyScalar(distance);
+    camera.position.copy(target).add(offset);
+    faceDirection(new THREE.Vector3().subVectors(target, camera.position).normalize());
+  },
 };
