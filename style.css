@@ -11,16 +11,25 @@
 
 * { box-sizing: border-box; }
 
-body {
+.hidden { display: none !important; }
+
+html, body {
   margin: 0;
+  height: 100%;
+  overflow: hidden;
   font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   background: var(--bg);
   color: var(--text);
-  min-height: 100vh;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
 }
 
 .topbar {
-  padding: 18px 28px;
+  flex-shrink: 0;
+  padding: 14px 28px;
   background: var(--panel-bg);
   border-bottom: 1px solid var(--border);
   display: flex;
@@ -56,15 +65,18 @@ body {
 }
 
 .workspace {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  align-items: flex-start;
-  gap: 24px;
-  padding: 24px;
+  align-items: stretch;
+  gap: 16px;
+  padding: 16px;
 }
 
 .toolbar {
   width: 220px;
   flex-shrink: 0;
+  overflow-y: auto;
   background: var(--panel-bg);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -72,8 +84,6 @@ body {
   display: flex;
   flex-direction: column;
   gap: 22px;
-  position: sticky;
-  top: 24px;
 }
 
 .tool-group h2 {
@@ -196,28 +206,119 @@ body {
 
 .canvas-area {
   flex: 1;
+  min-width: 0;
+  position: relative;
   display: flex;
   flex-direction: column;
-  align-items: center;
-}
-
-.canvas-shadow {
-  box-shadow: var(--shadow);
-  border-radius: 2px;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border);
 }
 
 #drawCanvas {
   display: block;
-  background: #ffffff;
+  width: 100%;
+  flex: 1;
+  min-height: 0;
   cursor: crosshair;
-  max-width: 100%;
-  height: auto;
+  touch-action: none;
 }
 
 .canvas-hint {
-  margin-top: 14px;
-  font-size: 13px;
+  flex-shrink: 0;
+  margin: 0;
+  padding: 8px 14px;
+  font-size: 12px;
   color: var(--text-muted);
+  background: var(--panel-bg);
+  border-top: 1px solid var(--border);
+}
+
+/* ---------- scale bar (2D) ---------- */
+.scale-bar-2d {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  pointer-events: none;
+}
+.scale-bar-fill-2d {
+  height: 5px;
+  min-width: 4px;
+  border-left: 2px solid rgba(38, 36, 32, 0.8);
+  border-right: 2px solid rgba(38, 36, 32, 0.8);
+  border-bottom: 2px solid rgba(38, 36, 32, 0.8);
+}
+.scale-bar-label-2d {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+/* ---------- exact-dimension panel for the selected shape ---------- */
+.dim-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.dim-label {
+  width: 62px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.dim-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 6px;
+  font: inherit;
+  font-size: 13px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.dim-unit { font-size: 11px; color: var(--text-muted); width: 22px; }
+.dim-step {
+  width: 24px; height: 24px; flex-shrink: 0;
+  border-radius: 50%; border: 1px solid var(--border);
+  background: #fafaf8; font-size: 14px; cursor: pointer;
+}
+.dim-panel-title { margin: 0 0 10px; font-weight: 700; font-size: 14px; }
+.dim-delete {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #f2c9cd;
+  background: #fdecee;
+  color: #c1121f;
+  border-radius: 8px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+
+/* ---------- print: only the generated page image, at real A4 size ---------- */
+#printSheet { display: none; }
+@media print {
+  body * { visibility: hidden; }
+  #printSheet {
+    display: block;
+    visibility: visible;
+    position: fixed;
+    left: 0; top: 0;
+    width: 210mm;
+    height: 297mm;
+  }
+  @page { size: A4; margin: 0; }
 }
 
 @media (max-width: 860px) {
@@ -226,6 +327,6 @@ body {
   }
   .toolbar {
     width: 100%;
-    position: static;
+    max-height: 40vh;
   }
 }

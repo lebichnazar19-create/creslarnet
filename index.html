@@ -27,7 +27,11 @@
     <aside class="toolbar">
       <div class="tool-group">
         <h2>Інструменти</h2>
-        <button class="tool-btn active" data-tool="line" title="Лінія">
+        <button class="tool-btn active" data-tool="select" title="Виділити / перемістити / панорамувати">
+          <svg viewBox="0 0 24 24"><path d="M6 3 L6 19 L10 15 L13 21 L15.5 20 L12.5 14 L18 14 Z"/></svg>
+          Виділити
+        </button>
+        <button class="tool-btn" data-tool="line" title="Лінія">
           <svg viewBox="0 0 24 24"><line x1="4" y1="20" x2="20" y2="4"/></svg>
           Лінія
         </button>
@@ -39,6 +43,14 @@
           <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>
           Коло
         </button>
+        <button class="tool-btn" data-tool="arc" title="Дуга / циркуль">
+          <svg viewBox="0 0 24 24"><path d="M4 18 A8 8 0 0 1 20 18"/></svg>
+          Дуга
+        </button>
+      </div>
+
+      <div class="tool-group" id="dimPanel2d">
+        <!-- filled dynamically when a shape is selected -->
       </div>
 
       <div class="tool-group">
@@ -68,14 +80,17 @@
         <button class="action-btn" id="undoBtn">Скасувати</button>
         <button class="action-btn" id="clearBtn">Очистити полотно</button>
         <button class="action-btn" id="exportBtn">Зберегти як PNG</button>
+        <button class="action-btn" id="printBtn">🖨 Друк</button>
       </div>
     </aside>
 
     <main class="canvas-area">
-      <div class="canvas-shadow">
-        <canvas id="drawCanvas" width="794" height="1123"></canvas>
+      <canvas id="drawCanvas"></canvas>
+      <div class="scale-bar-2d" aria-hidden="true">
+        <div id="scaleBarFill2d" class="scale-bar-fill-2d"></div>
+        <span id="scaleBarLabel2d" class="scale-bar-label-2d">—</span>
       </div>
-      <p class="canvas-hint">Формат A4 (210×297 мм, 96 DPI) — тримайте кнопку миші та тягніть, щоб намалювати фігуру</p>
+      <p class="canvas-hint">Формат A4 (210×297 мм) · тягніть, щоб малювати · два пальці — масштаб · «Виділити» — панорамування й переміщення фігур</p>
     </main>
   </div>
 
