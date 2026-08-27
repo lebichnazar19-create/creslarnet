@@ -163,6 +163,20 @@ html, body {
 }
 
 .pbtn.wide { flex: 1 1 100%; justify-content: center; }
+
+.library-row {
+  flex-wrap: nowrap;
+  width: 100%;
+}
+
+.library-row .pbtn:first-child {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  justify-content: flex-start;
+}
 .pbtn.on { background: var(--accent); border-color: var(--accent); }
 .pbtn.danger { color: var(--danger); }
 .pbtn.danger:active { background: rgba(224, 119, 106, 0.15); }

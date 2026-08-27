@@ -25,7 +25,7 @@ const PAPER_COLOR = '#f7f4ec'; // warm paper white, distinct from the neutral de
 const KIND_LABELS = {
   cube: 'Куб', cylinder: 'Циліндр', pipe: 'Труба', sphere: 'Сфера', cone: 'Конус',
   wall: 'Стіна', window: 'Вікно', paper: 'Папір', sketchLine: 'Лінія на папері',
-  rebar: 'Арматура', beam: 'Балка',
+  rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт',
 };
 
 // Quantize to the coordinate system's stated resolution: 0.1 mm.
@@ -174,6 +174,7 @@ const raycastTargets = []; // flat list of every raycastable mesh, tagged userDa
 let mode = 'edit'; // 'edit' | 'walk'
 let selected = null;
 let placingKind = null;
+let placingLibraryEntry = null; // a saved "Мої об'єкти" entry waiting for a tap to place it
 let wallDrawing = false;
 let wallColor = DEFAULT_WALL_COLOR;
 let wallPoints = [];
@@ -647,6 +648,63 @@ function buildSizeSection(record) {
   return section;
 }
 
+function formatDeg(v) {
+  const rounded = Math.round(v * 10) / 10;
+  return (Object.is(rounded, -0) ? 0 : rounded).toString().replace('.', ',');
+}
+
+// Fine rotation control — a stepper + exact-value field at 1° resolution
+// (turntable-style, around the object's own vertical axis), replacing the
+// old fixed 15° nudge buttons.
+let rotationInputRef = null;
+function buildRotationSection(record) {
+  const row = document.createElement('div');
+  row.className = 'size-row';
+
+  const label = document.createElement('span');
+  label.className = 'axis-label';
+  label.textContent = '⟲';
+
+  const minus = document.createElement('button');
+  minus.type = 'button'; minus.className = 'stepper-btn'; minus.textContent = '–';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.inputMode = 'decimal';
+  input.className = 'size-input';
+
+  const plus = document.createElement('button');
+  plus.type = 'button'; plus.className = 'stepper-btn'; plus.textContent = '+';
+
+  const unit = document.createElement('span');
+  unit.className = 'unit-label';
+  unit.textContent = '°';
+
+  const current = () => {
+    const deg = THREE.MathUtils.radToDeg(record.root.rotation.y) % 360;
+    return deg < 0 ? deg + 360 : deg;
+  };
+  const apply = (deg) => {
+    deg = ((deg % 360) + 360) % 360;
+    record.root.rotation.y = THREE.MathUtils.degToRad(deg);
+    outlineHelper?.update();
+    input.value = formatDeg(deg);
+  };
+  input.value = formatDeg(current());
+
+  minus.addEventListener('click', () => apply(current() - 1));
+  plus.addEventListener('click', () => apply(current() + 1));
+  input.addEventListener('change', () => {
+    const v = parseFloat(input.value.replace(',', '.'));
+    if (Number.isFinite(v)) apply(v);
+    else input.value = formatDeg(current());
+  });
+
+  row.append(label, minus, input, plus, unit);
+  rotationInputRef = { record, input };
+  return row;
+}
+
 function currentPaintColor(record) {
   const meshes = [];
   record.root.traverse((o) => { if (o.isMesh && o.userData.role !== 'glass') meshes.push(o); });
@@ -814,22 +872,13 @@ function renderSelectionPanel() {
   }
 
   selectionPanelEl.appendChild(buildSizeSection(selected));
+  selectionPanelEl.appendChild(buildRotationSection(selected));
 
   selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
   selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
 
   const actions = document.createElement('div');
   actions.className = 'panel-row';
-
-  const rotL = document.createElement('button');
-  rotL.className = 'pbtn'; rotL.textContent = '↺ 15°';
-  rotL.addEventListener('click', () => { selected.root.rotation.y -= Math.PI / 12; outlineHelper?.update(); });
-  actions.appendChild(rotL);
-
-  const rotR = document.createElement('button');
-  rotR.className = 'pbtn'; rotR.textContent = '↻ 15°';
-  rotR.addEventListener('click', () => { selected.root.rotation.y += Math.PI / 12; outlineHelper?.update(); });
-  actions.appendChild(rotR);
 
   const moveBtn = document.createElement('button');
   moveBtn.className = 'pbtn'; moveBtn.textContent = '✥ Перемістити';
@@ -990,6 +1039,52 @@ function buildPopoverContent(panel) {
     loadBtn.className = 'pbtn wide'; loadBtn.textContent = '⭱ Завантажити з файлу';
     loadBtn.addEventListener('click', () => { document.getElementById('fileInput').click(); closePopover(); });
     row.append(saveBtn, loadBtn);
+    popoverEl.appendChild(row);
+
+    const h2 = document.createElement('h3'); h2.textContent = 'Групи об’єктів'; popoverEl.appendChild(h2);
+    const groupRow = document.createElement('div'); groupRow.className = 'panel-row';
+    const groupBtn = document.createElement('button');
+    groupBtn.className = 'pbtn wide';
+    groupBtn.textContent = '▦ Виділити й згрупувати';
+    groupBtn.addEventListener('click', () => { enterGroupSelectMode(); closePopover(); });
+    groupRow.appendChild(groupBtn);
+    popoverEl.appendChild(groupRow);
+
+    buildMyObjectsSection();
+  }
+}
+
+function buildMyObjectsSection() {
+  const h3 = document.createElement('h3'); h3.textContent = 'Мої об’єкти'; popoverEl.appendChild(h3);
+  const library = loadLibrary();
+  if (!library.length) {
+    const empty = document.createElement('p');
+    empty.className = 'dim-readout';
+    empty.textContent = 'Поки порожньо — виділіть об’єкти вище й натисніть «Зберегти як об’єкт».';
+    popoverEl.appendChild(empty);
+    return;
+  }
+  for (const entry of [...library].reverse()) {
+    const row = document.createElement('div');
+    row.className = 'panel-row library-row';
+    const insertBtn = document.createElement('button');
+    insertBtn.className = 'pbtn';
+    insertBtn.textContent = `${entry.name} · ${entry.count} шт.`;
+    insertBtn.addEventListener('click', () => {
+      placingLibraryEntry = entry;
+      closePopover();
+      toast(`Торкніться, де розмістити: ${entry.name}`);
+    });
+    const delBtn = document.createElement('button');
+    delBtn.className = 'pbtn danger';
+    delBtn.textContent = '🗑';
+    delBtn.title = 'Видалити з «Моїх об’єктів»';
+    delBtn.addEventListener('click', () => {
+      saveLibrary(loadLibrary().filter((e) => e.id !== entry.id));
+      popoverEl.innerHTML = '';
+      buildPopoverContent('file');
+    });
+    row.append(insertBtn, delBtn);
     popoverEl.appendChild(row);
   }
 }
@@ -1222,6 +1317,19 @@ function handleEditTap(x, y) {
     placingKind = null;
     return;
   }
+  if (placingLibraryEntry) {
+    const ray = rayFromClient(x, y);
+    const hits = ray.intersectObjects(raycastTargets.concat(ground), false);
+    if (hits.length) {
+      insertMiniObject(placingLibraryEntry.data, hits[0].point);
+      toast(`Розміщено: ${placingLibraryEntry.name}`);
+    } else {
+      toast('Не вдалося визначити точку розміщення');
+    }
+    placingLibraryEntry = null;
+    return;
+  }
+  if (groupSelectMode) { toggleGroupMember(x, y); return; }
   if (wallDrawing) { addWallPoint(x, y); return; }
   if (windowToolActive) { insertWindowAt(x, y); return; }
   if (holeToolActive) { performHolePlacement(x, y); return; }
@@ -1354,33 +1462,35 @@ function updateFreeCamera(dt, refDist) {
 // ---------------------------------------------------------------------------
 // Save / load project
 // ---------------------------------------------------------------------------
-function buildProjectData() {
-  const data = { app: 'creslarnet-3d', version: 2, units: 'mm', objects: [] };
-  for (const rec of objects) {
-    if (rec.kind === 'window') {
-      const p = rec.root.userData.windowParams;
-      data.objects.push({
-        id: rec.id, kind: 'window',
-        position: rec.root.position.toArray(),
-        quaternion: rec.root.quaternion.toArray(),
-        scale: rec.root.scale.toArray(),
-        width: p.width, height: p.height, thickness: p.thickness, frameColor: p.frameColor,
-      });
-    } else {
-      const mesh = rec.root;
-      data.objects.push({
-        id: rec.id, kind: rec.kind, isPipe: !!rec.isPipe, wallLength: rec.wallLength,
-        paperId: rec.paperId, lineLength: rec.lineLength,
-        lineStart: rec.lineStart?.toArray(), lineEnd: rec.lineEnd?.toArray(),
-        geometry: mesh.geometry.toJSON(),
-        material: { type: mesh.material.userData.creslarnetType, color: mesh.material.userData.creslarnetColor },
-        position: mesh.position.toArray(),
-        quaternion: mesh.quaternion.toArray(),
-        scale: mesh.scale.toArray(),
-      });
-    }
+// Serialize one object record to plain JSON. `positionOverride` lets a
+// caller store a position relative to some anchor (used by the object
+// library) instead of the record's own absolute world position.
+function serializeObjectRecord(rec, positionOverride) {
+  if (rec.kind === 'window') {
+    const p = rec.root.userData.windowParams;
+    return {
+      id: rec.id, kind: 'window',
+      position: (positionOverride || rec.root.position).toArray(),
+      quaternion: rec.root.quaternion.toArray(),
+      scale: rec.root.scale.toArray(),
+      width: p.width, height: p.height, thickness: p.thickness, frameColor: p.frameColor,
+    };
   }
-  return data;
+  const mesh = rec.root;
+  return {
+    id: rec.id, kind: rec.kind, isPipe: !!rec.isPipe, wallLength: rec.wallLength,
+    paperId: rec.paperId, lineLength: rec.lineLength,
+    lineStart: rec.lineStart?.toArray(), lineEnd: rec.lineEnd?.toArray(),
+    geometry: mesh.geometry.toJSON(),
+    material: { type: mesh.material.userData.creslarnetType, color: mesh.material.userData.creslarnetColor },
+    position: (positionOverride || mesh.position).toArray(),
+    quaternion: mesh.quaternion.toArray(),
+    scale: mesh.scale.toArray(),
+  };
+}
+
+function buildProjectData() {
+  return { app: 'creslarnet-3d', version: 2, units: 'mm', objects: objects.map((rec) => serializeObjectRecord(rec)) };
 }
 
 // A blob: URL behind an <a download> is not always honoured as a real save
@@ -1449,34 +1559,234 @@ function loadProject(data) {
   let maxId = 0;
   for (const item of data.objects) {
     maxId = Math.max(maxId, item.id || 0);
-    if (item.kind === 'window') {
-      const group = buildWindowGroup(item.width, item.height, item.thickness, item.frameColor);
-      group.position.fromArray(item.position);
-      group.quaternion.fromArray(item.quaternion);
-      if (item.scale) group.scale.fromArray(item.scale);
-      group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
-      registerObject('window', group);
-    } else {
-      const geometry = parseGeometryJSON(item.geometry);
-      const material = item.material.type === 'paint'
-        ? createPaintMaterial(item.material.color)
-        : createMaterial(item.material.type, item.material.color, scene.environment);
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.position.fromArray(item.position);
-      mesh.quaternion.fromArray(item.quaternion);
-      if (item.scale) mesh.scale.fromArray(item.scale);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      registerObject(item.kind, mesh, {
-        isPipe: !!item.isPipe, wallLength: item.wallLength,
-        paperId: item.paperId, lineLength: item.lineLength,
-        lineStart: item.lineStart && new THREE.Vector3().fromArray(item.lineStart),
-        lineEnd: item.lineEnd && new THREE.Vector3().fromArray(item.lineEnd),
-      });
-    }
+    const { root, extra } = buildObjectFromItem(item);
+    root.position.fromArray(item.position);
+    registerObject(item.kind, root, extra);
   }
   nextId = maxId + 1;
   toast('Проєкт завантажено');
+}
+
+// Reconstructs a mesh/group from a serialized item, WITHOUT setting its
+// position — callers place it themselves (project load uses the item's own
+// absolute position; library insertion offsets it by wherever the user
+// tapped instead).
+function buildObjectFromItem(item) {
+  if (item.kind === 'window') {
+    const group = buildWindowGroup(item.width, item.height, item.thickness, item.frameColor);
+    group.quaternion.fromArray(item.quaternion);
+    if (item.scale) group.scale.fromArray(item.scale);
+    group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+    return { root: group, extra: {} };
+  }
+  const geometry = parseGeometryJSON(item.geometry);
+  const material = item.material.type === 'paint'
+    ? createPaintMaterial(item.material.color)
+    : createMaterial(item.material.type, item.material.color, scene.environment);
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.quaternion.fromArray(item.quaternion);
+  if (item.scale) mesh.scale.fromArray(item.scale);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  return {
+    root: mesh,
+    extra: {
+      isPipe: !!item.isPipe, wallLength: item.wallLength,
+      paperId: item.paperId, lineLength: item.lineLength,
+      lineStart: item.lineStart && new THREE.Vector3().fromArray(item.lineStart),
+      lineEnd: item.lineEnd && new THREE.Vector3().fromArray(item.lineEnd),
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Object library ("Мої об'єкти") — select one or more placed objects, name
+// them, and stash them in this phone's browser storage as a reusable
+// mini-object (a window, a door, a whole assembly…). Anything saved here is
+// available from ANY project opened in this browser afterward, unlike a
+// project save file which only round-trips that one project.
+// ---------------------------------------------------------------------------
+const LIBRARY_KEY = 'creslarnet-object-library';
+const GROUP_OUTLINE_COLOR = 0xe63946;
+
+function loadLibrary() {
+  try {
+    const raw = localStorage.getItem(LIBRARY_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveLibrary(entries) {
+  try {
+    localStorage.setItem(LIBRARY_KEY, JSON.stringify(entries));
+    return true;
+  } catch (e) {
+    toast('Не вдалося зберегти — забракло місця. Видаліть щось із «Моїх об’єктів»');
+    return false;
+  }
+}
+
+// The anchor a group is stored relative to: centred horizontally, resting
+// on its own lowest point — so re-inserting it at a tapped surface places
+// the whole group flush on that surface, the same way a single object does.
+function computeGroupAnchor(records) {
+  const box = new THREE.Box3();
+  for (const rec of records) box.union(new THREE.Box3().setFromObject(rec.root));
+  const center = box.getCenter(new THREE.Vector3());
+  return new THREE.Vector3(center.x, box.min.y, center.z);
+}
+
+function saveGroupAsMiniObject(name, records) {
+  const anchor = computeGroupAnchor(records);
+  const items = records.map((rec) => serializeObjectRecord(rec, rec.root.position.clone().sub(anchor)));
+  const entry = {
+    id: `obj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    name,
+    count: items.length,
+    createdAt: Date.now(),
+    data: { app: 'creslarnet-3d-object', version: 1, units: 'mm', items },
+  };
+  const library = loadLibrary();
+  library.push(entry);
+  if (saveLibrary(library)) toast(`Збережено «${name}» до «Моїх об’єктів»`);
+}
+
+function insertMiniObject(data, worldAnchor) {
+  if (!data || data.app !== 'creslarnet-3d-object' || !Array.isArray(data.items)) {
+    toast('Файл не розпізнано як об’єкт Creslarnet');
+    return;
+  }
+  const inserted = [];
+  for (const item of data.items) {
+    const { root, extra } = buildObjectFromItem(item);
+    root.position.fromArray(item.position).add(worldAnchor);
+    inserted.push(registerObject(item.kind, root, extra));
+  }
+  if (inserted.length === 1) select(inserted[0]);
+}
+
+// ---------- Group-select mode: tap objects to build a set, then save them ----------
+let groupSelectMode = false;
+const groupSelection = new Set();
+const groupOutlineHelpers = new Map();
+
+function enterGroupSelectMode() {
+  deselect();
+  groupSelectMode = true;
+  groupSelection.clear();
+  closePopover();
+  renderGroupSelectPill();
+  showEl(modePillEl);
+  toast('Торкніться об’єктів, щоб додати їх до групи');
+}
+
+function exitGroupSelectMode() {
+  groupSelectMode = false;
+  for (const helper of groupOutlineHelpers.values()) scene.remove(helper);
+  groupOutlineHelpers.clear();
+  groupSelection.clear();
+  hideEl(modePillEl);
+}
+
+function toggleGroupMember(x, y) {
+  const hits = rayFromClient(x, y).intersectObjects(raycastTargets, false);
+  if (!hits.length) return;
+  const rec = findRecordByMesh(hits[0].object);
+  if (!rec) return;
+  if (groupSelection.has(rec)) {
+    groupSelection.delete(rec);
+    const helper = groupOutlineHelpers.get(rec);
+    if (helper) { scene.remove(helper); groupOutlineHelpers.delete(rec); }
+  } else {
+    groupSelection.add(rec);
+    const helper = new THREE.BoxHelper(rec.root, GROUP_OUTLINE_COLOR);
+    scene.add(helper);
+    groupOutlineHelpers.set(rec, helper);
+  }
+  renderGroupSelectPill();
+}
+
+function renderGroupSelectPill() {
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = `Обрано: ${groupSelection.size}`;
+  modePillEl.appendChild(label);
+
+  const saveBtn = document.createElement('button');
+  saveBtn.textContent = '💾 Зберегти як об’єкт';
+  saveBtn.addEventListener('click', () => {
+    if (!groupSelection.size) { toast('Спершу торкніться хоча б одного об’єкта'); return; }
+    const records = [...groupSelection];
+    const suggested = records.length === 1 ? (KIND_LABELS[records[0].kind] || records[0].kind) : `Група (${records.length})`;
+    const name = window.prompt('Назва об’єкта для «Моїх об’єктів»:', suggested);
+    if (!name) return;
+    saveGroupAsMiniObject(name.trim() || suggested, records);
+    exitGroupSelectMode();
+  });
+  modePillEl.appendChild(saveBtn);
+
+  const mergeBtn = document.createElement('button');
+  mergeBtn.textContent = '🔗 Об’єднати в один';
+  mergeBtn.addEventListener('click', () => {
+    if (groupSelection.size < 2) { toast('Оберіть щонайменше 2 об’єкти для об’єднання'); return; }
+    mergeGroupSelection([...groupSelection]);
+    exitGroupSelectMode();
+  });
+  modePillEl.appendChild(mergeBtn);
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'ghost';
+  cancelBtn.textContent = 'Скасувати';
+  cancelBtn.addEventListener('click', exitGroupSelectMode);
+  modePillEl.appendChild(cancelBtn);
+}
+
+// Real geometric union (not just a bundle): walks the CSG boolean union
+// across every selected solid and replaces them all with one merged mesh.
+// Only plain meshes qualify — windows are a Group of parts, not one
+// geometry, so they're skipped with a note rather than silently dropped.
+function mergeGroupSelection(records) {
+  const meshRecords = records.filter((r) => r.root.isMesh);
+  const skipped = records.length - meshRecords.length;
+  if (meshRecords.length < 2) {
+    toast('Об’єднання працює лише для простих об’єктів (не вікон) — оберіть щонайменше 2');
+    return;
+  }
+
+  const base = meshRecords[0].root;
+  const accumulator = new THREE.Mesh(base.geometry, base.material);
+  accumulator.position.copy(base.position);
+  accumulator.quaternion.copy(base.quaternion);
+  accumulator.scale.copy(base.scale);
+  accumulator.updateMatrixWorld(true);
+
+  try {
+    for (let i = 1; i < meshRecords.length; i++) {
+      const unioned = CSG.union(accumulator, meshRecords[i].root);
+      if (!unioned.attributes.position.count) throw new Error('empty union result');
+      accumulator.geometry = unioned;
+    }
+  } catch (e) {
+    toast('Не вдалося об’єднати ці об’єкти');
+    return;
+  }
+
+  const merged = new THREE.Mesh(accumulator.geometry, base.material.clone());
+  merged.position.copy(base.position);
+  merged.quaternion.copy(base.quaternion);
+  merged.scale.copy(base.scale);
+  merged.castShadow = true;
+  merged.receiveShadow = true;
+
+  meshRecords.forEach(removeObject);
+  const record = registerObject('merged', merged, {});
+  select(record);
+  toast(skipped
+    ? `Об’єднано ${meshRecords.length} об’єктів (вікна пропущено). Колір/матеріал — від першого.`
+    : `Об’єднано ${meshRecords.length} об’єктів в один. Колір/матеріал — від першого.`);
 }
 
 document.getElementById('fileInput').addEventListener('change', (e) => {
