@@ -6,24 +6,52 @@ import { createMaterial, createPaintMaterial, MATERIAL_LABELS } from './material
 
 // ---------------------------------------------------------------------------
 // Constants
+//
+// One THREE.js unit = one millimetre. Every distance in this file (object
+// sizes, wall/window dimensions, camera placement, speeds…) is a plain mm
+// value — there is no separate "world scale" to convert, so a mesh built
+// with e.g. BoxGeometry(200, 200, 200) really is a 200 mm cube.
 // ---------------------------------------------------------------------------
 const PALETTE = ['#1a1a1a', '#e63946', '#2a9d8f', '#264653', '#f4a261', '#8338ec'];
 const DEFAULT_PAINT = '#cfcfd6';
-const WALL_HEIGHT = 2.6;
-const WALL_THICKNESS = 0.15;
+const WALL_HEIGHT = 2600;
+const WALL_THICKNESS = 150;
 const DEFAULT_WALL_COLOR = '#e8e4da';
-const WINDOW_WIDTH = 1.0;
-const WINDOW_HEIGHT = 1.2;
-const EYE_HEIGHT = 1.65;
-const WALK_SPEED = 3.2; // metres / second
+const WINDOW_WIDTH = 1000;
+const WINDOW_HEIGHT = 1200;
+const EYE_HEIGHT = 1650;
+const WALK_SPEED = 3200; // mm / second (≈ a brisk walking pace)
 
 const KIND_LABELS = { cube: 'Куб', cylinder: 'Циліндр', pipe: 'Труба', sphere: 'Сфера', cone: 'Конус', wall: 'Стіна', window: 'Вікно' };
+
+// Quantize to the coordinate system's stated resolution: 0.1 mm.
+const roundMm = (v) => Math.round(v * 10) / 10;
+
+// Ukrainian-locale number formatting: space-grouped thousands, comma decimal.
+function formatMm(value, decimals = 1) {
+  const fixed = Math.abs(value) < 1e-9 ? (0).toFixed(decimals) : value.toFixed(decimals);
+  const neg = fixed.startsWith('-');
+  const [intPart, decPart] = (neg ? fixed.slice(1) : fixed).split('.');
+  const grouped = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+  const withDecimals = decPart !== undefined ? `${grouped},${decPart}` : grouped;
+  return neg ? `-${withDecimals}` : withDecimals;
+}
+
+// Classic map/CAD "nice number" scale-bar step: 1-2-5 × a power of ten.
+function niceMm(raw) {
+  if (!(raw > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const step of [1, 2, 5]) {
+    if (raw <= step * mag) return step * mag;
+  }
+  return 10 * mag;
+}
 
 // ---------------------------------------------------------------------------
 // Scene bootstrap
 // ---------------------------------------------------------------------------
 const canvas = document.getElementById('viewport');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -34,48 +62,71 @@ renderer.toneMappingExposure = 1.05;
 const scene = new THREE.Scene();
 const SKY_COLOR = 0xbfe0e6;
 scene.background = new THREE.Color(SKY_COLOR);
-scene.fog = new THREE.Fog(SKY_COLOR, 26, 90);
+scene.fog = new THREE.Fog(SKY_COLOR, 26000, 90000);
 
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 pmrem.dispose();
 
-const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 300);
-camera.position.set(6, 5, 9);
+// Near/far start wide and get tightened every frame by updateAdaptiveClipping()
+// to whatever the current camera-to-target distance calls for — a fixed pair
+// can't cover "2 mm from a bolt" and "80 m across a plot" at once even with
+// a logarithmic depth buffer.
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 1000000);
+camera.position.set(6000, 5000, 9000);
 
 const hemi = new THREE.HemisphereLight(0xffffff, 0x8a7a63, 0.9);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff3e0, 1.6);
-sun.position.set(10, 14, 6);
+sun.position.set(10000, 14000, 6000);
 sun.castShadow = true;
 sun.shadow.mapSize.set(1536, 1536);
-sun.shadow.camera.left = -20;
-sun.shadow.camera.right = 20;
-sun.shadow.camera.top = 20;
-sun.shadow.camera.bottom = -20;
-sun.shadow.camera.far = 50;
+sun.shadow.camera.left = -20000;
+sun.shadow.camera.right = 20000;
+sun.shadow.camera.top = 20000;
+sun.shadow.camera.bottom = -20000;
+sun.shadow.camera.far = 50000;
 sun.shadow.bias = -0.0008;
 scene.add(sun);
 
-const groundGeo = new THREE.PlaneGeometry(80, 80);
+const groundGeo = new THREE.PlaneGeometry(80000, 80000);
 const groundMat = new THREE.MeshStandardMaterial({ color: 0xd8dcc9, roughness: 0.95, metalness: 0 });
 const ground = new THREE.Mesh(groundGeo, groundMat);
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
 
-const grid = new THREE.GridHelper(80, 80, 0x7a8a70, 0xa9b39a);
+// 80 divisions across an 80 m plot = one grid line per metre (1000 mm).
+const grid = new THREE.GridHelper(80000, 80, 0x7a8a70, 0xa9b39a);
 grid.material.opacity = 0.35;
 grid.material.transparent = true;
-grid.position.y = 0.002;
+grid.position.y = 1;
 scene.add(grid);
 
 const orbit = new OrbitControls(camera, renderer.domElement);
-orbit.target.set(0, 1, 0);
+orbit.target.set(0, 1000, 0);
 orbit.enableDamping = true;
 orbit.maxPolarAngle = Math.PI / 2 - 0.02;
-orbit.minDistance = 1.5;
-orbit.maxDistance = 45;
+// A 5 mm test-piece and a 3 m room both need to be reachable by scrolling:
+// get within 2 mm of a tiny object, or back off 150 m to frame a whole site.
+orbit.minDistance = 2;
+orbit.maxDistance = 150000;
+orbit.zoomSpeed = 1.15;
+
+// Perspective zoom is naturally "real" — dolly distance scales multiplicatively,
+// so a scroll tick feels the same whether you're 5 mm or 5 m from the target.
+// What breaks across a huge range is the depth buffer, so the clip planes are
+// re-fit to the current distance every frame instead of using one fixed pair.
+function updateAdaptiveClipping() {
+  const dist = camera.position.distanceTo(orbit.target);
+  const near = Math.max(0.1, dist / 200);
+  const far = Math.max(200000, dist * 200);
+  if (Math.abs(camera.near - near) > 1e-6 || Math.abs(camera.far - far) > 1) {
+    camera.near = near;
+    camera.far = far;
+    camera.updateProjectionMatrix();
+  }
+}
 
 function resize() {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -102,7 +153,7 @@ let wallSegmentsThisDraw = [];
 let windowToolActive = false;
 let windowFrameColor = '#f2efe6';
 let holeToolActive = false;
-let holeRadius = 0.08;
+let holeRadius = 80; // mm
 let moveMode = false;
 let moveDragging = false;
 
@@ -128,6 +179,26 @@ function toast(msg, ms = 2400) {
   toastEl.classList.remove('hidden');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toastEl.classList.add('hidden'), ms);
+}
+
+// ---------------------------------------------------------------------------
+// Scale bar — the honest way to show "zoom level" in a perspective view:
+// how many millimetres a fixed on-screen length covers at the orbit target's
+// depth, rounded to a friendly 1-2-5 step (same idea as a map's scale bar).
+// ---------------------------------------------------------------------------
+const scaleBarEl = document.getElementById('scaleBar');
+const scaleBarFillEl = document.getElementById('scaleBarFill');
+const scaleBarLabelEl = document.getElementById('scaleBarLabel');
+const TARGET_BAR_PX = 90;
+
+function updateScaleBar() {
+  const dist = camera.position.distanceTo(orbit.target);
+  const vFov = (camera.fov * Math.PI) / 180;
+  const screenPx = renderer.domElement.clientHeight || window.innerHeight;
+  const mmPerPixel = (2 * dist * Math.tan(vFov / 2)) / screenPx;
+  const mm = niceMm(mmPerPixel * TARGET_BAR_PX);
+  scaleBarFillEl.style.width = `${(mm / mmPerPixel).toFixed(1)}px`;
+  scaleBarLabelEl.textContent = `${formatMm(mm, 0)} мм`;
 }
 
 function colorSwatchRow(currentColor, onPick) {
@@ -199,7 +270,7 @@ function findRecordByMesh(mesh) {
 // ---------------------------------------------------------------------------
 // Shape builders
 // ---------------------------------------------------------------------------
-function buildPipeGeometry(outerR = 0.22, innerR = 0.14, length = 1.4, radialSegments = 20) {
+function buildPipeGeometry(outerR = 220, innerR = 140, length = 1400, radialSegments = 20) {
   const shape = new THREE.Shape();
   shape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
   const hole = new THREE.Path();
@@ -213,11 +284,11 @@ function buildPipeGeometry(outerR = 0.22, innerR = 0.14, length = 1.4, radialSeg
 }
 
 const KIND_DEFS = {
-  cube: { build: () => ({ geometry: new THREE.BoxGeometry(1, 1, 1), restY: 0.5 }) },
-  sphere: { build: () => ({ geometry: new THREE.SphereGeometry(0.5, 32, 16), restY: 0.5 }) },
-  cone: { build: () => ({ geometry: new THREE.ConeGeometry(0.5, 1, 32), restY: 0.5 }) },
-  cylinder: { build: () => ({ geometry: new THREE.CylinderGeometry(0.5, 0.5, 1, 32), restY: 0.5 }) },
-  pipe: { build: () => ({ geometry: buildPipeGeometry(), restY: 0.22, isPipe: true }) },
+  cube: { build: () => ({ geometry: new THREE.BoxGeometry(1000, 1000, 1000), restY: 500 }) },
+  sphere: { build: () => ({ geometry: new THREE.SphereGeometry(500, 32, 16), restY: 500 }) },
+  cone: { build: () => ({ geometry: new THREE.ConeGeometry(500, 1000, 32), restY: 500 }) },
+  cylinder: { build: () => ({ geometry: new THREE.CylinderGeometry(500, 500, 1000, 32), restY: 500 }) },
+  pipe: { build: () => ({ geometry: buildPipeGeometry(), restY: 220, isPipe: true }) },
 };
 
 function addObject(kind, point) {
@@ -227,7 +298,7 @@ function addObject(kind, point) {
   const mesh = new THREE.Mesh(built.geometry, material);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
-  mesh.position.set(point.x, point.y + built.restY, point.z);
+  mesh.position.set(roundMm(point.x), roundMm(point.y + built.restY), roundMm(point.z));
   const record = registerObject(kind, mesh, { isPipe: !!built.isPipe });
   select(record);
   return record;
@@ -236,7 +307,7 @@ function addObject(kind, point) {
 function addWallSegment(p1, p2, color) {
   const dx = p2.x - p1.x, dz = p2.z - p1.z;
   const length = Math.hypot(dx, dz);
-  if (length < 0.05) return null;
+  if (length < 50) return null; // ignore an accidental near-zero-length tap
   const geometry = new THREE.BoxGeometry(length, WALL_HEIGHT, WALL_THICKNESS);
   const material = createPaintMaterial(color);
   const mesh = new THREE.Mesh(geometry, material);
@@ -249,7 +320,7 @@ function addWallSegment(p1, p2, color) {
 
 function buildWindowGroup(width, height, thickness, frameColor) {
   const group = new THREE.Group();
-  const bar = 0.06;
+  const bar = 60;
   const frameMat = createPaintMaterial(frameColor);
   const glassMat = createMaterial('glass', '#bfe3f0', scene.environment);
 
@@ -266,7 +337,7 @@ function buildWindowGroup(width, height, thickness, frameColor) {
   addBar(bar, height - 2 * bar, -width / 2 + bar / 2, 0);
   addBar(bar, height - 2 * bar, width / 2 - bar / 2, 0);
 
-  const glassGeom = new THREE.BoxGeometry(width - 2 * bar, height - 2 * bar, Math.max(0.02, thickness * 0.5));
+  const glassGeom = new THREE.BoxGeometry(width - 2 * bar, height - 2 * bar, Math.max(20, thickness * 0.5));
   const glassMesh = new THREE.Mesh(glassGeom, glassMat);
   glassMesh.userData.role = 'glass';
   group.add(glassMesh);
@@ -298,6 +369,21 @@ function deselect() {
   orbit.enabled = mode === 'edit';
   hideEl(selectionPanelEl);
   hideEl(modePillEl);
+}
+
+// Intrinsic size (local-space bounding box × scale) — the object's own
+// width/height/depth regardless of how it's rotated in the world, matching
+// what "this cube is 200 mm" should mean.
+function getObjectSizeMm(record) {
+  if (record.kind === 'window') {
+    const p = record.root.userData.windowParams;
+    return new THREE.Vector3(p.width, p.height, p.thickness);
+  }
+  const mesh = record.root;
+  mesh.geometry.computeBoundingBox(); // cheap; re-run in case CSG just replaced the geometry
+  const size = mesh.geometry.boundingBox.getSize(new THREE.Vector3());
+  size.multiply(mesh.scale);
+  return size;
 }
 
 function currentPaintColor(record) {
@@ -342,7 +428,7 @@ function performHolePlacement(clientX, clientY) {
   const hit = hits[0];
   const worldNormal = hit.face.normal.clone().transformDirection(selected.root.matrixWorld).normalize();
   selected.root.geometry.computeBoundingSphere();
-  const reach = (selected.root.geometry.boundingSphere?.radius || 1) * 2.5 + 0.2;
+  const reach = (selected.root.geometry.boundingSphere?.radius || 500) * 2.5 + 200;
 
   const drillGeom = new THREE.CylinderGeometry(holeRadius, holeRadius, reach, 20);
   const drill = new THREE.Mesh(drillGeom);
@@ -375,7 +461,7 @@ function attachSelectedPipe() {
 
   const pipe = selected.root;
   pipe.updateMatrixWorld(true);
-  const localHalf = 0.7; // matches the default pipe length (1.4) / 2 — pipes aren't resizable yet
+  const localHalf = 700; // matches the default pipe length (1400 mm) / 2 — pipes aren't resizable yet
   const endA = new THREE.Vector3(localHalf, 0, 0).applyMatrix4(pipe.matrixWorld);
   const endB = new THREE.Vector3(-localHalf, 0, 0).applyMatrix4(pipe.matrixWorld);
 
@@ -432,6 +518,12 @@ function renderSelectionPanel() {
   title.className = 'panel-title';
   title.textContent = KIND_LABELS[selected.kind] || selected.kind;
   selectionPanelEl.appendChild(title);
+
+  const size = getObjectSizeMm(selected);
+  const dims = document.createElement('p');
+  dims.className = 'dim-readout';
+  dims.textContent = `${formatMm(size.x)} × ${formatMm(size.y)} × ${formatMm(size.z)} мм`;
+  selectionPanelEl.appendChild(dims);
 
   selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
   selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
@@ -510,10 +602,10 @@ function renderHolePill() {
   const stepper = document.createElement('div');
   stepper.className = 'stepper';
   const minus = document.createElement('button'); minus.textContent = '–';
-  const val = document.createElement('span'); val.textContent = Math.round(holeRadius * 200) + ' см';
+  const val = document.createElement('span'); val.textContent = formatMm(holeRadius * 2, 0) + ' мм';
   const plus = document.createElement('button'); plus.textContent = '+';
-  minus.addEventListener('click', () => { holeRadius = Math.max(0.03, holeRadius - 0.02); renderHolePill(); });
-  plus.addEventListener('click', () => { holeRadius = Math.min(0.4, holeRadius + 0.02); renderHolePill(); });
+  minus.addEventListener('click', () => { holeRadius = Math.max(30, holeRadius - 20); renderHolePill(); });
+  plus.addEventListener('click', () => { holeRadius = Math.min(400, holeRadius + 20); renderHolePill(); });
   stepper.append(minus, val, plus);
   const cancel = document.createElement('button');
   cancel.className = 'ghost'; cancel.textContent = 'Скасувати';
@@ -633,6 +725,7 @@ function addWallPoint(clientX, clientY) {
   const ray = rayFromClient(clientX, clientY);
   const hit = new THREE.Vector3();
   if (!ray.ray.intersectPlane(groundPlane, hit)) return;
+  hit.set(roundMm(hit.x), roundMm(hit.y), roundMm(hit.z));
   wallPoints.push(hit.clone());
   if (wallPoints.length >= 2) {
     const rec = addWallSegment(wallPoints[wallPoints.length - 2], wallPoints[wallPoints.length - 1], wallColor);
@@ -654,7 +747,7 @@ function insertWindowAt(clientX, clientY) {
   const wall = hit.object;
   const local = wall.worldToLocal(hit.point.clone());
 
-  const margin = 0.12;
+  const margin = 120;
   const halfLen = (wallRecord.wallLength || 2) / 2;
   const maxX = Math.max(0, halfLen - WINDOW_WIDTH / 2 - margin);
   const clampedX = Math.max(-maxX, Math.min(maxX, local.x));
@@ -707,8 +800,8 @@ canvas.addEventListener('pointermove', (e) => {
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -selected.root.position.y);
     const hit = new THREE.Vector3();
     if (ray.ray.intersectPlane(plane, hit)) {
-      selected.root.position.x = hit.x;
-      selected.root.position.z = hit.z;
+      selected.root.position.x = roundMm(hit.x);
+      selected.root.position.z = roundMm(hit.z);
       outlineHelper?.update();
     }
   } else if (mode === 'walk') {
@@ -784,6 +877,7 @@ function enterWalkMode() {
   deselect();
   closePopover();
   hideEl(document.getElementById('toolbar'));
+  hideEl(scaleBarEl);
   orbit.enabled = false;
   showEl(crosshairEl);
   showEl(joystickEl);
@@ -796,6 +890,11 @@ function enterWalkMode() {
   pitch = Math.asin(Math.max(-1, Math.min(1, dir.y)));
   camera.position.y = EYE_HEIGHT;
   camera.rotation.order = 'YXZ';
+  // Walking tours human-scale space, not mm-level inspection — a fixed,
+  // generous pair is simpler and plenty for that.
+  camera.near = 10;
+  camera.far = 500000;
+  camera.updateProjectionMatrix();
 }
 
 function exitWalkMode() {
@@ -804,6 +903,7 @@ function exitWalkMode() {
   hideEl(joystickEl);
   hideEl(walkExitBtn);
   showEl(document.getElementById('toolbar'));
+  showEl(scaleBarEl);
   const forward = new THREE.Vector3();
   camera.getWorldDirection(forward);
   orbit.target.copy(camera.position).add(forward.multiplyScalar(5));
@@ -882,7 +982,7 @@ function updateWalkMovement(dt) {
 // Save / load project
 // ---------------------------------------------------------------------------
 function saveProject() {
-  const data = { app: 'creslarnet-3d', version: 1, objects: [] };
+  const data = { app: 'creslarnet-3d', version: 2, units: 'mm', objects: [] };
   for (const rec of objects) {
     if (rec.kind === 'window') {
       const p = rec.root.userData.windowParams;
@@ -932,6 +1032,10 @@ function parseGeometryJSON(json) {
 function loadProject(data) {
   if (!data || data.app !== 'creslarnet-3d' || !Array.isArray(data.objects)) {
     toast('Файл не розпізнано як проєкт Creslarnet');
+    return;
+  }
+  if (data.units !== 'mm') {
+    toast('Цей файл збережено старішою версією (в метрах) і несумісний із поточною системою мм. Створіть проєкт заново.');
     return;
   }
   clearScene();
@@ -989,6 +1093,8 @@ function animate() {
 
   if (mode === 'edit') {
     orbit.update();
+    updateAdaptiveClipping();
+    updateScaleBar();
   } else if (mode === 'walk') {
     updateWalkMovement(dt);
   }
