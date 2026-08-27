@@ -286,6 +286,27 @@ html, body {
   backdrop-filter: blur(6px);
 }
 
+/* ---------- floating axis dimension tags ---------- */
+.axis-tag {
+  position: fixed;
+  top: 0;
+  left: 0;
+  transform: translate(-50%, -50%);
+  z-index: 16;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 6px;
+  color: #fff;
+  pointer-events: none;
+  white-space: nowrap;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+.axis-tag-x { background: rgba(216, 62, 62, 0.88); }
+.axis-tag-y { background: rgba(58, 168, 90, 0.88); }
+.axis-tag-z { background: rgba(58, 108, 216, 0.88); }
+
 /* ---------- object dimension readout ---------- */
 .dim-readout {
   margin: 0 0 10px;

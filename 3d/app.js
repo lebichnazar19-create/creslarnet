@@ -25,7 +25,7 @@ const PAPER_COLOR = '#f7f4ec'; // warm paper white, distinct from the neutral de
 const KIND_LABELS = {
   cube: 'Куб', cylinder: 'Циліндр', pipe: 'Труба', sphere: 'Сфера', cone: 'Конус',
   wall: 'Стіна', window: 'Вікно', paper: 'Папір', sketchLine: 'Лінія на папері',
-  rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт',
+  rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт', ground: 'Земля',
 };
 
 // Quantize to the coordinate system's stated resolution: 0.1 mm.
@@ -96,8 +96,10 @@ sun.shadow.bias = -0.0008;
 scene.add(sun);
 
 const groundGeo = new THREE.PlaneGeometry(80000, 80000);
-const groundMat = new THREE.MeshStandardMaterial({ color: 0xd8dcc9, roughness: 0.95, metalness: 0 });
-const ground = new THREE.Mesh(groundGeo, groundMat);
+// Built via the same paint-material factory as everything else so the
+// ground can go through the normal colour/material picker (grass included)
+// once it's made selectable further down, once `objects`/raycastTargets exist.
+const ground = new THREE.Mesh(groundGeo, createPaintMaterial('#d8dcc9'));
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
@@ -137,7 +139,7 @@ function forwardHitDistance() {
   const dir = new THREE.Vector3();
   camera.getWorldDirection(dir);
   raycaster.set(camera.position, dir);
-  const hits = raycaster.intersectObjects(raycastTargets.concat(ground), false);
+  const hits = raycaster.intersectObjects(raycastTargets, false);
   if (hits.length) return hits[0].distance;
   return Math.max(1000, Math.abs(camera.position.y) * 3, 3000);
 }
@@ -170,6 +172,14 @@ resize();
 let nextId = 1;
 const objects = [];        // { id, kind, root, wallLength? }
 const raycastTargets = []; // flat list of every raycastable mesh, tagged userData.ownerId
+
+// The ground is selectable (for its colour/material — grass, etc.) but is
+// not a normal placed object: it's a singleton outside `objects[]`, so it
+// never shows up in group-select/merge/save-load and can't be deleted.
+const GROUND_ID = -1;
+const groundRecord = { id: GROUND_ID, kind: 'ground', root: ground };
+ground.userData.ownerId = GROUND_ID;
+raycastTargets.push(ground);
 
 let mode = 'edit'; // 'edit' | 'walk'
 let selected = null;
@@ -315,6 +325,7 @@ function removeObject(record) {
 
 function findRecordByMesh(mesh) {
   const id = mesh.userData.ownerId;
+  if (id === GROUND_ID) return groundRecord;
   return objects.find((r) => r.id === id) || null;
 }
 
@@ -531,18 +542,25 @@ function buildWindowGroup(width, height, thickness, frameColor) {
 // Selection & outline
 // ---------------------------------------------------------------------------
 let outlineHelper = null;
+let axesHelper = null;
 function select(record) {
   if (selected === record) return;
   deselect();
   selected = record;
   outlineHelper = new THREE.BoxHelper(record.root, 0x8338ec);
   scene.add(outlineHelper);
+  if (record.kind !== 'ground' && record.kind !== 'sketchLine') {
+    axesHelper = new THREE.AxesHelper(axisGizmoLocalSize(record));
+    record.root.add(axesHelper); // child — tracks position/rotation/scale for free
+  }
   closePopover();
   renderSelectionPanel();
 }
 
 function deselect() {
   if (outlineHelper) { scene.remove(outlineHelper); outlineHelper = null; }
+  if (axesHelper) { axesHelper.parent?.remove(axesHelper); axesHelper = null; }
+  hideEl(axisLabelEls.x); hideEl(axisLabelEls.y); hideEl(axisLabelEls.z);
   selected = null;
   holeToolActive = false;
   moveMode = false;
@@ -568,6 +586,71 @@ function getObjectSizeMm(record) {
   const size = mesh.geometry.boundingBox.getSize(new THREE.Vector3());
   size.multiply(mesh.scale);
   return size;
+}
+
+// The local (unscaled) half-extent to size the AxesHelper — as a child of
+// the object it inherits the object's own scale, so this length grows or
+// shrinks automatically as the object is resized without touching the
+// helper again.
+function axisGizmoLocalSize(record) {
+  if (record.kind === 'window') {
+    const p = record.root.userData.windowParams;
+    return Math.max(p.width, p.height, p.thickness) * 0.6;
+  }
+  record.root.geometry.computeBoundingBox();
+  const size = record.root.geometry.boundingBox.getSize(new THREE.Vector3());
+  return Math.max(size.x, size.y, size.z) * 0.6;
+}
+
+// ---------------------------------------------------------------------------
+// Live-updated "N mm" tags hovering at the tip of each axis of the selected
+// object's own local frame — the on-screen answer to "what does this axis
+// mean". Uses the object's actual local bounding box (not an assumed
+// centre) so it's correct even for a merged object whose geometry isn't
+// centred at its own origin.
+// ---------------------------------------------------------------------------
+const axisLabelEls = {
+  x: document.getElementById('axisLabelX'),
+  y: document.getElementById('axisLabelY'),
+  z: document.getElementById('axisLabelZ'),
+};
+
+function updateAxisLabels() {
+  if (!selected || selected.kind === 'ground' || selected.kind === 'sketchLine' || mode !== 'edit') {
+    hideEl(axisLabelEls.x); hideEl(axisLabelEls.y); hideEl(axisLabelEls.z);
+    return;
+  }
+  const root = selected.root;
+  let localMin, localMax, sizeMm;
+  if (selected.kind === 'window') {
+    const p = root.userData.windowParams;
+    localMin = new THREE.Vector3(-p.width / 2, -p.height / 2, -p.thickness / 2);
+    localMax = new THREE.Vector3(p.width / 2, p.height / 2, p.thickness / 2);
+    sizeMm = new THREE.Vector3(p.width, p.height, p.thickness).multiply(root.scale);
+  } else {
+    root.geometry.computeBoundingBox();
+    localMin = root.geometry.boundingBox.min;
+    localMax = root.geometry.boundingBox.max;
+    sizeMm = root.geometry.boundingBox.getSize(new THREE.Vector3()).multiply(root.scale);
+  }
+  const localCenter = localMin.clone().add(localMax).multiplyScalar(0.5);
+  const tips = {
+    x: new THREE.Vector3(localMax.x, localCenter.y, localCenter.z),
+    y: new THREE.Vector3(localCenter.x, localMax.y, localCenter.z),
+    z: new THREE.Vector3(localCenter.x, localCenter.y, localMax.z),
+  };
+  const texts = { x: `X: ${formatMm(sizeMm.x)} мм`, y: `Y: ${formatMm(sizeMm.y)} мм`, z: `Z: ${formatMm(sizeMm.z)} мм` };
+
+  for (const axis of ['x', 'y', 'z']) {
+    const worldTip = tips[axis].clone().applyMatrix4(root.matrixWorld);
+    const ndc = worldTip.project(camera);
+    const el = axisLabelEls[axis];
+    if (ndc.z < -1 || ndc.z > 1 || ndc.x < -1.2 || ndc.x > 1.2 || ndc.y < -1.2 || ndc.y > 1.2) { hideEl(el); continue; }
+    el.style.left = `${(ndc.x * 0.5 + 0.5) * window.innerWidth}px`;
+    el.style.top = `${(-ndc.y * 0.5 + 0.5) * window.innerHeight}px`;
+    el.textContent = texts[axis];
+    showEl(el);
+  }
 }
 
 // The UNSCALED local size along one axis — needed to work out what scale
@@ -839,6 +922,16 @@ function renderSelectionPanel() {
   title.className = 'panel-title';
   title.textContent = KIND_LABELS[selected.kind] || selected.kind;
   selectionPanelEl.appendChild(title);
+
+  if (selected.kind === 'ground') {
+    const hint = document.createElement('p');
+    hint.className = 'dim-readout';
+    hint.textContent = 'Поверхня землі — колір і матеріал (за бажанням, наприклад «Трава»).';
+    selectionPanelEl.appendChild(hint);
+    selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
+    selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
+    return;
+  }
 
   if (selected.kind === 'sketchLine') {
     const info = document.createElement('p');
@@ -1321,7 +1414,7 @@ function handleEditTap(x, y) {
 
   if (placingKind) {
     const ray = rayFromClient(x, y);
-    const hits = ray.intersectObjects(raycastTargets.concat(ground), false);
+    const hits = ray.intersectObjects(raycastTargets, false);
     if (hits.length) {
       addObject(placingKind, hits[0].point);
     } else {
@@ -1332,7 +1425,7 @@ function handleEditTap(x, y) {
   }
   if (placingLibraryEntry) {
     const ray = rayFromClient(x, y);
-    const hits = ray.intersectObjects(raycastTargets.concat(ground), false);
+    const hits = ray.intersectObjects(raycastTargets, false);
     if (hits.length) {
       insertMiniObject(placingLibraryEntry.data, hits[0].point);
       toast(`Розміщено: ${placingLibraryEntry.name}`);
@@ -1480,7 +1573,11 @@ function serializeObjectRecord(rec, positionOverride) {
 }
 
 function buildProjectData() {
-  return { app: 'creslarnet-3d', version: 2, units: 'mm', objects: objects.map((rec) => serializeObjectRecord(rec)) };
+  return {
+    app: 'creslarnet-3d', version: 2, units: 'mm',
+    ground: { type: ground.material.userData.creslarnetType, color: ground.material.userData.creslarnetColor },
+    objects: objects.map((rec) => serializeObjectRecord(rec)),
+  };
 }
 
 // A blob: URL behind an <a download> is not always honoured as a real save
@@ -1546,6 +1643,14 @@ function loadProject(data) {
     return;
   }
   clearScene();
+  if (data.ground) {
+    const newMat = data.ground.type === 'paint'
+      ? createPaintMaterial(data.ground.color)
+      : createMaterial(data.ground.type, data.ground.color, scene.environment);
+    ground.material.dispose();
+    ground.material = newMat;
+    if (selected === groundRecord) renderSelectionPanel();
+  }
   let maxId = 0;
   for (const item of data.objects) {
     maxId = Math.max(maxId, item.id || 0);
@@ -1685,7 +1790,7 @@ function toggleGroupMember(x, y) {
   const hits = rayFromClient(x, y).intersectObjects(raycastTargets, false);
   if (!hits.length) return;
   const rec = findRecordByMesh(hits[0].object);
-  if (!rec) return;
+  if (!rec || rec.kind === 'ground') return;
   if (groupSelection.has(rec)) {
     groupSelection.delete(rec);
     const helper = groupOutlineHelpers.get(rec);
@@ -1809,6 +1914,7 @@ function animate() {
     updateAdaptiveClipping(refDist);
     updateScaleBar(refDist);
     updateFreeCamera(dt, refDist);
+    updateAxisLabels();
   } else if (mode === 'walk') {
     updateFreeCamera(dt, 0);
   }

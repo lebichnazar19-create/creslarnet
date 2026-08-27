@@ -83,7 +83,24 @@ function metalTexture(color) {
   });
 }
 
-const REPEAT = { glass: 1, tile: 2, fabric: 3, wood: 1.5, metal: 1 };
+function grassTexture(color) {
+  return canvasTexture(128, (ctx, s) => {
+    ctx.fillStyle = `#${color.getHexString()}`;
+    ctx.fillRect(0, 0, s, s);
+    for (let i = 0; i < 500; i++) {
+      const x = Math.random() * s, y = Math.random() * s;
+      const len = 3 + Math.random() * 5;
+      ctx.strokeStyle = Math.random() > 0.5 ? 'rgba(0,0,0,0.14)' : 'rgba(255,255,255,0.12)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + (Math.random() - 0.5) * 2, y - len);
+      ctx.stroke();
+    }
+  });
+}
+
+const REPEAT = { glass: 1, tile: 2, fabric: 3, wood: 1.5, metal: 1, grass: 10 };
 
 export const MATERIAL_LABELS = {
   glass: 'Скло',
@@ -91,6 +108,7 @@ export const MATERIAL_LABELS = {
   fabric: 'Тканина',
   wood: 'Дерево',
   metal: 'Метал',
+  grass: 'Трава',
 };
 
 export function createMaterial(type, colorHex, envMap) {
@@ -135,6 +153,12 @@ export function createMaterial(type, colorHex, envMap) {
       material = new THREE.MeshStandardMaterial({ map, roughness: 0.3, metalness: 1, envMap, envMapIntensity: 1 });
       break;
     }
+    case 'grass': {
+      const map = grassTexture(color);
+      map.repeat.set(REPEAT.grass, REPEAT.grass);
+      material = new THREE.MeshStandardMaterial({ map, roughness: 0.95, metalness: 0 });
+      break;
+    }
     default:
       material = new THREE.MeshStandardMaterial({ color, roughness: 0.7, metalness: 0.05 });
   }
@@ -150,6 +174,7 @@ function defaultColor(type) {
     fabric: '#7d8fae',
     wood: '#9a6b3f',
     metal: '#a9adb3',
+    grass: '#5a9c4a',
   }[type] ?? '#cccccc';
 }
 
