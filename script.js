@@ -83,14 +83,218 @@ if ('serviceWorker' in navigator) {
   let shapes = [];
   let selected = null;
 
-  const KIND_LABELS = { line: 'Лінія', rect: 'Прямокутник', circle: 'Коло', arc: 'Дуга' };
+  const KIND_LABELS = { line: 'Лінія', rect: 'Прямокутник', circle: 'Коло', arc: 'Дуга', leader: 'Виноска' };
 
   function makePreviewShape(tool, x1, y1, x2, y2) {
     if (tool === 'line') return { type: 'line', x1, y1, x2, y2 };
     if (tool === 'rect') return { type: 'rect', x1, y1, x2, y2 };
     if (tool === 'circle') return { type: 'circle', cx: x1, cy: y1, r: Math.hypot(x2 - x1, y2 - y1) };
     if (tool === 'arc') return { type: 'arc', cx: x1, cy: y1, r: Math.hypot(x2 - x1, y2 - y1), startDeg: 0, endDeg: 360 };
+    if (tool === 'leader') return { type: 'leader', x1, y1, x2, y2, text: '' };
     return null;
+  }
+
+  // ---------------------------------------------------------------------
+  // ГОСТ-lite: material hatching for closed shapes (rect/circle) and a
+  // leader/callout tool for feature labels ("що це за гвинт", etc).
+  // Not a pixel-perfect reproduction of ГОСТ 2.306 — a practical, visually
+  // distinct set covering the materials/labels a hand drawing needs.
+  // ---------------------------------------------------------------------
+  const HATCH_LIST = [
+    { key: null, label: 'Немає' },
+    { key: 'metal', label: 'Метал' },
+    { key: 'wood', label: 'Дерево' },
+    { key: 'concrete', label: 'Бетон' },
+    { key: 'glass', label: 'Скло' },
+    { key: 'insulation', label: 'Ізоляція' },
+    { key: 'soil', label: 'Ґрунт' },
+  ];
+
+  function pseudoRandom01(gx, gy) {
+    const v = Math.sin(gx * 12.9898 + gy * 78.233) * 43758.5453;
+    return v - Math.floor(v);
+  }
+
+  // Parallel lines through the bounding box at a given angle, spaced in
+  // screen px — reused for every straight-line hatch style.
+  function drawParallelLines(context, bounds, angleDeg, spacingPx) {
+    const angle = (angleDeg * Math.PI) / 180;
+    const dx = Math.cos(angle), dy = Math.sin(angle);
+    const nx = -dy, ny = dx;
+    const cx = (bounds.x0 + bounds.x1) / 2, cy = (bounds.y0 + bounds.y1) / 2;
+    const diag = Math.hypot(bounds.x1 - bounds.x0, bounds.y1 - bounds.y0) || 1;
+    context.beginPath();
+    for (let o = -diag; o <= diag; o += spacingPx) {
+      const px = cx + nx * o, py = cy + ny * o;
+      context.moveTo(px - dx * diag, py - dy * diag);
+      context.lineTo(px + dx * diag, py + dy * diag);
+    }
+    context.stroke();
+  }
+
+  // Near-vertical lines with a slight wobble — suggests wood grain.
+  function drawGrainLines(context, bounds, spacingPx) {
+    const amp = Math.min(3, spacingPx * 0.25);
+    for (let x = bounds.x0 + spacingPx / 2; x <= bounds.x1; x += spacingPx) {
+      context.beginPath();
+      context.moveTo(x, bounds.y0);
+      const mid = (bounds.y0 + bounds.y1) / 2;
+      context.quadraticCurveTo(x + amp, mid, x, bounds.y1);
+      context.stroke();
+    }
+  }
+
+  // Horizontal loop/wave rows — standard-ish thermal-insulation symbol.
+  function drawWavyRows(context, bounds, spacingPx) {
+    const amp = spacingPx * 0.35;
+    for (let y = bounds.y0 + spacingPx / 2; y <= bounds.y1; y += spacingPx) {
+      context.beginPath();
+      let x = bounds.x0;
+      context.moveTo(x, y);
+      let up = true;
+      while (x < bounds.x1) {
+        const nx = Math.min(bounds.x1, x + amp * 2);
+        context.quadraticCurveTo(x + amp, y + (up ? -amp : amp), nx, y);
+        x = nx; up = !up;
+      }
+      context.stroke();
+    }
+  }
+
+  function drawScatterDots(context, bounds, spacingPx, sizePx) {
+    context.beginPath();
+    for (let gy = 0; bounds.y0 + gy * spacingPx <= bounds.y1; gy++) {
+      for (let gx = 0; bounds.x0 + gx * spacingPx <= bounds.x1; gx++) {
+        const jx = pseudoRandom01(gx, gy), jy = pseudoRandom01(gx + 91, gy + 17);
+        const x = bounds.x0 + gx * spacingPx + jx * spacingPx * 0.6;
+        const y = bounds.y0 + gy * spacingPx + jy * spacingPx * 0.6;
+        context.moveTo(x + sizePx, y);
+        context.arc(x, y, sizePx, 0, Math.PI * 2);
+      }
+    }
+    context.fill();
+  }
+
+  const HATCH_DEFS = {
+    metal: (context, bounds) => {
+      context.lineWidth = 1;
+      drawParallelLines(context, bounds, 45, Math.max(3, 3 * view.scale));
+    },
+    wood: (context, bounds) => {
+      context.lineWidth = 1;
+      drawGrainLines(context, bounds, Math.max(4, 4 * view.scale));
+    },
+    concrete: (context, bounds) => {
+      context.lineWidth = 1;
+      const spacing = Math.max(4, 5 * view.scale);
+      drawParallelLines(context, bounds, 45, spacing);
+      drawParallelLines(context, bounds, 135, spacing);
+      drawScatterDots(context, bounds, spacing, Math.max(1, 0.9 * view.scale));
+    },
+    glass: (context, bounds) => {
+      context.lineWidth = 0.75;
+      const spacing = Math.max(2.5, 2 * view.scale);
+      drawParallelLines(context, bounds, 45, spacing);
+      drawParallelLines(context, bounds, 135, spacing);
+    },
+    insulation: (context, bounds) => {
+      context.lineWidth = 1;
+      drawWavyRows(context, bounds, Math.max(5, 5 * view.scale));
+    },
+    soil: (context, bounds) => {
+      context.lineWidth = 1;
+      context.setLineDash([Math.max(2, 1.5 * view.scale), Math.max(2, 1.5 * view.scale)]);
+      drawParallelLines(context, bounds, 45, Math.max(3, 3 * view.scale));
+      context.setLineDash([]);
+    },
+  };
+
+  function shapeHatchBounds(s) {
+    if (s.type === 'rect') {
+      const a = mmToPx({ x: s.x1, y: s.y1 }), b = mmToPx({ x: s.x2, y: s.y2 });
+      return { x0: Math.min(a.x, b.x), y0: Math.min(a.y, b.y), x1: Math.max(a.x, b.x), y1: Math.max(a.y, b.y) };
+    }
+    if (s.type === 'circle') {
+      const c = mmToPx({ x: s.cx, y: s.cy }), r = Math.max(0.01, s.r * view.scale);
+      return { x0: c.x - r, y0: c.y - r, x1: c.x + r, y1: c.y + r, circle: { cx: c.x, cy: c.y, r } };
+    }
+    return null;
+  }
+
+  function drawHatch(context, s) {
+    if (!s.hatch || !HATCH_DEFS[s.hatch]) return;
+    const bounds = shapeHatchBounds(s);
+    if (!bounds) return;
+    context.save();
+    context.beginPath();
+    if (bounds.circle) context.arc(bounds.circle.cx, bounds.circle.cy, bounds.circle.r, 0, Math.PI * 2);
+    else context.rect(bounds.x0, bounds.y0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+    context.clip();
+    context.strokeStyle = s.color;
+    context.fillStyle = s.color;
+    HATCH_DEFS[s.hatch](context, bounds, s);
+    context.restore();
+  }
+
+  // ---------------------------------------------------------------------
+  // Leader/callout: feature point -> elbow -> text shelf, ГОСТ-style.
+  // ---------------------------------------------------------------------
+  const LEADER_TEXT_HEIGHT_MM = 3.5;
+
+  function leaderGeometry(s) {
+    const p1 = mmToPx({ x: s.x1, y: s.y1 });
+    const p2 = mmToPx({ x: s.x2, y: s.y2 });
+    const fontPx = Math.max(9, LEADER_TEXT_HEIGHT_MM * view.scale);
+    const text = s.text || '';
+    ctx.font = `${fontPx}px "Segoe UI", Roboto, sans-serif`;
+    const textW = text ? ctx.measureText(text).width : 0;
+    const dir = p2.x >= p1.x ? 1 : -1;
+    const shelfLen = Math.max(10, textW + 6);
+    const p3 = { x: p2.x + dir * shelfLen, y: p2.y };
+    const textX = dir === 1 ? p2.x + 4 : p3.x + 4;
+    const textY = p2.y - 4;
+    return { p1, p2, p3, fontPx, text, dir, textX, textY };
+  }
+
+  function drawLeader(context, s, isPreview) {
+    const g = leaderGeometry(s);
+    context.save();
+    context.strokeStyle = s.color;
+    context.fillStyle = s.color;
+    context.lineWidth = Math.max(1, s.lineWidthMm * view.scale);
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    if (isPreview) context.globalAlpha = 0.75;
+
+    context.beginPath();
+    context.moveTo(g.p1.x, g.p1.y);
+    context.lineTo(g.p2.x, g.p2.y);
+    context.lineTo(g.p3.x, g.p3.y);
+    context.stroke();
+
+    // Arrowhead pointing at the feature point.
+    const ang = Math.atan2(g.p2.y - g.p1.y, g.p2.x - g.p1.x);
+    const headLen = Math.max(6, 3 * view.scale);
+    context.beginPath();
+    context.moveTo(g.p1.x, g.p1.y);
+    context.lineTo(g.p1.x + headLen * Math.cos(ang - 0.32), g.p1.y + headLen * Math.sin(ang - 0.32));
+    context.lineTo(g.p1.x + headLen * Math.cos(ang + 0.32), g.p1.y + headLen * Math.sin(ang + 0.32));
+    context.closePath();
+    context.fill();
+
+    if (g.text) {
+      context.font = `${g.fontPx}px "Segoe UI", Roboto, sans-serif`;
+      context.textBaseline = 'alphabetic';
+      context.fillText(g.text, g.textX, g.textY);
+    }
+    context.globalAlpha = 1;
+    context.restore();
+  }
+
+  function renderOneShape(context, s, isPreview) {
+    if (s.type === 'leader') { drawLeader(context, s, isPreview); return; }
+    drawHatch(context, s);
+    drawShape(context, s, isPreview);
   }
 
   function shapeLengthMm(s) { return s.type === 'line' ? Math.hypot(s.x2 - s.x1, s.y2 - s.y1) : 0; }
@@ -141,6 +345,9 @@ if ('serviceWorker' in navigator) {
         const c = mmToPx({ x: s.cx, y: s.cy });
         const dist = Math.hypot(p.x - c.x, p.y - c.y);
         if (Math.abs(dist - s.r * view.scale) <= HIT_TOLERANCE_PX + s.lineWidthMm * view.scale / 2) return s;
+      } else if (s.type === 'leader') {
+        const g = leaderGeometry(s);
+        if (Math.min(distToSegment(p, g.p1, g.p2), distToSegment(p, g.p2, g.p3)) <= HIT_TOLERANCE_PX) return s;
       }
     }
     return null;
@@ -194,8 +401,8 @@ if ('serviceWorker' in navigator) {
     }
     ctx.restore();
 
-    for (const s of shapes) drawShape(ctx, s, false);
-    if (dragPreview) drawShape(ctx, dragPreview, true);
+    for (const s of shapes) renderOneShape(ctx, s, false);
+    if (dragPreview) renderOneShape(ctx, dragPreview, true);
 
     if (selected) {
       ctx.save();
@@ -203,15 +410,17 @@ if ('serviceWorker' in navigator) {
       ctx.lineWidth = 2;
       ctx.setLineDash([6, 4]);
       const pad = 4;
-      if (selected.type === 'line') {
+      if (selected.type === 'line' || selected.type === 'rect') {
         const a = mmToPx({ x: selected.x1, y: selected.y1 }), b = mmToPx({ x: selected.x2, y: selected.y2 });
         ctx.strokeRect(Math.min(a.x, b.x) - pad, Math.min(a.y, b.y) - pad, Math.abs(b.x - a.x) + pad * 2, Math.abs(b.y - a.y) + pad * 2);
-      } else if (selected.type === 'rect') {
-        const a = mmToPx({ x: selected.x1, y: selected.y1 }), b = mmToPx({ x: selected.x2, y: selected.y2 });
-        ctx.strokeRect(Math.min(a.x, b.x) - pad, Math.min(a.y, b.y) - pad, Math.abs(b.x - a.x) + pad * 2, Math.abs(b.y - a.y) + pad * 2);
-      } else {
+      } else if (selected.type === 'circle' || selected.type === 'arc') {
         const c = mmToPx({ x: selected.cx, y: selected.cy });
         ctx.beginPath(); ctx.arc(c.x, c.y, selected.r * view.scale + pad, 0, Math.PI * 2); ctx.stroke();
+      } else if (selected.type === 'leader') {
+        const g = leaderGeometry(selected);
+        const xs = [g.p1.x, g.p2.x, g.p3.x], ys = [g.p1.y, g.p2.y, g.p3.y];
+        const x0 = Math.min(...xs) - pad, x1 = Math.max(...xs) + pad, y0 = Math.min(...ys) - pad, y1 = Math.max(...ys) + pad;
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
       }
       ctx.restore();
     }
@@ -343,6 +552,20 @@ if ('serviceWorker' in navigator) {
       field('Висота', () => Math.abs(selected.y2 - selected.y1), (v) => { selected.y2 = selected.y1 + Math.sign(selected.y2 - selected.y1 || 1) * v; });
     } else if (selected.type === 'circle') {
       field('Радіус', () => selected.r, (v) => { selected.r = v; });
+    } else if (selected.type === 'leader') {
+      const row = document.createElement('div');
+      row.className = 'dim-row';
+      const label = document.createElement('span');
+      label.className = 'dim-label';
+      label.textContent = 'Текст';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'dim-input';
+      input.style.textAlign = 'left';
+      input.value = selected.text || '';
+      input.addEventListener('change', () => { selected.text = input.value; requestRedraw(); });
+      row.append(label, input);
+      dimPanel.appendChild(row);
     } else if (selected.type === 'arc') {
       field('Радіус', () => selected.r, (v) => { selected.r = v; });
       const row = document.createElement('div');
@@ -357,6 +580,27 @@ if ('serviceWorker' in navigator) {
       plus.addEventListener('click', () => { selected.endDeg = selected.startDeg + Math.min(360, sweep() + 15); requestRedraw(); renderDimPanel(); });
       row.append(label, minus, val, plus);
       dimPanel.appendChild(row);
+    }
+
+    if (selected.type === 'rect' || selected.type === 'circle') {
+      const hatchLabel = document.createElement('p');
+      hatchLabel.className = 'hatch-label';
+      hatchLabel.textContent = 'Штрихування (матеріал)';
+      dimPanel.appendChild(hatchLabel);
+      const wrap = document.createElement('div');
+      wrap.className = 'hatch-options';
+      HATCH_LIST.forEach(({ key, label: hLabel }) => {
+        const b = document.createElement('button');
+        b.className = 'hatch-btn' + ((selected.hatch || null) === key ? ' active' : '');
+        b.textContent = hLabel;
+        b.addEventListener('click', () => {
+          selected.hatch = key;
+          requestRedraw();
+          renderDimPanel();
+        });
+        wrap.appendChild(b);
+      });
+      dimPanel.appendChild(wrap);
     }
 
     const delBtn = document.createElement('button');
@@ -393,7 +637,7 @@ if ('serviceWorker' in navigator) {
   }
 
   function cloneShapeCoords(s) {
-    if (s.type === 'line' || s.type === 'rect') return { x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2 };
+    if (s.type === 'line' || s.type === 'rect' || s.type === 'leader') return { x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2 };
     return { cx: s.cx, cy: s.cy };
   }
 
@@ -496,6 +740,12 @@ if ('serviceWorker' in navigator) {
       shape.id = nextId++;
       shapes.push(shape);
       select(shape);
+      if (shape.type === 'leader') {
+        const t = window.prompt('Текст виноски (наприклад: "Гвинт М8 ГОСТ 1491"):', '');
+        shape.text = t || '';
+        renderDimPanel();
+        requestRedraw();
+      }
     }
   }
   window.addEventListener('pointerup', endPointer);
