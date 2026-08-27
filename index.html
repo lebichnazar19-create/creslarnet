@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Creslarnet — прототип 2D</title>
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#8338ec">
+<link rel="icon" href="icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Creslarnet">
+<meta name="mobile-web-app-capable" content="yes">
+
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Creslarnet <span class="subtitle">— прототип 2D-режиму</span></h1>
+  </header>
+
+  <div class="workspace">
+    <aside class="toolbar">
+      <div class="tool-group">
+        <h2>Інструменти</h2>
+        <button class="tool-btn active" data-tool="line" title="Лінія">
+          <svg viewBox="0 0 24 24"><line x1="4" y1="20" x2="20" y2="4"/></svg>
+          Лінія
+        </button>
+        <button class="tool-btn" data-tool="rect" title="Прямокутник">
+          <svg viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1"/></svg>
+          Прямокутник
+        </button>
+        <button class="tool-btn" data-tool="circle" title="Коло">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>
+          Коло
+        </button>
+      </div>
+
+      <div class="tool-group">
+        <h2>Колір</h2>
+        <div class="colors">
+          <button class="color-swatch active" data-color="#1a1a1a" style="background:#1a1a1a"></button>
+          <button class="color-swatch" data-color="#e63946" style="background:#e63946"></button>
+          <button class="color-swatch" data-color="#2a9d8f" style="background:#2a9d8f"></button>
+          <button class="color-swatch" data-color="#264653" style="background:#264653"></button>
+          <button class="color-swatch" data-color="#f4a261" style="background:#f4a261"></button>
+          <button class="color-swatch" data-color="#8338ec" style="background:#8338ec"></button>
+        </div>
+        <label class="custom-color-label">
+          Свій колір
+          <input type="color" id="customColor" value="#1a1a1a">
+        </label>
+      </div>
+
+      <div class="tool-group">
+        <h2>Товщина лінії</h2>
+        <input type="range" id="lineWidth" min="1" max="20" value="3">
+        <span id="lineWidthValue">3 px</span>
+      </div>
+
+      <div class="tool-group">
+        <h2>Дії</h2>
+        <button class="action-btn" id="undoBtn">Скасувати</button>
+        <button class="action-btn" id="clearBtn">Очистити полотно</button>
+        <button class="action-btn" id="exportBtn">Зберегти як PNG</button>
+      </div>
+    </aside>
+
+    <main class="canvas-area">
+      <div class="canvas-shadow">
+        <canvas id="drawCanvas" width="794" height="1123"></canvas>
+      </div>
+      <p class="canvas-hint">Формат A4 (210×297 мм, 96 DPI) — тримайте кнопку миші та тягніть, щоб намалювати фігуру</p>
+    </main>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
