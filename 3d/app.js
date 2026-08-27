@@ -1,0 +1,1007 @@
+import * as THREE from './vendor/three/three.module.min.js';
+import { OrbitControls } from './vendor/three/OrbitControls.js';
+import { RoomEnvironment } from './vendor/three/RoomEnvironment.js';
+import { CSG } from './csg.js';
+import { createMaterial, createPaintMaterial, MATERIAL_LABELS } from './materials.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const PALETTE = ['#1a1a1a', '#e63946', '#2a9d8f', '#264653', '#f4a261', '#8338ec'];
+const DEFAULT_PAINT = '#cfcfd6';
+const WALL_HEIGHT = 2.6;
+const WALL_THICKNESS = 0.15;
+const DEFAULT_WALL_COLOR = '#e8e4da';
+const WINDOW_WIDTH = 1.0;
+const WINDOW_HEIGHT = 1.2;
+const EYE_HEIGHT = 1.65;
+const WALK_SPEED = 3.2; // metres / second
+
+const KIND_LABELS = { cube: 'Куб', cylinder: 'Циліндр', pipe: 'Труба', sphere: 'Сфера', cone: 'Конус', wall: 'Стіна', window: 'Вікно' };
+
+// ---------------------------------------------------------------------------
+// Scene bootstrap
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('viewport');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+
+const scene = new THREE.Scene();
+const SKY_COLOR = 0xbfe0e6;
+scene.background = new THREE.Color(SKY_COLOR);
+scene.fog = new THREE.Fog(SKY_COLOR, 26, 90);
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+pmrem.dispose();
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 300);
+camera.position.set(6, 5, 9);
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0x8a7a63, 0.9);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff3e0, 1.6);
+sun.position.set(10, 14, 6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1536, 1536);
+sun.shadow.camera.left = -20;
+sun.shadow.camera.right = 20;
+sun.shadow.camera.top = 20;
+sun.shadow.camera.bottom = -20;
+sun.shadow.camera.far = 50;
+sun.shadow.bias = -0.0008;
+scene.add(sun);
+
+const groundGeo = new THREE.PlaneGeometry(80, 80);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0xd8dcc9, roughness: 0.95, metalness: 0 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const grid = new THREE.GridHelper(80, 80, 0x7a8a70, 0xa9b39a);
+grid.material.opacity = 0.35;
+grid.material.transparent = true;
+grid.position.y = 0.002;
+scene.add(grid);
+
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.target.set(0, 1, 0);
+orbit.enableDamping = true;
+orbit.maxPolarAngle = Math.PI / 2 - 0.02;
+orbit.minDistance = 1.5;
+orbit.maxDistance = 45;
+
+function resize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
+let nextId = 1;
+const objects = [];        // { id, kind, root, wallLength? }
+const raycastTargets = []; // flat list of every raycastable mesh, tagged userData.ownerId
+
+let mode = 'edit'; // 'edit' | 'walk'
+let selected = null;
+let placingKind = null;
+let wallDrawing = false;
+let wallColor = DEFAULT_WALL_COLOR;
+let wallPoints = [];
+let wallSegmentsThisDraw = [];
+let windowToolActive = false;
+let windowFrameColor = '#f2efe6';
+let holeToolActive = false;
+let holeRadius = 0.08;
+let moveMode = false;
+let moveDragging = false;
+
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+function rayFromClient(x, y) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.x = ((x - rect.left) / rect.width) * 2 - 1;
+  ndc.y = -((y - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  return raycaster;
+}
+
+// ---------------------------------------------------------------------------
+// UI helpers
+// ---------------------------------------------------------------------------
+const toastEl = document.getElementById('toast');
+let toastTimer = null;
+function toast(msg, ms = 2400) {
+  toastEl.textContent = msg;
+  toastEl.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.add('hidden'), ms);
+}
+
+function colorSwatchRow(currentColor, onPick) {
+  const row = document.createElement('div');
+  row.className = 'panel-row';
+  for (const c of PALETTE) {
+    const b = document.createElement('button');
+    b.className = 'swatch' + (c.toLowerCase() === currentColor?.toLowerCase() ? ' selected' : '');
+    b.style.background = c;
+    b.addEventListener('click', () => onPick(c));
+    row.appendChild(b);
+  }
+  const custom = document.createElement('input');
+  custom.type = 'color';
+  custom.value = currentColor || '#888888';
+  custom.className = 'swatch-custom';
+  custom.style.background = 'none';
+  custom.addEventListener('input', () => onPick(custom.value));
+  row.appendChild(custom);
+  return row;
+}
+
+function materialSwatchRow(onPick) {
+  const row = document.createElement('div');
+  row.className = 'panel-row';
+  for (const key of Object.keys(MATERIAL_LABELS)) {
+    const b = document.createElement('button');
+    b.className = 'pbtn';
+    b.textContent = MATERIAL_LABELS[key];
+    b.addEventListener('click', () => onPick(key));
+    row.appendChild(b);
+  }
+  return row;
+}
+
+// ---------------------------------------------------------------------------
+// Object registry
+// ---------------------------------------------------------------------------
+function registerObject(kind, root, extra = {}) {
+  const id = nextId++;
+  root.traverse((o) => { if (o.isMesh) { o.userData.ownerId = id; raycastTargets.push(o); } });
+  const record = { id, kind, root, ...extra };
+  objects.push(record);
+  scene.add(root);
+  return record;
+}
+
+function removeObject(record) {
+  scene.remove(record.root);
+  record.root.traverse((o) => {
+    if (o.isMesh) {
+      const idx = raycastTargets.indexOf(o);
+      if (idx !== -1) raycastTargets.splice(idx, 1);
+      o.geometry.dispose();
+      if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose());
+      else o.material.dispose();
+    }
+  });
+  const idx = objects.indexOf(record);
+  if (idx !== -1) objects.splice(idx, 1);
+  if (selected === record) deselect();
+}
+
+function findRecordByMesh(mesh) {
+  const id = mesh.userData.ownerId;
+  return objects.find((r) => r.id === id) || null;
+}
+
+// ---------------------------------------------------------------------------
+// Shape builders
+// ---------------------------------------------------------------------------
+function buildPipeGeometry(outerR = 0.22, innerR = 0.14, length = 1.4, radialSegments = 20) {
+  const shape = new THREE.Shape();
+  shape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
+  const hole = new THREE.Path();
+  hole.absarc(0, 0, innerR, 0, Math.PI * 2, true);
+  shape.holes.push(hole);
+  const geometry = new THREE.ExtrudeGeometry(shape, { depth: length, bevelEnabled: false, curveSegments: radialSegments });
+  geometry.rotateY(-Math.PI / 2);
+  geometry.translate(length / 2, 0, 0);
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+const KIND_DEFS = {
+  cube: { build: () => ({ geometry: new THREE.BoxGeometry(1, 1, 1), restY: 0.5 }) },
+  sphere: { build: () => ({ geometry: new THREE.SphereGeometry(0.5, 32, 16), restY: 0.5 }) },
+  cone: { build: () => ({ geometry: new THREE.ConeGeometry(0.5, 1, 32), restY: 0.5 }) },
+  cylinder: { build: () => ({ geometry: new THREE.CylinderGeometry(0.5, 0.5, 1, 32), restY: 0.5 }) },
+  pipe: { build: () => ({ geometry: buildPipeGeometry(), restY: 0.22, isPipe: true }) },
+};
+
+function addObject(kind, point) {
+  const def = KIND_DEFS[kind];
+  const built = def.build();
+  const material = createPaintMaterial(DEFAULT_PAINT);
+  const mesh = new THREE.Mesh(built.geometry, material);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.position.set(point.x, point.y + built.restY, point.z);
+  const record = registerObject(kind, mesh, { isPipe: !!built.isPipe });
+  select(record);
+  return record;
+}
+
+function addWallSegment(p1, p2, color) {
+  const dx = p2.x - p1.x, dz = p2.z - p1.z;
+  const length = Math.hypot(dx, dz);
+  if (length < 0.05) return null;
+  const geometry = new THREE.BoxGeometry(length, WALL_HEIGHT, WALL_THICKNESS);
+  const material = createPaintMaterial(color);
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.position.set((p1.x + p2.x) / 2, WALL_HEIGHT / 2, (p1.z + p2.z) / 2);
+  mesh.rotation.y = Math.atan2(-dz, dx);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  return registerObject('wall', mesh, { wallLength: length });
+}
+
+function buildWindowGroup(width, height, thickness, frameColor) {
+  const group = new THREE.Group();
+  const bar = 0.06;
+  const frameMat = createPaintMaterial(frameColor);
+  const glassMat = createMaterial('glass', '#bfe3f0', scene.environment);
+
+  function addBar(w, h, x, y) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, thickness), frameMat);
+    m.position.set(x, y, 0);
+    m.userData.role = 'frame';
+    m.castShadow = true;
+    m.receiveShadow = true;
+    group.add(m);
+  }
+  addBar(width, bar, 0, height / 2 - bar / 2);
+  addBar(width, bar, 0, -height / 2 + bar / 2);
+  addBar(bar, height - 2 * bar, -width / 2 + bar / 2, 0);
+  addBar(bar, height - 2 * bar, width / 2 - bar / 2, 0);
+
+  const glassGeom = new THREE.BoxGeometry(width - 2 * bar, height - 2 * bar, Math.max(0.02, thickness * 0.5));
+  const glassMesh = new THREE.Mesh(glassGeom, glassMat);
+  glassMesh.userData.role = 'glass';
+  group.add(glassMesh);
+
+  group.userData.windowParams = { width, height, thickness, frameColor };
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// Selection & outline
+// ---------------------------------------------------------------------------
+let outlineHelper = null;
+function select(record) {
+  if (selected === record) return;
+  deselect();
+  selected = record;
+  outlineHelper = new THREE.BoxHelper(record.root, 0x8338ec);
+  scene.add(outlineHelper);
+  closePopover();
+  renderSelectionPanel();
+}
+
+function deselect() {
+  if (outlineHelper) { scene.remove(outlineHelper); outlineHelper = null; }
+  selected = null;
+  holeToolActive = false;
+  moveMode = false;
+  moveDragging = false;
+  orbit.enabled = mode === 'edit';
+  hideEl(selectionPanelEl);
+  hideEl(modePillEl);
+}
+
+function currentPaintColor(record) {
+  const meshes = [];
+  record.root.traverse((o) => { if (o.isMesh && o.userData.role !== 'glass') meshes.push(o); });
+  const m = meshes[0]?.material;
+  return m?.userData?.creslarnetColor || DEFAULT_PAINT;
+}
+
+function applyColorToSelected(color) {
+  if (!selected) return;
+  selected.root.traverse((o) => {
+    if (!o.isMesh || o.userData.role === 'glass') return;
+    const type = o.material.userData.creslarnetType;
+    const newMat = type && type !== 'paint' ? createMaterial(type, color, scene.environment) : createPaintMaterial(color);
+    o.material.dispose();
+    o.material = newMat;
+  });
+  renderSelectionPanel();
+}
+
+function applyMaterialToSelected(type) {
+  if (!selected) return;
+  const color = currentPaintColor(selected);
+  selected.root.traverse((o) => {
+    if (!o.isMesh || o.userData.role === 'glass') return;
+    const newMat = createMaterial(type, color, scene.environment);
+    o.material.dispose();
+    o.material = newMat;
+  });
+  renderSelectionPanel();
+}
+
+// ---------------------------------------------------------------------------
+// Hole tool (works on any single-mesh object: cube/cylinder/pipe/sphere/cone/wall)
+// ---------------------------------------------------------------------------
+function performHolePlacement(clientX, clientY) {
+  if (!selected || !selected.root.isMesh) return;
+  const ray = rayFromClient(clientX, clientY);
+  const hits = ray.intersectObject(selected.root, false);
+  if (!hits.length) { toast('Торкніться поверхні обраного об’єкта'); return; }
+  const hit = hits[0];
+  const worldNormal = hit.face.normal.clone().transformDirection(selected.root.matrixWorld).normalize();
+  selected.root.geometry.computeBoundingSphere();
+  const reach = (selected.root.geometry.boundingSphere?.radius || 1) * 2.5 + 0.2;
+
+  const drillGeom = new THREE.CylinderGeometry(holeRadius, holeRadius, reach, 20);
+  const drill = new THREE.Mesh(drillGeom);
+  drill.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), worldNormal);
+  drill.position.copy(hit.point);
+  drill.updateMatrixWorld(true);
+
+  try {
+    const result = CSG.subtract(selected.root, drill);
+    if (!result.attributes.position.count) throw new Error('empty result');
+    selected.root.geometry.dispose();
+    selected.root.geometry = result;
+    toast('Отвір створено');
+  } catch (e) {
+    toast('Не вдалося вирізати отвір тут — спробуйте інше місце');
+  }
+  holeToolActive = false;
+  hideEl(modePillEl);
+  showEl(selectionPanelEl);
+  if (outlineHelper) outlineHelper.update();
+}
+
+// ---------------------------------------------------------------------------
+// Pipe attach / snap
+// ---------------------------------------------------------------------------
+function attachSelectedPipe() {
+  if (!selected || !selected.isPipe) return;
+  const others = objects.filter((r) => r !== selected);
+  if (!others.length) { toast('Немає інших об’єктів для прикріплення'); return; }
+
+  const pipe = selected.root;
+  pipe.updateMatrixWorld(true);
+  const localHalf = 0.7; // matches the default pipe length (1.4) / 2 — pipes aren't resizable yet
+  const endA = new THREE.Vector3(localHalf, 0, 0).applyMatrix4(pipe.matrixWorld);
+  const endB = new THREE.Vector3(-localHalf, 0, 0).applyMatrix4(pipe.matrixWorld);
+
+  let best = null;
+  for (const rec of others) {
+    const targetCenter = new THREE.Vector3();
+    new THREE.Box3().setFromObject(rec.root).getCenter(targetCenter);
+    const targetRadius = new THREE.Box3().setFromObject(rec.root).getSize(new THREE.Vector3()).length() / 2.5;
+    for (const [end, other] of [[endA, endB], [endB, endA]]) {
+      const d = end.distanceTo(targetCenter);
+      if (!best || d < best.d) best = { d, near: end, far: other, targetCenter, targetRadius };
+    }
+  }
+  if (!best) return;
+
+  const dirToTarget = new THREE.Vector3().subVectors(best.targetCenter, best.far).normalize();
+  const attachPoint = new THREE.Vector3().copy(best.targetCenter).sub(dirToTarget.clone().multiplyScalar(best.targetRadius));
+  const newDir = new THREE.Vector3().subVectors(attachPoint, best.far).normalize();
+  const length = localHalf * 2;
+
+  // does local +X currently point toward `near` or away from it?
+  const currentAxis = new THREE.Vector3(1, 0, 0).applyQuaternion(pipe.quaternion);
+  const nearIsPlusX = currentAxis.dot(new THREE.Vector3().subVectors(best.near, best.far)) > 0;
+  const axisTarget = nearIsPlusX ? newDir : newDir.clone().negate();
+
+  pipe.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), axisTarget);
+  const center = new THREE.Vector3().copy(best.far).add(newDir.clone().multiplyScalar(length / 2));
+  pipe.position.copy(center);
+  if (outlineHelper) outlineHelper.update();
+  toast('Трубу прикріплено');
+}
+
+// ---------------------------------------------------------------------------
+// Selection panel rendering
+// ---------------------------------------------------------------------------
+const selectionPanelEl = document.getElementById('selectionPanel');
+const modePillEl = document.getElementById('modePill');
+function hideEl(el) { el.classList.add('hidden'); }
+function showEl(el) { el.classList.remove('hidden'); }
+
+function renderSelectionPanel() {
+  if (!selected) { hideEl(selectionPanelEl); return; }
+  selectionPanelEl.innerHTML = '';
+  showEl(selectionPanelEl);
+  hideEl(modePillEl);
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'close-x';
+  closeBtn.textContent = '✕';
+  closeBtn.addEventListener('click', deselect);
+  selectionPanelEl.appendChild(closeBtn);
+
+  const title = document.createElement('p');
+  title.className = 'panel-title';
+  title.textContent = KIND_LABELS[selected.kind] || selected.kind;
+  selectionPanelEl.appendChild(title);
+
+  selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
+  selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
+
+  const actions = document.createElement('div');
+  actions.className = 'panel-row';
+
+  const rotL = document.createElement('button');
+  rotL.className = 'pbtn'; rotL.textContent = '↺ 15°';
+  rotL.addEventListener('click', () => { selected.root.rotation.y -= Math.PI / 12; outlineHelper?.update(); });
+  actions.appendChild(rotL);
+
+  const rotR = document.createElement('button');
+  rotR.className = 'pbtn'; rotR.textContent = '↻ 15°';
+  rotR.addEventListener('click', () => { selected.root.rotation.y += Math.PI / 12; outlineHelper?.update(); });
+  actions.appendChild(rotR);
+
+  const moveBtn = document.createElement('button');
+  moveBtn.className = 'pbtn'; moveBtn.textContent = '✥ Перемістити';
+  moveBtn.addEventListener('click', enterMoveMode);
+  actions.appendChild(moveBtn);
+
+  if (selected.root.isMesh) {
+    const holeBtn = document.createElement('button');
+    holeBtn.className = 'pbtn'; holeBtn.textContent = '◎ Отвір';
+    holeBtn.addEventListener('click', enterHoleMode);
+    actions.appendChild(holeBtn);
+  }
+
+  if (selected.isPipe) {
+    const attachBtn = document.createElement('button');
+    attachBtn.className = 'pbtn'; attachBtn.textContent = '⚭ Прикріпити';
+    attachBtn.addEventListener('click', attachSelectedPipe);
+    actions.appendChild(attachBtn);
+  }
+
+  const delBtn = document.createElement('button');
+  delBtn.className = 'pbtn danger'; delBtn.textContent = '🗑 Видалити';
+  delBtn.addEventListener('click', () => removeObject(selected));
+  actions.appendChild(delBtn);
+
+  selectionPanelEl.appendChild(actions);
+}
+
+function enterMoveMode() {
+  moveMode = true;
+  orbit.enabled = false;
+  hideEl(selectionPanelEl);
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = 'Перетягніть об’єкт по підлозі';
+  const done = document.createElement('button');
+  done.textContent = '✓ Готово';
+  done.addEventListener('click', () => {
+    moveMode = false;
+    orbit.enabled = mode === 'edit';
+    hideEl(modePillEl);
+    renderSelectionPanel();
+  });
+  modePillEl.appendChild(label);
+  modePillEl.appendChild(done);
+  showEl(modePillEl);
+}
+
+function enterHoleMode() {
+  holeToolActive = true;
+  hideEl(selectionPanelEl);
+  renderHolePill();
+  showEl(modePillEl);
+}
+
+function renderHolePill() {
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = 'Торкніться поверхні';
+  const stepper = document.createElement('div');
+  stepper.className = 'stepper';
+  const minus = document.createElement('button'); minus.textContent = '–';
+  const val = document.createElement('span'); val.textContent = Math.round(holeRadius * 200) + ' см';
+  const plus = document.createElement('button'); plus.textContent = '+';
+  minus.addEventListener('click', () => { holeRadius = Math.max(0.03, holeRadius - 0.02); renderHolePill(); });
+  plus.addEventListener('click', () => { holeRadius = Math.min(0.4, holeRadius + 0.02); renderHolePill(); });
+  stepper.append(minus, val, plus);
+  const cancel = document.createElement('button');
+  cancel.className = 'ghost'; cancel.textContent = 'Скасувати';
+  cancel.addEventListener('click', () => { holeToolActive = false; hideEl(modePillEl); renderSelectionPanel(); });
+  modePillEl.append(label, stepper, cancel);
+}
+
+// ---------------------------------------------------------------------------
+// Bottom toolbar + popovers
+// ---------------------------------------------------------------------------
+const popoverEl = document.getElementById('popover');
+const toolbarEl = document.getElementById('toolbar');
+
+function closePopover() {
+  popoverEl.classList.add('hidden');
+  toolbarEl.querySelectorAll('.tb-btn.active').forEach((b) => b.classList.remove('active'));
+}
+
+function openPopover(panel, btn) {
+  const wasOpenForSameBtn = !popoverEl.classList.contains('hidden') && btn.classList.contains('active');
+  closePopover();
+  if (wasOpenForSameBtn) return;
+  btn.classList.add('active');
+  popoverEl.innerHTML = '';
+  buildPopoverContent(panel);
+  popoverEl.classList.remove('hidden');
+}
+
+function buildPopoverContent(panel) {
+  if (panel === 'objects') {
+    const h = document.createElement('h3'); h.textContent = 'Додати об’єкт'; popoverEl.appendChild(h);
+    const row = document.createElement('div'); row.className = 'panel-row';
+    for (const kind of ['cube', 'cylinder', 'pipe', 'sphere', 'cone']) {
+      const b = document.createElement('button');
+      b.className = 'pbtn' + (placingKind === kind ? ' on' : '');
+      b.textContent = KIND_LABELS[kind];
+      b.addEventListener('click', () => {
+        placingKind = placingKind === kind ? null : kind;
+        deselect();
+        closePopover();
+        if (placingKind) toast(`Торкніться підлоги або об’єкта, щоб розмістити: ${KIND_LABELS[kind]}`);
+      });
+      row.appendChild(b);
+    }
+    popoverEl.appendChild(row);
+  }
+
+  if (panel === 'walls') {
+    const h = document.createElement('h3'); h.textContent = 'Стіни будинку'; popoverEl.appendChild(h);
+    const row = document.createElement('div'); row.className = 'panel-row';
+    const drawBtn = document.createElement('button');
+    drawBtn.className = 'pbtn wide' + (wallDrawing ? ' on' : '');
+    drawBtn.textContent = wallDrawing ? '■ Завершити стіну' : '✎ Малювати стіну';
+    drawBtn.addEventListener('click', () => {
+      if (wallDrawing) { finishWallDrawing(); } else { startWallDrawing(); }
+      closePopover();
+    });
+    row.appendChild(drawBtn);
+    popoverEl.appendChild(row);
+    popoverEl.appendChild(colorSwatchRow(wallColor, (c) => { wallColor = c; }));
+  }
+
+  if (panel === 'windows') {
+    const h = document.createElement('h3'); h.textContent = 'Вставити вікно'; popoverEl.appendChild(h);
+    const row = document.createElement('div'); row.className = 'panel-row';
+    const btn = document.createElement('button');
+    btn.className = 'pbtn wide' + (windowToolActive ? ' on' : '');
+    btn.textContent = windowToolActive ? 'Вимкнути інструмент' : 'Торкніться стіни, щоб вставити';
+    btn.addEventListener('click', () => {
+      windowToolActive = !windowToolActive;
+      deselect();
+      closePopover();
+      if (windowToolActive) toast('Торкніться стіни в потрібному місці');
+    });
+    row.appendChild(btn);
+    popoverEl.appendChild(row);
+    popoverEl.appendChild(colorSwatchRow(windowFrameColor, (c) => { windowFrameColor = c; }));
+  }
+
+  if (panel === 'file') {
+    const h = document.createElement('h3'); h.textContent = 'Проєкт'; popoverEl.appendChild(h);
+    const row = document.createElement('div'); row.className = 'panel-row';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'pbtn wide'; saveBtn.textContent = '⭳ Зберегти у файл';
+    saveBtn.addEventListener('click', () => { saveProject(); closePopover(); });
+    const loadBtn = document.createElement('button');
+    loadBtn.className = 'pbtn wide'; loadBtn.textContent = '⭱ Завантажити з файлу';
+    loadBtn.addEventListener('click', () => { document.getElementById('fileInput').click(); closePopover(); });
+    row.append(saveBtn, loadBtn);
+    popoverEl.appendChild(row);
+  }
+}
+
+toolbarEl.querySelectorAll('.tb-btn[data-panel]').forEach((btn) => {
+  btn.addEventListener('click', () => openPopover(btn.dataset.panel, btn));
+});
+
+// ---------------------------------------------------------------------------
+// Wall drawing
+// ---------------------------------------------------------------------------
+function startWallDrawing() {
+  wallDrawing = true;
+  wallPoints = [];
+  wallSegmentsThisDraw = [];
+  deselect();
+  toast('Торкайтесь підлоги, щоб додавати кути стіни');
+}
+
+function finishWallDrawing() {
+  wallDrawing = false;
+  wallPoints = [];
+  wallSegmentsThisDraw = [];
+  toast('Стіну завершено');
+}
+
+function addWallPoint(clientX, clientY) {
+  const ray = rayFromClient(clientX, clientY);
+  const hit = new THREE.Vector3();
+  if (!ray.ray.intersectPlane(groundPlane, hit)) return;
+  wallPoints.push(hit.clone());
+  if (wallPoints.length >= 2) {
+    const rec = addWallSegment(wallPoints[wallPoints.length - 2], wallPoints[wallPoints.length - 1], wallColor);
+    if (rec) wallSegmentsThisDraw.push(rec);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Window insertion
+// ---------------------------------------------------------------------------
+function insertWindowAt(clientX, clientY) {
+  const wallMeshes = objects.filter((r) => r.kind === 'wall').map((r) => r.root);
+  if (!wallMeshes.length) { toast('Спершу побудуйте стіну'); return; }
+  const ray = rayFromClient(clientX, clientY);
+  const hits = ray.intersectObjects(wallMeshes, false);
+  if (!hits.length) { toast('Торкніться стіни'); return; }
+  const hit = hits[0];
+  const wallRecord = findRecordByMesh(hit.object);
+  const wall = hit.object;
+  const local = wall.worldToLocal(hit.point.clone());
+
+  const margin = 0.12;
+  const halfLen = (wallRecord.wallLength || 2) / 2;
+  const maxX = Math.max(0, halfLen - WINDOW_WIDTH / 2 - margin);
+  const clampedX = Math.max(-maxX, Math.min(maxX, local.x));
+  const maxY = WALL_HEIGHT / 2 - WINDOW_HEIGHT / 2 - margin;
+  const minY = -WALL_HEIGHT / 2 + WINDOW_HEIGHT / 2 + margin;
+  const clampedY = Math.max(minY, Math.min(maxY, local.y));
+
+  const cutterGeom = new THREE.BoxGeometry(WINDOW_WIDTH, WINDOW_HEIGHT, WALL_THICKNESS * 3);
+  const cutter = new THREE.Mesh(cutterGeom);
+  cutter.position.copy(wall.localToWorld(new THREE.Vector3(clampedX, clampedY, 0)));
+  cutter.quaternion.copy(wall.quaternion);
+  cutter.updateMatrixWorld(true);
+
+  try {
+    const result = CSG.subtract(wall, cutter);
+    if (!result.attributes.position.count) throw new Error('empty');
+    wall.geometry.dispose();
+    wall.geometry = result;
+  } catch (e) {
+    toast('Не вдалося вставити вікно тут');
+    return;
+  }
+
+  const winGroup = buildWindowGroup(WINDOW_WIDTH, WINDOW_HEIGHT, WALL_THICKNESS, windowFrameColor);
+  winGroup.position.copy(wall.localToWorld(new THREE.Vector3(clampedX, clampedY, 0)));
+  winGroup.quaternion.copy(wall.quaternion);
+  winGroup.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  registerObject('window', winGroup);
+  windowToolActive = false;
+  toast('Вікно вставлено');
+}
+
+// ---------------------------------------------------------------------------
+// Pointer interaction (edit mode: tap-to-place / select / draw / cut)
+// ---------------------------------------------------------------------------
+let downX = 0, downY = 0, downTime = 0, pointerActive = false;
+
+canvas.addEventListener('pointerdown', (e) => {
+  pointerActive = true;
+  downX = e.clientX; downY = e.clientY; downTime = performance.now();
+
+  if (mode === 'edit' && moveMode && selected) {
+    moveDragging = true;
+  }
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (mode === 'edit' && moveMode && moveDragging && selected) {
+    const ray = rayFromClient(e.clientX, e.clientY);
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -selected.root.position.y);
+    const hit = new THREE.Vector3();
+    if (ray.ray.intersectPlane(plane, hit)) {
+      selected.root.position.x = hit.x;
+      selected.root.position.z = hit.z;
+      outlineHelper?.update();
+    }
+  } else if (mode === 'walk') {
+    handleWalkLook(e);
+  }
+});
+
+window.addEventListener('pointerup', (e) => {
+  if (!pointerActive) return;
+  pointerActive = false;
+
+  if (mode === 'edit' && moveMode) { moveDragging = false; return; }
+  if (mode === 'walk') { endWalkLook(e); return; }
+
+  const dx = e.clientX - downX, dy = e.clientY - downY;
+  const dt = performance.now() - downTime;
+  if (dx * dx + dy * dy > 49 || dt > 600) return; // treat as a camera-orbit drag, not a tap
+  if (e.target !== canvas) return;
+
+  handleEditTap(e.clientX, e.clientY);
+});
+
+function handleEditTap(x, y) {
+  // A mesh's matrixWorld only refreshes on render; force it here so a tap
+  // arriving in the same tick as an object add/move never raycasts stale.
+  scene.updateMatrixWorld(true);
+
+  if (placingKind) {
+    const ray = rayFromClient(x, y);
+    const hits = ray.intersectObjects(raycastTargets.concat(ground), false);
+    if (hits.length) {
+      addObject(placingKind, hits[0].point);
+    } else {
+      toast('Не вдалося визначити точку розміщення');
+    }
+    placingKind = null;
+    return;
+  }
+  if (wallDrawing) { addWallPoint(x, y); return; }
+  if (windowToolActive) { insertWindowAt(x, y); return; }
+  if (holeToolActive) { performHolePlacement(x, y); return; }
+
+  const ray = rayFromClient(x, y);
+  const hits = ray.intersectObjects(raycastTargets, false);
+  if (hits.length) {
+    const rec = findRecordByMesh(hits[0].object);
+    if (rec) select(rec);
+  } else {
+    deselect();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Walk mode (first-person)
+// ---------------------------------------------------------------------------
+const walkExitBtn = document.getElementById('walkExit');
+const crosshairEl = document.getElementById('crosshair');
+const joystickEl = document.getElementById('joystick');
+const joystickNubEl = document.getElementById('joystickNub');
+const walkToggleBtn = document.getElementById('walkToggle');
+
+let yaw = 0, pitch = 0;
+let joyVec = { x: 0, y: 0 };
+let joyPointerId = null;
+let lookPointerId = null;
+let lastLookX = 0, lastLookY = 0;
+const keys = new Set();
+window.addEventListener('keydown', (e) => keys.add(e.code));
+window.addEventListener('keyup', (e) => keys.delete(e.code));
+
+function enterWalkMode() {
+  mode = 'walk';
+  deselect();
+  closePopover();
+  hideEl(document.getElementById('toolbar'));
+  orbit.enabled = false;
+  showEl(crosshairEl);
+  showEl(joystickEl);
+  showEl(walkExitBtn);
+
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  // camera's horizontal forward is (-sin(yaw), 0, -cos(yaw)); solve for yaw from the current direction
+  yaw = Math.atan2(-dir.x, -dir.z);
+  pitch = Math.asin(Math.max(-1, Math.min(1, dir.y)));
+  camera.position.y = EYE_HEIGHT;
+  camera.rotation.order = 'YXZ';
+}
+
+function exitWalkMode() {
+  mode = 'edit';
+  hideEl(crosshairEl);
+  hideEl(joystickEl);
+  hideEl(walkExitBtn);
+  showEl(document.getElementById('toolbar'));
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  orbit.target.copy(camera.position).add(forward.multiplyScalar(5));
+  orbit.enabled = true;
+}
+
+walkToggleBtn.addEventListener('click', () => { mode === 'walk' ? exitWalkMode() : enterWalkMode(); });
+walkExitBtn.addEventListener('click', exitWalkMode);
+
+joystickEl.addEventListener('pointerdown', (e) => {
+  joyPointerId = e.pointerId;
+  joystickEl.setPointerCapture(e.pointerId);
+  updateJoystick(e);
+});
+joystickEl.addEventListener('pointermove', (e) => { if (e.pointerId === joyPointerId) updateJoystick(e); });
+function endJoystick(e) {
+  if (e.pointerId !== joyPointerId) return;
+  joyPointerId = null;
+  joyVec = { x: 0, y: 0 };
+  joystickNubEl.style.transform = 'translate(0px, 0px)';
+}
+joystickEl.addEventListener('pointerup', endJoystick);
+joystickEl.addEventListener('pointercancel', endJoystick);
+
+function updateJoystick(e) {
+  const rect = joystickEl.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+  const r = rect.width / 2;
+  let dx = e.clientX - cx, dy = e.clientY - cy;
+  const len = Math.hypot(dx, dy);
+  if (len > r) { dx = (dx / len) * r; dy = (dy / len) * r; }
+  joyVec = { x: dx / r, y: dy / r };
+  joystickNubEl.style.transform = `translate(${dx}px, ${dy}px)`;
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (mode !== 'walk') return;
+  lookPointerId = e.pointerId;
+  lastLookX = e.clientX; lastLookY = e.clientY;
+});
+function handleWalkLook(e) {
+  if (e.pointerId !== lookPointerId) return;
+  const dx = e.clientX - lastLookX, dy = e.clientY - lastLookY;
+  lastLookX = e.clientX; lastLookY = e.clientY;
+  const sens = 0.0035;
+  yaw -= dx * sens;
+  pitch -= dy * sens;
+  pitch = Math.max(-1.3, Math.min(1.3, pitch));
+}
+function endWalkLook(e) { if (e.pointerId === lookPointerId) lookPointerId = null; }
+
+function updateWalkMovement(dt) {
+  camera.rotation.set(pitch, yaw, 0, 'YXZ');
+
+  let mx = joyVec.x, my = joyVec.y;
+  if (keys.has('KeyW') || keys.has('ArrowUp')) my -= 1;
+  if (keys.has('KeyS') || keys.has('ArrowDown')) my += 1;
+  if (keys.has('KeyA') || keys.has('ArrowLeft')) mx -= 1;
+  if (keys.has('KeyD') || keys.has('ArrowRight')) mx += 1;
+  mx = Math.max(-1, Math.min(1, mx));
+  my = Math.max(-1, Math.min(1, my));
+  if (mx === 0 && my === 0) return;
+
+  // must match the horizontal forward/right implied by camera.rotation.set(pitch, yaw, 0, 'YXZ')
+  const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+  const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+  const move = new THREE.Vector3()
+    .addScaledVector(forward, -my)
+    .addScaledVector(right, mx);
+  if (move.lengthSq() > 0) move.normalize().multiplyScalar(WALK_SPEED * dt);
+  camera.position.add(move);
+  camera.position.y = EYE_HEIGHT;
+}
+
+// ---------------------------------------------------------------------------
+// Save / load project
+// ---------------------------------------------------------------------------
+function saveProject() {
+  const data = { app: 'creslarnet-3d', version: 1, objects: [] };
+  for (const rec of objects) {
+    if (rec.kind === 'window') {
+      const p = rec.root.userData.windowParams;
+      data.objects.push({
+        id: rec.id, kind: 'window',
+        position: rec.root.position.toArray(),
+        quaternion: rec.root.quaternion.toArray(),
+        width: p.width, height: p.height, thickness: p.thickness, frameColor: p.frameColor,
+      });
+    } else {
+      const mesh = rec.root;
+      data.objects.push({
+        id: rec.id, kind: rec.kind, isPipe: !!rec.isPipe, wallLength: rec.wallLength,
+        geometry: mesh.geometry.toJSON(),
+        material: { type: mesh.material.userData.creslarnetType, color: mesh.material.userData.creslarnetColor },
+        position: mesh.position.toArray(),
+        quaternion: mesh.quaternion.toArray(),
+        scale: mesh.scale.toArray(),
+      });
+    }
+  }
+  const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'creslarnet-3d-project.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  toast('Проєкт збережено у файл');
+}
+
+function clearScene() {
+  deselect();
+  [...objects].forEach(removeObject);
+}
+
+// Primitive geometries (Box/Cylinder/Cone/Extrude…) serialize as a compact
+// parametric shorthand rather than raw attributes, so plain
+// BufferGeometryLoader can't read them back — ObjectLoader's geometry
+// parser understands both that shorthand and CSG's raw-attribute output.
+const geomLoader = new THREE.ObjectLoader();
+function parseGeometryJSON(json) {
+  return Object.values(geomLoader.parseGeometries([json], {}))[0];
+}
+function loadProject(data) {
+  if (!data || data.app !== 'creslarnet-3d' || !Array.isArray(data.objects)) {
+    toast('Файл не розпізнано як проєкт Creslarnet');
+    return;
+  }
+  clearScene();
+  let maxId = 0;
+  for (const item of data.objects) {
+    maxId = Math.max(maxId, item.id || 0);
+    if (item.kind === 'window') {
+      const group = buildWindowGroup(item.width, item.height, item.thickness, item.frameColor);
+      group.position.fromArray(item.position);
+      group.quaternion.fromArray(item.quaternion);
+      group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+      registerObject('window', group);
+    } else {
+      const geometry = parseGeometryJSON(item.geometry);
+      const material = item.material.type === 'paint'
+        ? createPaintMaterial(item.material.color)
+        : createMaterial(item.material.type, item.material.color, scene.environment);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.fromArray(item.position);
+      mesh.quaternion.fromArray(item.quaternion);
+      if (item.scale) mesh.scale.fromArray(item.scale);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      registerObject(item.kind, mesh, { isPipe: !!item.isPipe, wallLength: item.wallLength });
+    }
+  }
+  nextId = maxId + 1;
+  toast('Проєкт завантажено');
+}
+
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      loadProject(JSON.parse(reader.result));
+    } catch (err) {
+      toast('Не вдалося прочитати файл проєкту');
+    }
+  };
+  reader.readAsText(file);
+  e.target.value = '';
+});
+
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
+let lastFrame = performance.now();
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - lastFrame) / 1000);
+  lastFrame = now;
+
+  if (mode === 'edit') {
+    orbit.update();
+  } else if (mode === 'walk') {
+    updateWalkMovement(dt);
+  }
+  renderer.render(scene, camera);
+}
+animate();
+
+toast('Оберіть інструмент внизу, щоб додати перший об’єкт', 3200);
+
+// Lightweight introspection hook for debugging in the browser console —
+// harmless in production, handy on a real device or in automated checks.
+window.__creslarnet3d = {
+  get objects() { return objects; },
+  get selected() { return selected; },
+  scene, camera, renderer,
+};

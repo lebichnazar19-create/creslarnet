@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>Creslarnet — 3D режим</title>
+
+<link rel="manifest" href="../manifest.json">
+<meta name="theme-color" content="#8338ec">
+<link rel="icon" href="../icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="../icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Creslarnet">
+<meta name="mobile-web-app-capable" content="yes">
+
+<link rel="stylesheet" href="style.css">
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/three.module.min.js"
+  }
+}
+</script>
+</head>
+<body>
+  <canvas id="viewport"></canvas>
+
+  <a href="../index.html" class="back-link" title="Повернутись до 2D-режиму">← 2D</a>
+
+  <div id="crosshair" class="crosshair hidden" aria-hidden="true">
+    <svg viewBox="0 0 24 24"><path d="M12 4v6M12 14v6M4 12h6M14 12h6"/></svg>
+  </div>
+
+  <button id="walkExit" class="walk-exit hidden">✕ Вихід із прогулянки</button>
+
+  <div id="joystick" class="joystick hidden">
+    <div id="joystickNub" class="joystick-nub"></div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- Selection contextual panel (shown when an object is picked) -->
+  <div id="selectionPanel" class="panel selection-panel hidden"></div>
+
+  <!-- Transient pill shown during move-drag / hole-placement sub-modes -->
+  <div id="modePill" class="mode-pill hidden"></div>
+
+  <!-- Popovers opened from the bottom toolbar -->
+  <div id="popover" class="panel popover hidden"></div>
+
+  <nav id="toolbar" class="toolbar">
+    <button class="tb-btn" data-panel="objects" title="Об'єкти">
+      <svg viewBox="0 0 24 24"><path d="M4 8 L12 4 L20 8 L20 16 L12 20 L4 16 Z M4 8 L12 12 L20 8 M12 12 L12 20"/></svg>
+      <span>Об'єкти</span>
+    </button>
+    <button class="tb-btn" data-panel="walls" title="Стіни">
+      <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16"/><path d="M3 9 H21 M3 14 H21 M8 4 V9 M14 9 V14 M8 14 V19 M16 4 V9 M12 14 V19"/></svg>
+      <span>Стіни</span>
+    </button>
+    <button class="tb-btn" data-panel="windows" title="Вікна">
+      <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="1"/><path d="M12 4 V20 M4 12 H20"/></svg>
+      <span>Вікна</span>
+    </button>
+    <button class="tb-btn" id="walkToggle" title="Прогулянка від першої особи">
+      <svg viewBox="0 0 24 24"><ellipse cx="9" cy="7" rx="2.4" ry="3.4" transform="rotate(-18 9 7)"/><ellipse cx="15" cy="16" rx="2.4" ry="3.4" transform="rotate(18 15 16)"/></svg>
+      <span>Прогулянка</span>
+    </button>
+    <button class="tb-btn" data-panel="file" title="Файл">
+      <svg viewBox="0 0 24 24"><path d="M4 4 H16 L20 8 V20 H4 Z M8 4 V9 H15 V4 M8 20 V14 H16 V20"/></svg>
+      <span>Файл</span>
+    </button>
+  </nav>
+
+  <input type="file" id="fileInput" accept="application/json,.json" class="hidden">
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
