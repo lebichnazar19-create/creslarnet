@@ -459,22 +459,17 @@ function isCameraInsideAnyRoom() { return !!findRoomContainingCamera(); }
 // a ceiling-mounted point light so walls get real distance/angle falloff
 // and cast soft shadows, same as a real light fixture would.
 function addRoomLight(roomId, params, center) {
+  // No shadow on this light — a point-light cube shadow map is exactly the
+  // kind of thing weaker/older mobile GPUs render as solid speckled noise
+  // across everything it touches, tuned bias or not; a normalBias fix that
+  // was fine to reason about on paper made it worse in practice on the
+  // actual device. The light still gives every wall real distance/angle
+  // falloff (the original "flat white blob" fix) without any shadow map
+  // at all, so it's the simple, reliably-flat-colour option this needs to
+  // be: no texture, no shader trickery, nothing that can come out as noise.
   const light = new THREE.PointLight(0xfff4e0, 2.2, 0, 2);
   light.position.set(center.x, center.y + params.height - 250, center.z);
-  light.castShadow = true;
-  light.shadow.mapSize.set(1024, 1024);
-  light.shadow.camera.near = 100;
-  light.shadow.camera.far = Math.max(params.width, params.length, params.height) * 1.6;
-  // The noisy/speckled "dithered" look on the walls was shadow acne: a flat
-  // wall self-shadowing against its own depth map from floating-point
-  // rounding, not a texture or colour bug. depthBias alone (in NDC units)
-  // wasn't nearly enough here because this whole scene is millimetre-scale
-  // (comment at the top of the file) — normalBias, which offsets the
-  // shadow sample along the surface's own normal in WORLD units (mm here),
-  // is the standard fix for exactly this on point/spot lights, and is what
-  // actually clears it at this scale.
-  light.shadow.bias = -0.0008;
-  light.shadow.normalBias = 18; // mm
+  light.castShadow = false;
   scene.add(light);
   roomLights.set(roomId, light);
 }
@@ -2001,6 +1996,8 @@ function buildPopoverContent(panel) {
       row.appendChild(b);
     }
     popoverEl.appendChild(row);
+
+    buildProjectLibrarySection();
   }
 
   if (panel === 'room') {
@@ -2193,6 +2190,92 @@ function buildMyObjectsSection() {
       buildPopoverContent('file');
     });
     row.append(insertBtn, delBtn);
+    popoverEl.appendChild(row);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Project library — whole scenes saved into this phone's browser storage
+// and picked from a list, instead of a file dialog every time. Same
+// localStorage pattern as "Мої об'єкти" above, but for a full project
+// (buildProjectData/loadProject, the same pair "Файл" → Зберегти/
+// Завантажити у файл uses) rather than one reusable object. Complements
+// the file-based save/load — that one still round-trips to a real file you
+// can move between devices; this is for quickly switching between a
+// handful of projects kept on this one phone.
+// ---------------------------------------------------------------------------
+const PROJECT_LIBRARY_KEY = 'creslarnet-3d-project-library';
+
+function loadProjectLibrary() {
+  try {
+    const raw = localStorage.getItem(PROJECT_LIBRARY_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveProjectLibrary(entries) {
+  try {
+    localStorage.setItem(PROJECT_LIBRARY_KEY, JSON.stringify(entries));
+    return true;
+  } catch (e) {
+    toast('Не вдалося зберегти — забракло місця. Видаліть якийсь збережений проєкт');
+    return false;
+  }
+}
+
+function buildProjectLibrarySection() {
+  const h2 = document.createElement('h3'); h2.textContent = 'Збережені проєкти'; popoverEl.appendChild(h2);
+
+  const saveRow = document.createElement('div'); saveRow.className = 'panel-row';
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'pbtn wide';
+  saveBtn.textContent = '💾 Зберегти поточний проєкт…';
+  saveBtn.addEventListener('click', () => {
+    const name = window.prompt('Назва проєкту:', `Проєкт ${new Date().toLocaleDateString('uk-UA')}`);
+    if (!name || !name.trim()) return;
+    const entries = loadProjectLibrary();
+    entries.push({ id: `p_${Date.now().toString(36)}`, name: name.trim(), savedAt: Date.now(), data: buildProjectData() });
+    if (saveProjectLibrary(entries)) {
+      toast(`Проєкт «${name.trim()}» збережено`);
+      popoverEl.innerHTML = '';
+      buildPopoverContent('objects');
+    }
+  });
+  saveRow.appendChild(saveBtn);
+  popoverEl.appendChild(saveRow);
+
+  const library = loadProjectLibrary();
+  if (!library.length) {
+    const empty = document.createElement('p');
+    empty.className = 'dim-readout';
+    empty.textContent = 'Поки порожньо — збережіть поточний проєкт кнопкою вище, щоб потім швидко повертатись до нього.';
+    popoverEl.appendChild(empty);
+    return;
+  }
+  for (const entry of [...library].reverse()) {
+    const row = document.createElement('div');
+    row.className = 'panel-row library-row';
+    const loadBtn = document.createElement('button');
+    loadBtn.className = 'pbtn';
+    const when = new Date(entry.savedAt || 0).toLocaleDateString('uk-UA');
+    loadBtn.textContent = `${entry.name} · ${when}`;
+    loadBtn.addEventListener('click', () => {
+      loadProject(entry.data);
+      closePopover();
+    });
+    const delBtn = document.createElement('button');
+    delBtn.className = 'pbtn danger';
+    delBtn.textContent = '🗑';
+    delBtn.title = 'Видалити зі збережених проєктів';
+    delBtn.addEventListener('click', () => {
+      saveProjectLibrary(loadProjectLibrary().filter((e) => e.id !== entry.id));
+      popoverEl.innerHTML = '';
+      buildPopoverContent('objects');
+    });
+    row.append(loadBtn, delBtn);
     popoverEl.appendChild(row);
   }
 }
