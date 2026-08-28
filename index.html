@@ -154,7 +154,11 @@
   </aside>
 
   <input type="file" accept="image/*" id="tilePhotoInput" class="hidden">
-  <input type="file" accept="image/*" capture="environment" id="scanPhotoInput" class="hidden">
+  <!-- No `capture` attribute here on purpose — that forces the camera app
+       straight open on most mobile browsers, skipping the gallery/file
+       choice entirely. Plain accept="image/*" lets the OS show its normal
+       picker (camera or an existing photo). -->
+  <input type="file" accept="image/*" id="scanPhotoInput" class="hidden">
 
   <div id="scanModal" class="scan-modal hidden">
     <div class="scan-modal-inner">
