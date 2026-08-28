@@ -500,6 +500,35 @@ html, body {
 }
 .crosshair svg { width: 22px; height: 22px; stroke: currentColor; stroke-width: 1.6; fill: none; }
 
+/* ---------- room minimap (top-down position indicator) ---------- */
+.minimap-wrap {
+  position: fixed;
+  left: max(10px, env(safe-area-inset-left));
+  bottom: max(10px, env(safe-area-inset-bottom));
+  z-index: 18;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: var(--hud-bg);
+  border: 1px solid var(--hud-line);
+  border-radius: 12px;
+  padding: 6px;
+  backdrop-filter: blur(8px);
+}
+#minimapCanvas {
+  display: block;
+  width: 100px;
+  height: 100px;
+  border-radius: 6px;
+}
+.minimap-coords {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--hud-text-muted);
+}
+
 .walk-exit {
   position: fixed;
   top: max(10px, env(safe-area-inset-top));

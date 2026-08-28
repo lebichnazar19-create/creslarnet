@@ -34,12 +34,19 @@
     <svg viewBox="0 0 24 24"><path d="M12 4v6M12 14v6M4 12h6M14 12h6"/></svg>
   </div>
 
-  <!-- Optical zoom (camera.fov), not a movement control — lets you see a
-       whole wall from inside a small room without needing space to
-       physically back away into. -->
+  <!-- Dolly forward/back straight along the camera's own view direction —
+       see wireZoomButton in app.js. -->
   <div id="zoomControl" class="zoom-control">
     <button id="zoomInBtn" title="Наблизити">+</button>
     <button id="zoomOutBtn" title="Віддалити — побачити більше, наприклад, всю стіну">−</button>
+  </div>
+
+  <!-- Room minimap — top-down floor plan with a dot for the camera and a
+       wedge for which way it's facing. Only shown while actually standing
+       inside a room (see updateMinimap in app.js). -->
+  <div id="minimapWrap" class="minimap-wrap hidden">
+    <canvas id="minimapCanvas" width="200" height="200"></canvas>
+    <span id="minimapCoords" class="minimap-coords"></span>
   </div>
 
   <button id="walkExit" class="walk-exit hidden">✕ Вихід із прогулянки</button>

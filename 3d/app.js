@@ -426,12 +426,15 @@ function findRoomParts(roomId) {
   return objects.filter((r) => r.roomId === roomId);
 }
 
-// Is the camera currently standing inside any room's own footprint/height —
+// Is the camera currently standing inside a room's own footprint/height —
 // not "did the user press Всередині", an actual geometric check, so it
 // stays correct as they walk around, and works the same regardless of how
 // they got in there. A little horizontal/vertical slack so standing right
-// up against a wall still counts as inside.
-function isCameraInsideAnyRoom() {
+// up against a wall still counts as inside. Returns the room's own
+// {roomId, roomParams, roomCenter} (first match) or null — used both as a
+// yes/no check (isCameraInsideAnyRoom) and, with the actual params/centre,
+// by the minimap.
+function findRoomContainingCamera() {
   const seen = new Set();
   const margin = 50; // mm
   for (const rec of objects) {
@@ -441,10 +444,11 @@ function isCameraInsideAnyRoom() {
     const hw = p.width / 2 + margin, hl = p.length / 2 + margin;
     const px = camera.position.x, py = camera.position.y, pz = camera.position.z;
     if (px > c.x - hw && px < c.x + hw && pz > c.z - hl && pz < c.z + hl &&
-        py > c.y - margin && py < c.y + p.height + margin) return true;
+        py > c.y - margin && py < c.y + p.height + margin) return rec;
   }
-  return false;
+  return null;
 }
+function isCameraInsideAnyRoom() { return !!findRoomContainingCamera(); }
 
 // The outdoor sun can't reach an enclosed room — its own ceiling blocks it
 // — and the ambient hemisphere/environment light alone shades every
@@ -2607,9 +2611,12 @@ function handleFreeLook(e) {
   const dx = e.clientX - lastLookX, dy = e.clientY - lastLookY;
   lastLookX = e.clientX; lastLookY = e.clientY;
   const sens = 0.002;
-  yaw -= dx * sens;
+  yaw -= dx * sens; // unclamped — a full 360° turn, like turning your head/body
   pitch -= dy * sens;
-  pitch = Math.max(-1.3, Math.min(1.3, pitch));
+  // Just short of straight up/down (±90°) rather than exactly there — a
+  // dead-on vertical look direction makes yaw ill-defined (gimbal-lock-ish
+  // jitter), same reason most first-person cameras stop just shy of it.
+  pitch = Math.max(-1.55, Math.min(1.55, pitch));
 }
 
 // refDist is only meaningful (and only computed) in edit mode — walk mode
@@ -3244,6 +3251,74 @@ function renderAxisGizmo() {
 }
 
 // ---------------------------------------------------------------------------
+// Room minimap — a schematic top-down floor plan (drawn straight with 2D
+// canvas, not another 3D viewport: a real top-down camera would just see
+// the ceiling), a dot for the camera's position and a wedge for which way
+// it's facing — "where am I standing / which way am I looking" at a
+// glance, on top of the free-look camera already covering "look around".
+// Only shown while actually standing inside a room.
+// ---------------------------------------------------------------------------
+const minimapWrapEl = document.getElementById('minimapWrap');
+const minimapCanvasEl = document.getElementById('minimapCanvas');
+const minimapCtx = minimapCanvasEl.getContext('2d');
+const minimapCoordsEl = document.getElementById('minimapCoords');
+
+function updateMinimap() {
+  const room = findRoomContainingCamera();
+  if (!room) {
+    minimapWrapEl.classList.add('hidden');
+    return;
+  }
+  minimapWrapEl.classList.remove('hidden');
+
+  const p = room.roomParams, c = room.roomCenter;
+  const size = minimapCanvasEl.width; // backing-resolution square, CSS-scaled by style.css
+  const pad = 18;
+  const scale = Math.min((size - pad * 2) / p.width, (size - pad * 2) / p.length);
+  const cx = size / 2, cy = size / 2;
+  const rw = p.width * scale, rl = p.length * scale;
+
+  const ctx = minimapCtx;
+  ctx.clearRect(0, 0, size, size);
+  ctx.fillStyle = 'rgba(131, 56, 236, 0.12)';
+  ctx.fillRect(cx - rw / 2, cy - rl / 2, rw, rl);
+  ctx.strokeStyle = 'rgba(244, 242, 248, 0.8)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx - rw / 2, cy - rl / 2, rw, rl);
+
+  // Local room-space X/Z map straight onto minimap X/Y (top-down), same
+  // convention the room itself is built with.
+  const localX = camera.position.x - c.x, localZ = camera.position.z - c.z;
+  const dotX = cx + localX * scale, dotY = cy + localZ * scale;
+
+  // Facing wedge from yaw — matches faceDirection's forward vector
+  // (-sin(yaw), 0, -cos(yaw)), so it always points the way the main view
+  // is actually looking (horizontally; pitch doesn't affect a floor plan).
+  const angle = Math.atan2(-Math.cos(yaw), -Math.sin(yaw));
+  ctx.save();
+  ctx.translate(dotX, dotY);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(13, 0);
+  ctx.lineTo(-6, 6);
+  ctx.lineTo(-6, -6);
+  ctx.closePath();
+  ctx.fillStyle = '#8338ec';
+  ctx.fill();
+  ctx.restore();
+
+  ctx.beginPath();
+  ctx.arc(dotX, dotY, 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = '#8338ec';
+  ctx.stroke();
+
+  minimapCoordsEl.textContent = `X ${formatMm(localX, 0)} · Z ${formatMm(localZ, 0)} мм`;
+}
+
+// ---------------------------------------------------------------------------
 // Render loop
 // ---------------------------------------------------------------------------
 let lastFrame = performance.now();
@@ -3264,6 +3339,7 @@ function animate() {
   } else if (mode === 'walk') {
     updateFreeCamera(dt, 0);
   }
+  updateMinimap();
   renderer.render(scene, camera);
   renderAxisGizmo();
 }
