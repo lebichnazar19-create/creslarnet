@@ -1585,6 +1585,15 @@ if ('serviceWorker' in navigator) {
       downTime = performance.now();
       const mm = clientToMm(e.clientX, e.clientY);
 
+      // Any new touch clears the previous selection outline first — the
+      // 'select' tool already did this for its own empty-space tap below,
+      // but a freshly-drawn shape auto-selects itself (see makePreviewShape
+      // commits further down), and its dashed frame used to stick around
+      // through the *next* shape too if you kept drawing without switching
+      // back to 'select' in between. Re-selecting a shape you actually tap
+      // right after this is unaffected — select() below just runs again.
+      if (selected) deselect();
+
       if (state.tool === 'select') {
         const hit = hitTest(e.clientX, e.clientY);
         if (hit) {
@@ -1593,7 +1602,6 @@ if ('serviceWorker' in navigator) {
           moveShapeStart = cloneShapeCoords(hit);
           moveGrabMm = mm;
         } else {
-          deselect();
           panStart = { offsetX: view.offsetX, offsetY: view.offsetY, clientX: e.clientX, clientY: e.clientY, committed: false };
         }
       } else if (state.tool === 'freehand') {

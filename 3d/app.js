@@ -93,10 +93,19 @@ pmrem.dispose();
 // to whatever's actually ahead of the camera — a fixed pair can't cover
 // "2 mm from a bolt" and "80 m across a plot" at once even with a
 // logarithmic depth buffer.
-const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 1000000);
+const DEFAULT_FOV = 60, MIN_FOV = 32, MAX_FOV = 100;
+const camera = new THREE.PerspectiveCamera(DEFAULT_FOV, window.innerWidth / window.innerHeight, 1, 1000000);
 camera.rotation.order = 'YXZ';
 const INITIAL_CAMERA_POS = new THREE.Vector3(6000, 5000, 9000);
 camera.position.copy(INITIAL_CAMERA_POS);
+
+// Optical zoom — widens/narrows the field of view rather than moving the
+// camera, so "zoom out" works even with no physical room to back into
+// (standing inside a small room, a couple of steps from every wall).
+function setFov(fov) {
+  camera.fov = Math.max(MIN_FOV, Math.min(MAX_FOV, fov));
+  camera.updateProjectionMatrix();
+}
 
 const hemi = new THREE.HemisphereLight(0xffffff, 0x8a7a63, 0.9);
 scene.add(hemi);
@@ -142,6 +151,7 @@ camera.rotation.set(pitch, yaw, 0, 'YXZ');
 function resetView() {
   camera.position.copy(INITIAL_CAMERA_POS);
   faceDirection(new THREE.Vector3(0, 1000, 0).sub(INITIAL_CAMERA_POS).normalize());
+  setFov(DEFAULT_FOV);
   toast('Вигляд скинуто');
 }
 
@@ -505,6 +515,10 @@ function viewRoomInside(roomId) {
   const { roomCenter: c } = parts[0];
   camera.position.set(c.x, c.y + EYE_HEIGHT, c.z);
   faceDirection(new THREE.Vector3(0, 0, -1));
+  // Wider than the default FOV — standing at the centre of a small room is
+  // only a metre or two from any wall, and the default angle crops it. The
+  // +/- zoom control (setFov) still works from here for further adjustment.
+  setFov(78);
 }
 
 function viewRoomOutside(roomId) {
@@ -516,6 +530,7 @@ function viewRoomOutside(roomId) {
   camera.position.set(c.x + offset.x, c.y + offset.y, c.z + offset.z);
   const lookAt = new THREE.Vector3(c.x, c.y + p.height / 2, c.z);
   faceDirection(lookAt.sub(camera.position).normalize());
+  setFov(DEFAULT_FOV);
 }
 
 // Tears down every part of a room (including any tiles/grout placed on its
@@ -619,17 +634,14 @@ function buildRoomDimsSection(roomId) {
 }
 
 // ---------------------------------------------------------------------------
-// "Плитка" (3D) — tap a wall or floor to lay one tile at a time; each new
-// tile snaps to a grid anchored on the FIRST tile placed on that surface, so
-// consecutive taps always land flush against their neighbours with an exact
-// grout-width gap, in any order, without the user having to aim precisely.
-// A grout-coloured backing plate goes in first (once per surface) so the
-// gap between tiles actually shows the chosen grout colour, not raw wall.
+// "Плитка" (3D) — drag a rectangle on a wall or floor to mark the area to
+// tile, then "Покласти плитку" fills the whole thing in one shot: full
+// tiles wherever they fit, and an automatically-sized cut piece wherever
+// they don't (tracked as tileRecord.tileCut and given its own on-model
+// width/height callout — see updateTileCutLabels below), the same way a
+// real tiler works out a layout before cutting anything.
 // ---------------------------------------------------------------------------
 const TILE_THICKNESS = 8; // mm
-const tileGridOrigins = new Map(); // "meshUuid_faceSign" -> { u0, v0 }
-const placedTileCells = new Set(); // "meshUuid_faceSign_cellU_cellV" — avoids stacking duplicates
-const tileBackings = new Set(); // "meshUuid_faceSign" already has its grout plate
 
 // A wall's local frame runs (length, height, thickness) along (X, Y, Z); a
 // floor/ceiling's runs (width, thickness, length) along (X, Y, Z) — so the
@@ -647,68 +659,162 @@ function surfaceLocalFromUV(kind, u, v, normalOffset) {
 function surfaceFaceSign(kind, local) {
   return isWallLike(kind) ? (local.z >= 0 ? 1 : -1) : (local.y >= 0 ? 1 : -1);
 }
-function surfaceFootprint(kind, mesh) {
-  const p = mesh.geometry.parameters;
-  return isWallLike(kind) ? { w: p.width, h: p.height } : { w: p.width, h: p.depth };
-}
 function buildTileGeometry(kind, w, h, thickness) {
   return isWallLike(kind) ? new THREE.BoxGeometry(w, h, thickness) : new THREE.BoxGeometry(w, thickness, h);
 }
 
-function ensureGroutBacking(targetRecord, mesh, kind, faceSign, key) {
-  if (tileBackings.has(key)) return;
-  tileBackings.add(key);
-  const { w, h } = surfaceFootprint(kind, mesh);
-  const backingGeom = buildTileGeometry(kind, w, h, 2);
-  const backingMesh = new THREE.Mesh(backingGeom, createPaintMaterial(tileConfig.groutColor));
-  const localOffset = faceSign * (WALL_THICKNESS / 2 + 1);
-  const localPos = surfaceLocalFromUV(kind, 0, 0, localOffset);
-  backingMesh.position.copy(mesh.localToWorld(localPos));
-  backingMesh.quaternion.copy(mesh.quaternion);
-  backingMesh.receiveShadow = true;
-  registerObject('tileGrout', backingMesh, targetRecord.roomId ? { roomId: targetRecord.roomId } : {});
+// Mirrors the 2D "Плитка" grid-fill algorithm (computeTileGrid in
+// script.js): step across the area in tile-size increments, cropping
+// whatever's left at the far edge instead of overflowing it, so the layout
+// always fits the exact area the user dragged out.
+function computeTileCells(areaW, areaH, tileW, tileH, grout) {
+  const stepU = tileW + grout, stepV = tileH + grout;
+  const us = [];
+  for (let u = 0; u < areaW - 0.01; u += stepU) us.push(u);
+  const vs = [];
+  for (let v = 0; v < areaH - 0.01; v += stepV) vs.push(v);
+  const cells = [];
+  for (const v of vs) {
+    for (const u of us) {
+      const w = Math.min(tileW, areaW - u);
+      const h = Math.min(tileH, areaH - v);
+      cells.push({ u, v, w, h, isFull: w >= tileW - 0.05 && h >= tileH - 0.05 });
+    }
+  }
+  return cells;
 }
 
-function placeTileAt(targetRecord, worldPoint) {
-  const mesh = targetRecord.root;
-  const kind = targetRecord.kind;
-  const local = mesh.worldToLocal(worldPoint.clone());
-  const { u, v } = surfaceUV(kind, local);
-  const faceSign = surfaceFaceSign(kind, local);
-  const key = `${mesh.uuid}_${faceSign}`;
+let tileDrag = null;           // { record, faceSign, startUV: {u,v} } while actively dragging
+let tileArea = null;           // { record, faceSign, u0, v0, u1, v1 } finalized, awaiting the button
+let tileAreaPreviewMesh = null;
 
-  let origin = tileGridOrigins.get(key);
-  if (!origin) { origin = { u0: u, v0: v }; tileGridOrigins.set(key, origin); }
-  const stepU = tileConfig.w + tileConfig.grout, stepV = tileConfig.h + tileConfig.grout;
-  const cellU = Math.round((u - origin.u0) / stepU);
-  const cellV = Math.round((v - origin.v0) / stepV);
-  const cellKey = `${key}_${cellU}_${cellV}`;
-  if (placedTileCells.has(cellKey)) { toast('Тут уже покладено плитку'); return; }
+function beginTileAreaDrag(record, worldPoint) {
+  const local = record.root.worldToLocal(worldPoint.clone());
+  tileDrag = { record, faceSign: surfaceFaceSign(record.kind, local), startUV: surfaceUV(record.kind, local) };
+}
 
-  ensureGroutBacking(targetRecord, mesh, kind, faceSign, key);
+function updateTileAreaDrag(worldPoint) {
+  if (!tileDrag) return;
+  const local = tileDrag.record.root.worldToLocal(worldPoint.clone());
+  const uv = surfaceUV(tileDrag.record.kind, local);
+  paintTileAreaPreview(tileDrag.record, tileDrag.faceSign, tileDrag.startUV, uv);
+}
 
-  const snappedU = origin.u0 + cellU * stepU, snappedV = origin.v0 + cellV * stepV;
-  const localOffset = faceSign * (WALL_THICKNESS / 2 + TILE_THICKNESS / 2 + 1);
-  const localPos = surfaceLocalFromUV(kind, snappedU, snappedV, localOffset);
+function endTileAreaDrag(worldPoint) {
+  if (!tileDrag) return;
+  const { record, faceSign, startUV } = tileDrag;
+  const local = record.root.worldToLocal(worldPoint.clone());
+  const uv = surfaceUV(record.kind, local);
+  tileDrag = null;
+  const u0 = Math.min(startUV.u, uv.u), u1 = Math.max(startUV.u, uv.u);
+  const v0 = Math.min(startUV.v, uv.v), v1 = Math.max(startUV.v, uv.v);
+  if (u1 - u0 < 30 || v1 - v0 < 30) {
+    clearTileAreaPreview();
+    toast('Ділянка занадто мала — розтягніть більшу область');
+    renderTilePill();
+    return;
+  }
+  tileArea = { record, faceSign, u0, v0, u1, v1 };
+  paintTileAreaPreview(record, faceSign, { u: u0, v: v0 }, { u: u1, v: v1 });
+  renderTilePill();
+}
 
-  const tileGeom = buildTileGeometry(kind, tileConfig.w, tileConfig.h, TILE_THICKNESS);
-  const tileMesh = new THREE.Mesh(tileGeom, createPaintMaterial(tileConfig.color));
-  tileMesh.position.copy(mesh.localToWorld(localPos));
-  tileMesh.quaternion.copy(mesh.quaternion);
-  tileMesh.castShadow = true;
-  tileMesh.receiveShadow = true;
-  registerObject('tile', tileMesh, targetRecord.roomId ? { roomId: targetRecord.roomId } : {});
-  placedTileCells.add(cellKey);
+function cancelTileArea() {
+  tileDrag = null;
+  tileArea = null;
+  clearTileAreaPreview();
+}
+
+// Translucent purple slab standing just off the surface — the same
+// "selected area" affordance as everywhere else in the app, live during
+// the drag and left up until the user commits or cancels.
+function paintTileAreaPreview(record, faceSign, uvA, uvB) {
+  clearTileAreaPreview();
+  const kind = record.kind;
+  const w = Math.abs(uvB.u - uvA.u), h = Math.abs(uvB.v - uvA.v);
+  if (w < 1 || h < 1) return;
+  const u0 = Math.min(uvA.u, uvB.u), v0 = Math.min(uvA.v, uvB.v);
+  const geom = buildTileGeometry(kind, w, h, 4);
+  const mat = new THREE.MeshBasicMaterial({ color: 0x8338ec, transparent: true, opacity: 0.32, depthTest: false, side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geom, mat);
+  const localOffset = faceSign * (WALL_THICKNESS / 2 + 6);
+  mesh.position.copy(record.root.localToWorld(surfaceLocalFromUV(kind, u0 + w / 2, v0 + h / 2, localOffset)));
+  mesh.quaternion.copy(record.root.quaternion);
+  mesh.renderOrder = 999;
+  scene.add(mesh);
+  tileAreaPreviewMesh = mesh;
+}
+
+function clearTileAreaPreview() {
+  if (!tileAreaPreviewMesh) return;
+  tileAreaPreviewMesh.parent?.remove(tileAreaPreviewMesh);
+  tileAreaPreviewMesh.geometry.dispose();
+  tileAreaPreviewMesh.material.dispose();
+  tileAreaPreviewMesh = null;
+}
+
+function commitTileArea() {
+  if (!tileArea) return;
+  const { record, faceSign, u0, v0, u1, v1 } = tileArea;
+  const kind = record.kind, mesh = record.root;
+  const areaW = u1 - u0, areaH = v1 - v0;
+  const cells = computeTileCells(areaW, areaH, tileConfig.w, tileConfig.h, tileConfig.grout);
+  const extra = record.roomId ? { roomId: record.roomId } : {};
+
+  // One grout-coloured backing plate sized to the exact selected area (not
+  // the whole wall), so the gap between tiles shows grout, not raw wall.
+  const backingGeom = buildTileGeometry(kind, areaW, areaH, 2);
+  const backingMesh = new THREE.Mesh(backingGeom, createPaintMaterial(tileConfig.groutColor));
+  const backingLocalOffset = faceSign * (WALL_THICKNESS / 2 + 1);
+  backingMesh.position.copy(mesh.localToWorld(surfaceLocalFromUV(kind, u0 + areaW / 2, v0 + areaH / 2, backingLocalOffset)));
+  backingMesh.quaternion.copy(mesh.quaternion);
+  backingMesh.receiveShadow = true;
+  registerObject('tileGrout', backingMesh, extra);
+
+  let cutCount = 0;
+  for (const cell of cells) {
+    const cu = u0 + cell.u + cell.w / 2, cv = v0 + cell.v + cell.h / 2;
+    const localOffset = faceSign * (WALL_THICKNESS / 2 + TILE_THICKNESS / 2 + 1);
+    const localPos = surfaceLocalFromUV(kind, cu, cv, localOffset);
+    const tileGeom = buildTileGeometry(kind, cell.w, cell.h, TILE_THICKNESS);
+    const tileMesh = new THREE.Mesh(tileGeom, createPaintMaterial(tileConfig.color));
+    tileMesh.position.copy(mesh.localToWorld(localPos));
+    tileMesh.quaternion.copy(mesh.quaternion);
+    tileMesh.castShadow = true;
+    tileMesh.receiveShadow = true;
+    const tileRecord = registerObject('tile', tileMesh, extra);
+    if (!cell.isFull) { tileRecord.tileCut = { w: cell.w, h: cell.h, wallLike: isWallLike(kind) }; cutCount++; }
+  }
+
+  toast(`Покладено ${cells.length} плиток${cutCount ? `, з них ${cutCount} обрізаних — розміри підписані на них` : ''}`);
+  tileArea = null;
+  clearTileAreaPreview();
+  // Tool stays active — tiling a whole room is usually more than one
+  // dragged area (around a window, up to a doorway, …), so the pill goes
+  // back to "drag the next area" instead of closing.
+  renderTilePill();
 }
 
 function renderTilePill() {
   modePillEl.innerHTML = '';
-  const label = document.createElement('span');
-  label.textContent = 'Торкніться стіни або підлоги';
-  const done = document.createElement('button');
-  done.textContent = '✓ Готово';
-  done.addEventListener('click', () => { tileToolActive = false; hideEl(modePillEl); });
-  modePillEl.append(label, done);
+  if (tileArea) {
+    const label = document.createElement('span');
+    label.textContent = `Ділянка ${formatMm(tileArea.u1 - tileArea.u0, 0)} × ${formatMm(tileArea.v1 - tileArea.v0, 0)} мм`;
+    const lay = document.createElement('button');
+    lay.textContent = '✓ Покласти плитку';
+    lay.addEventListener('click', commitTileArea);
+    const cancel = document.createElement('button');
+    cancel.textContent = '✕ Скасувати';
+    cancel.addEventListener('click', () => { cancelTileArea(); renderTilePill(); });
+    modePillEl.append(label, lay, cancel);
+  } else {
+    const label = document.createElement('span');
+    label.textContent = 'Розтягніть прямокутну ділянку на стіні чи підлозі';
+    const done = document.createElement('button');
+    done.textContent = '✓ Готово';
+    done.addEventListener('click', () => { tileToolActive = false; cancelTileArea(); hideEl(modePillEl); });
+    modePillEl.append(label, done);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,6 +1401,118 @@ function updateAxisLabels() {
   }
 }
 
+// Diameter callout for every hole cut into the selected object (see
+// performHolePlacement, which records each cut's local position/radius on
+// selected.holes) — a small dot on the hole, a leader to a "⌀160 мм" label
+// so it's readable without overlapping the hole itself. Rebuilt each frame
+// like the dimension lines above; hole counts per object are always small,
+// so recreating the DOM nodes is cheap enough to not bother pooling them.
+const holeLabelsGroupEl = document.getElementById('holeLabelsGroup');
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function updateHoleLabels() {
+  if (!selected || !selected.holes || !selected.holes.length || mode !== 'edit') {
+    if (holeLabelsGroupEl.childElementCount) holeLabelsGroupEl.innerHTML = '';
+    return;
+  }
+  const root = selected.root;
+  const frag = document.createDocumentFragment();
+  for (const hole of selected.holes) {
+    const ndc = hole.local.clone().applyMatrix4(root.matrixWorld).project(camera);
+    if (ndc.z < -1 || ndc.z > 1) continue;
+    const x = (ndc.x * 0.5 + 0.5) * window.innerWidth, y = (-ndc.y * 0.5 + 0.5) * window.innerHeight;
+    const lx = x + 26, ly = y - 22; // label sits up-right of the hole
+
+    const g = document.createElementNS(SVG_NS, 'g');
+    g.setAttribute('class', 'hole-label');
+
+    const dot = document.createElementNS(SVG_NS, 'circle');
+    dot.setAttribute('class', 'hole-dot');
+    dot.setAttribute('cx', x); dot.setAttribute('cy', y); dot.setAttribute('r', 2.5);
+    g.appendChild(dot);
+
+    const leader = document.createElementNS(SVG_NS, 'line');
+    leader.setAttribute('class', 'hole-leader');
+    leader.setAttribute('x1', x); leader.setAttribute('y1', y);
+    leader.setAttribute('x2', lx); leader.setAttribute('y2', ly);
+    g.appendChild(leader);
+
+    const text = document.createElementNS(SVG_NS, 'text');
+    text.setAttribute('class', 'hole-text');
+    text.setAttribute('x', lx + 4);
+    text.setAttribute('y', ly);
+    text.textContent = `⌀${formatMm(hole.radius * 2, 0)} мм`;
+    g.appendChild(text);
+
+    frag.appendChild(g);
+  }
+  holeLabelsGroupEl.innerHTML = '';
+  holeLabelsGroupEl.appendChild(frag);
+}
+
+// Width/height callouts for every tile cut down from the standard size
+// (tileRecord.tileCut, set in commitTileArea) — always on, not gated by
+// selection, since the point is a cut size readable at a glance while
+// laying tiles, not one you have to tap each piece to check. Reuses the
+// same arrow-tipped/colour-coded look as the per-object dimension lines
+// above (X = width, always red; the tile's other in-plane axis — Y on a
+// wall, Z on a floor/ceiling — is the height).
+const tileCutLabelsGroupEl = document.getElementById('tileCutLabelsGroup');
+
+function appendTileDimLine(frag, root, localEnds, labelText, axis, offsetPx) {
+  const toScreen = (v) => {
+    const ndc = v.clone().applyMatrix4(root.matrixWorld).project(camera);
+    return { x: (ndc.x * 0.5 + 0.5) * window.innerWidth, y: (-ndc.y * 0.5 + 0.5) * window.innerHeight, behind: ndc.z < -1 || ndc.z > 1 };
+  };
+  const a = toScreen(localEnds[0]), b = toScreen(localEnds[1]);
+  if (a.behind || b.behind || Math.hypot(a.x - b.x, a.y - b.y) < 4) return;
+
+  const line = document.createElementNS(SVG_NS, 'line');
+  line.setAttribute('class', `dim-line dim-line-${axis}`);
+  line.setAttribute('marker-start', `url(#dimArrow${axis.toUpperCase()})`);
+  line.setAttribute('marker-end', `url(#dimArrow${axis.toUpperCase()})`);
+  line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
+  line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+  frag.appendChild(line);
+
+  // Anchored 2/3 toward one end (not dead centre) with a perpendicular
+  // offset, same fix as updateAxisLabels — the width and height lines
+  // share the tile's centre point, so a centred label would clump them.
+  const t = 0.68;
+  const mx = a.x + (b.x - a.x) * t, my = a.y + (b.y - a.y) * t;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len, ny = dx / len;
+
+  const text = document.createElementNS(SVG_NS, 'text');
+  text.setAttribute('class', `dim-text dim-text-${axis}`);
+  text.setAttribute('x', mx + nx * offsetPx);
+  text.setAttribute('y', my + ny * offsetPx);
+  text.textContent = labelText;
+  frag.appendChild(text);
+}
+
+function updateTileCutLabels() {
+  const cutTiles = mode === 'edit' ? objects.filter((r) => r.kind === 'tile' && r.tileCut) : [];
+  if (!cutTiles.length) {
+    if (tileCutLabelsGroupEl.childElementCount) tileCutLabelsGroupEl.innerHTML = '';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const rec of cutTiles) {
+    const { w, h, wallLike } = rec.tileCut;
+    const hw = w / 2, hh = h / 2;
+    const wEnds = [new THREE.Vector3(-hw, 0, 0), new THREE.Vector3(hw, 0, 0)];
+    const hEnds = wallLike
+      ? [new THREE.Vector3(0, -hh, 0), new THREE.Vector3(0, hh, 0)]
+      : [new THREE.Vector3(0, 0, -hh), new THREE.Vector3(0, 0, hh)];
+    appendTileDimLine(frag, rec.root, wEnds, `${formatMm(w, 0)} мм`, 'x', 14);
+    appendTileDimLine(frag, rec.root, hEnds, `${formatMm(h, 0)} мм`, wallLike ? 'y' : 'z', 20);
+  }
+  tileCutLabelsGroupEl.innerHTML = '';
+  tileCutLabelsGroupEl.appendChild(frag);
+}
+
 // The UNSCALED local size along one axis — needed to work out what scale
 // factor turns "current geometry" into "the mm the user just typed in".
 function getBaseAxisSizeMm(record, axis) {
@@ -1483,6 +1701,11 @@ function performHolePlacement(clientX, clientY) {
     if (!result.attributes.position.count) throw new Error('empty result');
     selected.root.geometry.dispose();
     selected.root.geometry = result;
+    // Remembered in the object's own local space (not world) so the label
+    // keeps tracking the right spot on the surface if the object is later
+    // moved or rotated — see updateHoleLabels().
+    selected.holes = selected.holes || [];
+    selected.holes.push({ local: selected.root.worldToLocal(hit.point.clone()), radius: holeRadius });
     toast('Отвір створено');
   } catch (e) {
     toast('Не вдалося вирізати отвір тут — спробуйте інше місце');
@@ -1787,7 +2010,7 @@ function buildPopoverContent(panel) {
 
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
-    hint.textContent = 'Задайте розмір, кольори — тоді торкайтесь стіни чи підлоги, плитки самі приляжуть з рівним швом.';
+    hint.textContent = 'Задайте розмір, кольори — тоді розтягніть прямокутну ділянку на стіні чи підлозі й натисніть «Покласти плитку»: викладе цілі плитки й акуратно обріже краї.';
     popoverEl.appendChild(hint);
 
     const sizeRow = document.createElement('div'); sizeRow.className = 'panel-row';
@@ -1830,13 +2053,20 @@ function buildPopoverContent(panel) {
     const toggleRow = document.createElement('div'); toggleRow.className = 'panel-row';
     const toggleBtn = document.createElement('button');
     toggleBtn.className = 'pbtn wide' + (tileToolActive ? ' on' : '');
-    toggleBtn.textContent = tileToolActive ? '■ Вимкнути інструмент' : '✓ Активувати — торкайтесь стіни/підлоги';
+    toggleBtn.textContent = tileToolActive ? '■ Вимкнути інструмент' : '✓ Активувати — розтягніть ділянку на стіні/підлозі';
     toggleBtn.addEventListener('click', () => {
       tileToolActive = !tileToolActive;
       deselect();
       closePopover();
-      if (tileToolActive) { showEl(modePillEl); renderTilePill(); toast('Торкніться стіни або підлоги, щоб покласти плитку'); }
-      else hideEl(modePillEl);
+      if (tileToolActive) {
+        cancelTileArea();
+        showEl(modePillEl);
+        renderTilePill();
+        toast('Розтягніть прямокутну ділянку на стіні або підлозі, потім натисніть «Покласти плитку»');
+      } else {
+        cancelTileArea();
+        hideEl(modePillEl);
+      }
     });
     toggleRow.appendChild(toggleBtn);
     popoverEl.appendChild(toggleRow);
@@ -2076,6 +2306,14 @@ canvas.addEventListener('pointerdown', (e) => {
         drawStartWorld = hits[0].point.clone();
         paperDrawDragging = true;
       }
+    } else if (mode === 'edit' && tileToolActive) {
+      scene.updateMatrixWorld(true);
+      const targets = objects.filter((r) => r.kind === 'wall' || r.kind === 'roomFloor' || r.kind === 'roomCeiling').map((r) => r.root);
+      const hits = rayFromClient(e.clientX, e.clientY).intersectObjects(targets, false);
+      if (hits.length) {
+        const rec = findRecordByMesh(hits[0].object);
+        if (rec) beginTileAreaDrag(rec, hits[0].point);
+      }
     } else if (!moveMode && !paperDrawing) {
       lookPointerId = e.pointerId;
       lastLookX = e.clientX; lastLookY = e.clientY;
@@ -2138,6 +2376,11 @@ canvas.addEventListener('pointermove', (e) => {
     if (hits.length) updatePreviewLine(drawStartWorld, hits[0].point);
     return;
   }
+  if (mode === 'edit' && tileDrag && e.pointerId === primaryPointerId) {
+    const hits = rayFromClient(e.clientX, e.clientY).intersectObjects([tileDrag.record.root], false);
+    if (hits.length) updateTileAreaDrag(hits[0].point);
+    return;
+  }
   if (lookPointerId !== null && e.pointerId === lookPointerId) {
     handleFreeLook(e);
   }
@@ -2154,6 +2397,7 @@ function endPointer(e) {
   if (e.type === 'pointercancel') {
     if (mode === 'edit' && moveMode) moveDragging = false;
     if (mode === 'edit' && paperDrawing) { paperDrawDragging = false; drawStartWorld = null; clearPreviewLine(); }
+    if (mode === 'edit' && tileToolActive) { tileDrag = null; clearTileAreaPreview(); renderTilePill(); }
     return;
   }
 
@@ -2171,6 +2415,20 @@ function endPointer(e) {
       }
       paperDrawDragging = false;
       drawStartWorld = null;
+    }
+    return;
+  }
+  if (mode === 'edit' && tileToolActive) {
+    if (tileDrag && e.pointerId === primaryPointerId) {
+      const hits = rayFromClient(e.clientX, e.clientY).intersectObjects([tileDrag.record.root], false);
+      if (hits.length) {
+        endTileAreaDrag(hits[0].point);
+      } else {
+        // released off the wall/floor — cancel this attempt rather than guess
+        tileDrag = null;
+        clearTileAreaPreview();
+        renderTilePill();
+      }
     }
     return;
   }
@@ -2220,14 +2478,9 @@ function handleEditTap(x, y) {
   if (wallDrawing) { addWallPoint(x, y); return; }
   if (windowToolActive) { insertWindowAt(x, y); return; }
   if (holeToolActive) { performHolePlacement(x, y); return; }
-  if (tileToolActive) {
-    const targets = objects.filter((r) => r.kind === 'wall' || r.kind === 'roomFloor' || r.kind === 'roomCeiling').map((r) => r.root);
-    const hits = rayFromClient(x, y).intersectObjects(targets, false);
-    if (!hits.length) { toast('Торкніться стіни або підлоги'); return; }
-    const rec = findRecordByMesh(hits[0].object);
-    if (rec) placeTileAt(rec, hits[0].point);
-    return;
-  }
+  // tileToolActive is handled entirely as a drag in pointerdown/move/up
+  // (see beginTileAreaDrag etc.) — a tap that isn't a drag just falls
+  // through to normal selection below, same as with nothing active.
 
   const ray = rayFromClient(x, y);
   const hits = ray.intersectObjects(raycastTargets, false);
@@ -2254,6 +2507,26 @@ const resetViewBtn = document.getElementById('resetViewBtn');
 window.addEventListener('keydown', (e) => keys.add(e.code));
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 resetViewBtn.addEventListener('click', resetView);
+
+// Zoom buttons — a step per tap, and holding one repeats it, so it feels
+// like a normal continuous zoom rather than a one-shot nudge.
+function wireZoomButton(btn, stepSign) {
+  let repeatTimer = null;
+  const step = () => setFov(camera.fov - stepSign * 6);
+  const start = (e) => {
+    e.preventDefault();
+    step();
+    clearInterval(repeatTimer);
+    repeatTimer = setInterval(step, 140);
+  };
+  const stop = () => clearInterval(repeatTimer);
+  btn.addEventListener('pointerdown', start);
+  btn.addEventListener('pointerup', stop);
+  btn.addEventListener('pointerleave', stop);
+  btn.addEventListener('pointercancel', stop);
+}
+wireZoomButton(document.getElementById('zoomInBtn'), 1);   // narrower FOV — magnify
+wireZoomButton(document.getElementById('zoomOutBtn'), -1); // wider FOV — see more (e.g. a whole nearby wall)
 
 function enterWalkMode() {
   mode = 'walk';
@@ -2891,9 +3164,17 @@ function axisLabelSprite(letter, colorCss) {
     label.position.copy(dir).multiplyScalar(shaftLen + ballR + 0.3);
     axisGizmoScene.add(label);
   }
-  // Compact hub where the three axes meet.
-  const hub = new THREE.Mesh(new THREE.SphereGeometry(0.13, 16, 12), new THREE.MeshBasicMaterial({ color: 0xaeb0b8 }));
+  // Compact cube hub where the three axes meet — the recognisable "3ds Max
+  // style" anchor, not just a dot the arrows happen to touch. A thin dark
+  // edge outline keeps its corners readable at this tiny on-screen size.
+  const hubSize = 0.34;
+  const hub = new THREE.Mesh(new THREE.BoxGeometry(hubSize, hubSize, hubSize), new THREE.MeshBasicMaterial({ color: 0xd6d8de }));
   axisGizmoScene.add(hub);
+  const hubEdges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(hub.geometry),
+    new THREE.LineBasicMaterial({ color: 0x54565c }),
+  );
+  hub.add(hubEdges);
 })();
 
 function renderAxisGizmo() {
@@ -2934,6 +3215,8 @@ function animate() {
     updateScaleBar(refDist);
     updateFreeCamera(dt, refDist);
     updateAxisLabels();
+    updateHoleLabels();
+    updateTileCutLabels();
   } else if (mode === 'walk') {
     updateFreeCamera(dt, 0);
   }
@@ -2956,7 +3239,9 @@ window.__creslarnet3d = {
   get tileConfig() { return tileConfig; },
   set tileToolActive(v) { tileToolActive = v; },
   get tileToolActive() { return tileToolActive; },
-  handleEditTap, placeTileAt,
+  handleEditTap,
+  get tileArea() { return tileArea; },
+  commitTileArea, cancelTileArea,
   // fly the camera to look at a world point from a fixed relative offset —
   // handy for debugging/testing since there's no orbit pivot to aim any more
   lookAt(pos, distance = 3000) {

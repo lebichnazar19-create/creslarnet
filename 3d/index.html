@@ -34,6 +34,14 @@
     <svg viewBox="0 0 24 24"><path d="M12 4v6M12 14v6M4 12h6M14 12h6"/></svg>
   </div>
 
+  <!-- Optical zoom (camera.fov), not a movement control — lets you see a
+       whole wall from inside a small room without needing space to
+       physically back away into. -->
+  <div id="zoomControl" class="zoom-control">
+    <button id="zoomInBtn" title="Наблизити">+</button>
+    <button id="zoomOutBtn" title="Віддалити — побачити більше, наприклад, всю стіну">−</button>
+  </div>
+
   <button id="walkExit" class="walk-exit hidden">✕ Вихід із прогулянки</button>
 
   <div id="toast" class="toast hidden"></div>
@@ -69,6 +77,13 @@
       <line class="dim-line dim-line-z" marker-start="url(#dimArrowZ)" marker-end="url(#dimArrowZ)"></line>
       <text class="dim-text dim-text-z"></text>
     </g>
+    <!-- One <g class="hole-label"> per cut hole on the selected object,
+         built/recycled in app.js's updateHoleLabels(). -->
+    <g id="holeLabelsGroup"></g>
+    <!-- Width/height callouts for every tile cut down from the standard
+         size — always on, not gated by selection, built in
+         updateTileCutLabels(). -->
+    <g id="tileCutLabelsGroup"></g>
   </svg>
 
   <!-- Selection contextual panel (shown when an object is picked) -->
