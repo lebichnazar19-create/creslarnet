@@ -1808,6 +1808,117 @@ if ('serviceWorker' in navigator) {
   });
 
   // ---------------------------------------------------------------------
+  // Save / load — the whole project (every page, if one exists) as a
+  // single .json file, the same pattern as the 3D mode's "Файл" system.
+  // Shapes here are already plain data (mm coordinates, no geometry to
+  // reconstruct), so unlike 3D this is a near-direct JSON.stringify.
+  // ---------------------------------------------------------------------
+  function buildProjectData2D() {
+    const pages = project ? project.pages.map((p) => ({ number: p.number, shapes: p.shapes })) : [{ number: 1, shapes }];
+    return {
+      app: 'creslarnet-2d', version: 1, units: 'mm',
+      pageKey,
+      projectName: project ? project.name : null,
+      currentPageIndex,
+      pages,
+    };
+  }
+
+  // A blob: URL behind an <a download> is not always honoured as a real
+  // save on a phone — inside an installed PWA especially, it can silently
+  // do nothing or just open the JSON in a blank tab instead of writing a
+  // file. The File System Access API gives a genuine native "save to…"
+  // dialog with a confirmed on-disk result, so it's tried first; the
+  // download-link method remains as the fallback for browsers that don't
+  // support it (Safari, Firefox, older Android WebViews).
+  async function saveProject2D() {
+    const filename = 'creslarnet-2d-project.json';
+    const json = JSON.stringify(buildProjectData2D());
+
+    if (window.showSaveFilePicker) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: filename,
+          types: [{ description: 'Проєкт Creslarnet 2D', accept: { 'application/json': ['.json'] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(json);
+        await writable.close();
+        flashHint('Проєкт збережено');
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') { flashHint('Збереження скасовано'); return; }
+        // fall through to the download-link method below on any other failure
+      }
+    }
+
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    flashHint('Проєкт збережено у файл (перевірте папку «Завантаження»)');
+  }
+
+  function loadProject2D(data) {
+    if (!data || data.app !== 'creslarnet-2d' || !Array.isArray(data.pages) || !data.pages.length) {
+      flashHint('Файл не розпізнано як проєкт Creslarnet 2D');
+      return;
+    }
+    if (data.units !== 'mm') {
+      flashHint('Цей файл несумісний із поточною системою мм');
+      return;
+    }
+    deselect();
+    if (polylineDraft) cancelPolyline();
+
+    if (data.pageKey && PAGE_SIZES[data.pageKey]) {
+      pageKey = data.pageKey;
+      pageSizeButtons.forEach((b) => b.classList.toggle('active', b.dataset.pageSize === pageKey));
+    }
+
+    if (data.projectName) {
+      project = { name: data.projectName, pages: data.pages.map((p) => ({ number: p.number, shapes: p.shapes })) };
+      currentPageIndex = Math.min(Math.max(0, data.currentPageIndex || 0), project.pages.length - 1);
+      setShapes(project.pages[currentPageIndex].shapes);
+    } else {
+      project = null;
+      currentPageIndex = 0;
+      setShapes(data.pages[0].shapes || []);
+    }
+
+    let maxId = 0;
+    for (const p of data.pages) for (const s of p.shapes) if (s.id) maxId = Math.max(maxId, s.id);
+    nextId = maxId + 1;
+
+    fitPageToView();
+    renderProjectPanel();
+    flashHint('Проєкт завантажено');
+  }
+
+  document.getElementById('saveProjectBtn2d').addEventListener('click', saveProject2D);
+  const projectFileInput2d = document.getElementById('projectFileInput2d');
+  document.getElementById('loadProjectBtn2d').addEventListener('click', () => projectFileInput2d.click());
+  projectFileInput2d.addEventListener('change', () => {
+    const file = projectFileInput2d.files[0];
+    projectFileInput2d.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        loadProject2D(JSON.parse(reader.result));
+      } catch (e) {
+        flashHint('Не вдалося прочитати файл проєкту');
+      }
+    };
+    reader.readAsText(file);
+  });
+
+  // ---------------------------------------------------------------------
   // Any actual viewport change (rotate, browser chrome show/hide, a
   // desktop window resize) re-fits the sheet fresh instead of nudging the
   // existing pan/zoom — that's what stops it "wandering": every layout
@@ -1832,6 +1943,7 @@ if ('serviceWorker' in navigator) {
     get pageKey() { return pageKey; },
     get polylineDraft() { return polylineDraft; },
     pageW, pageH, view, clientToMm, fitPageToView,
+    buildProjectData2D, loadProject2D, saveProject2D,
     hasTileImage: (id) => tileImageCache.has(id),
     computeTileGrid,
     warpPerspective, runScanPipeline, solveHomography, applyHomography,

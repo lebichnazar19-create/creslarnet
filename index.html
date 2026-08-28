@@ -131,6 +131,12 @@
       </div>
 
       <div class="tool-group">
+        <h2>Проєкт-файл</h2>
+        <button class="action-btn" id="saveProjectBtn2d">⭳ Зберегти проєкт у файл</button>
+        <button class="action-btn" id="loadProjectBtn2d">⭱ Відкрити проєкт з файлу</button>
+      </div>
+
+      <div class="tool-group">
         <h2>Дії</h2>
         <button class="action-btn" id="undoBtn">Скасувати</button>
         <button class="action-btn" id="clearBtn">Очистити полотно</button>
@@ -141,6 +147,8 @@
       </div>
     </div>
   </aside>
+
+  <input type="file" accept="application/json,.json" id="projectFileInput2d" class="hidden">
 
   <aside class="drawer drawer-left" id="projectDrawer">
     <div class="drawer-header">

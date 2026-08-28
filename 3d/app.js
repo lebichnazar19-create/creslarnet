@@ -2544,7 +2544,19 @@ resetViewBtn.addEventListener('click', resetView);
 // like a normal continuous zoom rather than a one-shot nudge.
 function wireZoomButton(btn, stepSign) {
   let repeatTimer = null;
-  const step = () => setFov(camera.fov - stepSign * 6);
+  // Straight dolly along the camera's own forward vector (the same vector
+  // camera.getWorldDirection always returns, pitch included) — a pure
+  // translation along that one direction has no sideways component by
+  // construction, so it always moves exactly toward/away from wherever the
+  // camera is currently looking, never off to one side. Scaled by what's
+  // actually ahead (forwardHitDistance), same as the wheel/pinch dolly, so
+  // a press feels equally fine near a wall and brisk out in the open.
+  const step = () => {
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    const refDist = forwardHitDistance();
+    camera.position.addScaledVector(dir, stepSign * refDist * 0.1);
+  };
   const start = (e) => {
     e.preventDefault();
     step();
@@ -2557,8 +2569,8 @@ function wireZoomButton(btn, stepSign) {
   btn.addEventListener('pointerleave', stop);
   btn.addEventListener('pointercancel', stop);
 }
-wireZoomButton(document.getElementById('zoomInBtn'), 1);   // narrower FOV — magnify
-wireZoomButton(document.getElementById('zoomOutBtn'), -1); // wider FOV — see more (e.g. a whole nearby wall)
+wireZoomButton(document.getElementById('zoomInBtn'), 1);   // dolly forward — closer
+wireZoomButton(document.getElementById('zoomOutBtn'), -1); // dolly backward — see more (e.g. a whole nearby wall)
 
 function enterWalkMode() {
   mode = 'walk';
