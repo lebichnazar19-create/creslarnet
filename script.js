@@ -112,7 +112,7 @@ if ('serviceWorker' in navigator) {
 
   const KIND_LABELS = {
     line: 'Лінія', rect: 'Прямокутник', circle: 'Коло', arc: 'Дуга', leader: 'Виноска',
-    freehand: 'Олівець', polyline: 'Полілінія', tilearea: 'Плитка (розкладка)',
+    freehand: 'Олівець', polyline: 'Полілінія', tilearea: 'Плитка (розкладка)', gear: 'Шестерня',
   };
 
   function makePreviewShape(tool, x1, y1, x2, y2) {
@@ -122,7 +122,63 @@ if ('serviceWorker' in navigator) {
     if (tool === 'arc') return { type: 'arc', cx: x1, cy: y1, r: Math.hypot(x2 - x1, y2 - y1), startDeg: 0, endDeg: 360 };
     if (tool === 'leader') return { type: 'leader', x1, y1, x2, y2, text: '' };
     if (tool === 'tilearea') return { type: 'tilearea', x1, y1, x2, y2, tileW: 600, tileH: 1200, grout: 2, imageId: null };
+    if (tool === 'gear') {
+      const r = Math.hypot(x2 - x1, y2 - y1);
+      return { type: 'gear', cx: x1, cy: y1, teeth: 12, outerD: Math.max(20, r * 2), holeD: Math.max(4, r * 0.4) };
+    }
     return null;
+  }
+
+  // ---------------------------------------------------------------------
+  // "Шестерня" — a real involute gear profile from three numbers (teeth,
+  // outer/addendum diameter, hole diameter), not a decorative zigzag:
+  // module m = outer / (Z + 2), pitch/base/root circles from the standard
+  // formulas, each tooth flank sampled along the true involute curve
+  // (inv(a) = tan(a) - a) from the base circle out to the addendum circle,
+  // with a straight radial line down to the root where the dedendum falls
+  // below the base circle (as most small gears' does — the real fillet
+  // there is a trochoid from the cutting tool, a straight line is the
+  // standard simplification at drafting scale).
+  // ---------------------------------------------------------------------
+  function computeGearPath(cx, cy, teeth, outerD, holeD) {
+    const Z = Math.max(4, Math.round(teeth));
+    const pressureAngle = (20 * Math.PI) / 180;
+    const rOuter = outerD / 2;
+    const m = outerD / (Z + 2);
+    const rPitch = (m * Z) / 2;
+    const rBase = rPitch * Math.cos(pressureAngle);
+    const rDedendum = Math.max((holeD || 0) / 2 + m * 0.3, rPitch - 1.25 * m);
+    const flankStartR = Math.max(rBase, rDedendum);
+
+    const toothHalfAngle = Math.PI / (2 * Z);
+    const invAt = (r) => {
+      const a = Math.acos(Math.min(1, rBase / Math.max(r, rBase)));
+      return Math.tan(a) - a;
+    };
+    const invPitch = invAt(rPitch);
+
+    const steps = 6;
+    const points = [];
+    for (let i = 0; i < Z; i++) {
+      const theta0 = (i / Z) * Math.PI * 2;
+      for (let s = 0; s <= steps; s++) {
+        const r = flankStartR + (rOuter - flankStartR) * (s / steps);
+        const ang = theta0 + toothHalfAngle + invPitch - invAt(r);
+        points.push({ x: cx + r * Math.cos(ang), y: cy + r * Math.sin(ang) });
+      }
+      if (rDedendum < rBase - 0.01) {
+        const angBaseLeft = theta0 + toothHalfAngle + invPitch;
+        const angBaseRight = theta0 - toothHalfAngle - invPitch;
+        points.push({ x: cx + rDedendum * Math.cos(angBaseLeft), y: cy + rDedendum * Math.sin(angBaseLeft) });
+        points.push({ x: cx + rDedendum * Math.cos(angBaseRight), y: cy + rDedendum * Math.sin(angBaseRight) });
+      }
+      for (let s = steps; s >= 0; s--) {
+        const r = flankStartR + (rOuter - flankStartR) * (s / steps);
+        const ang = theta0 - toothHalfAngle - invPitch + invAt(r);
+        points.push({ x: cx + r * Math.cos(ang), y: cy + r * Math.sin(ang) });
+      }
+    }
+    return points;
   }
 
   // ---------------------------------------------------------------------
@@ -794,6 +850,20 @@ if ('serviceWorker' in navigator) {
           for (let i = 1; i < pts.length; i++) context.lineTo(pts[i].x, pts[i].y);
         }
       }
+    } else if (s.type === 'gear') {
+      const pts = computeGearPath(s.cx, s.cy, s.teeth, s.outerD, s.holeD).map(mmToPx);
+      context.beginPath();
+      if (pts.length) {
+        context.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) context.lineTo(pts[i].x, pts[i].y);
+        context.closePath();
+      }
+      if (s.holeD > 0) {
+        const c = mmToPx({ x: s.cx, y: s.cy });
+        const rpx = Math.max(0.01, (s.holeD / 2) * view.scale);
+        context.moveTo(c.x + rpx, c.y);
+        context.arc(c.x, c.y, rpx, 0, Math.PI * 2);
+      }
     }
   }
 
@@ -838,6 +908,11 @@ if ('serviceWorker' in navigator) {
         // a filled area, unlike an empty rect — tap anywhere inside selects it
         const b = tileAreaBounds(s);
         if (p.x >= b.x0 - HIT_TOLERANCE_PX && p.x <= b.x1 + HIT_TOLERANCE_PX && p.y >= b.y0 - HIT_TOLERANCE_PX && p.y <= b.y1 + HIT_TOLERANCE_PX) return s;
+      } else if (s.type === 'gear') {
+        // tap anywhere within the outer (addendum) circle — the teeth make
+        // an exact edge-only hit test fussy for touch
+        const c = mmToPx({ x: s.cx, y: s.cy });
+        if (Math.hypot(p.x - c.x, p.y - c.y) <= (s.outerD / 2) * view.scale + HIT_TOLERANCE_PX) return s;
       }
     }
     return null;
@@ -1522,6 +1597,29 @@ if ('serviceWorker' in navigator) {
       dimPanel.appendChild(summary);
     }
 
+    if (selected.type === 'gear') {
+      const teethRow = document.createElement('div');
+      teethRow.className = 'dim-row';
+      const teethLabel = document.createElement('span'); teethLabel.className = 'dim-label'; teethLabel.textContent = 'Зубців';
+      const teethMinus = document.createElement('button'); teethMinus.className = 'dim-step'; teethMinus.textContent = '–';
+      const teethVal = document.createElement('span'); teethVal.className = 'dim-input'; teethVal.style.textAlign = 'center';
+      const teethPlus = document.createElement('button'); teethPlus.className = 'dim-step'; teethPlus.textContent = '+';
+      teethVal.textContent = String(selected.teeth);
+      teethMinus.addEventListener('click', () => { selected.teeth = Math.max(4, selected.teeth - 1); requestRedraw(); renderDimPanel(); });
+      teethPlus.addEventListener('click', () => { selected.teeth = Math.min(200, selected.teeth + 1); requestRedraw(); renderDimPanel(); });
+      teethRow.append(teethLabel, teethMinus, teethVal, teethPlus);
+      dimPanel.appendChild(teethRow);
+
+      field('Зовнішній діаметр', () => selected.outerD, (v) => { selected.outerD = v; });
+      field('Діаметр отвору', () => selected.holeD, (v) => { selected.holeD = Math.max(0, Math.min(v, selected.outerD * 0.85)); });
+
+      const summary = document.createElement('p');
+      summary.className = 'hatch-label';
+      const m = selected.outerD / (Math.max(4, Math.round(selected.teeth)) + 2);
+      summary.textContent = `Модуль ≈ ${formatMm(m, 2)} мм, ділильне коло ≈ ${formatMm(m * selected.teeth, 1)} мм`;
+      dimPanel.appendChild(summary);
+    }
+
     if (selected.type === 'rect' || selected.type === 'circle') {
       const hatchLabel = document.createElement('p');
       hatchLabel.className = 'hatch-label';
@@ -1686,6 +1784,10 @@ if ('serviceWorker' in navigator) {
       const b = tileAreaBounds(s);
       return p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1;
     }
+    if (s.type === 'gear') {
+      const c = mmToPx({ x: s.cx, y: s.cy });
+      return Math.hypot(p.x - c.x, p.y - c.y) <= (s.outerD / 2) * view.scale + HIT_TOLERANCE_PX;
+    }
     return false;
   }
 
@@ -1846,7 +1948,7 @@ if ('serviceWorker' in navigator) {
     if (moveShape) {
       const mm = clientToMm(e.clientX, e.clientY);
       const dx = mm.x - moveGrabMm.x, dy = mm.y - moveGrabMm.y;
-      if (moveShape.type === 'circle' || moveShape.type === 'arc') {
+      if (moveShape.type === 'circle' || moveShape.type === 'arc' || moveShape.type === 'gear') {
         moveShape.cx = moveShapeStart.cx + dx; moveShape.cy = moveShapeStart.cy + dy;
       } else if (moveShape.type === 'freehand' || moveShape.type === 'polyline') {
         moveShape.points = moveShapeStart.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
@@ -1917,7 +2019,9 @@ if ('serviceWorker' in navigator) {
       const shape = makePreviewShape(state.tool, drawStartMm.x, drawStartMm.y, mm.x, mm.y);
       dragPreview = null;
       drawStartMm = null;
-      const tooSmall = shape.type === 'circle' || shape.type === 'arc' ? shape.r < 1.5 : Math.hypot((shape.x2 ?? 0) - (shape.x1 ?? 0), (shape.y2 ?? 0) - (shape.y1 ?? 0)) < 1.5;
+      const tooSmall = shape.type === 'circle' || shape.type === 'arc' ? shape.r < 1.5
+        : shape.type === 'gear' ? shape.outerD < 8
+        : Math.hypot((shape.x2 ?? 0) - (shape.x1 ?? 0), (shape.y2 ?? 0) - (shape.y1 ?? 0)) < 1.5;
       if (movedPx < 3 && dt < 250 || tooSmall) { requestRedraw(); return; } // accidental tap, discard
       shape.color = state.color;
       shape.lineWidthMm = state.lineWidthMm;
