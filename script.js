@@ -22,10 +22,14 @@ if ('serviceWorker' in navigator) {
   // devicePixelRatio-normalized transform (resizeCanvas + clientToMm) —
   // one CSS pixel is always one ctx unit, full stop.
   // ---------------------------------------------------------------------
-  const PAGE_W_MM = 210, PAGE_H_MM = 297; // A4
+  const PAGE_SIZES = { A4: { w: 210, h: 297 }, A3: { w: 297, h: 420 }, A2: { w: 420, h: 594 }, A1: { w: 594, h: 841 } };
+  let pageKey = 'A4';
+  function pageW() { return PAGE_SIZES[pageKey].w; }
+  function pageH() { return PAGE_SIZES[pageKey].h; }
   const PALETTE = ['#1a1a1a', '#e63946', '#2a9d8f', '#264653', '#f4a261', '#8338ec'];
   const MIN_SCALE = 0.4, MAX_SCALE = 60; // screen px per mm
   const HIT_TOLERANCE_PX = 10;
+  const PAN_START_THRESHOLD_PX = 5; // deadzone before an empty-area drag actually pans — stops tap jitter from "walking" the sheet
 
   const canvas = document.getElementById('drawCanvas');
   const ctx = canvas.getContext('2d');
@@ -37,9 +41,9 @@ if ('serviceWorker' in navigator) {
     const margin = 36;
     const availW = Math.max(50, rect.width - margin * 2);
     const availH = Math.max(50, rect.height - margin * 2);
-    view.scale = Math.min(availW / PAGE_W_MM, availH / PAGE_H_MM, MAX_SCALE);
-    view.offsetX = (rect.width - PAGE_W_MM * view.scale) / 2;
-    view.offsetY = (rect.height - PAGE_H_MM * view.scale) / 2;
+    view.scale = Math.min(availW / pageW(), availH / pageH(), MAX_SCALE);
+    view.offsetX = (rect.width - pageW() * view.scale) / 2;
+    view.offsetY = (rect.height - pageH() * view.scale) / 2;
     requestRedraw();
   }
 
@@ -83,7 +87,7 @@ if ('serviceWorker' in navigator) {
   let shapes = [];
   let selected = null;
 
-  const KIND_LABELS = { line: 'Лінія', rect: 'Прямокутник', circle: 'Коло', arc: 'Дуга', leader: 'Виноска' };
+  const KIND_LABELS = { line: 'Лінія', rect: 'Прямокутник', circle: 'Коло', arc: 'Дуга', leader: 'Виноска', freehand: 'Олівець', polyline: 'Полілінія' };
 
   function makePreviewShape(tool, x1, y1, x2, y2) {
     if (tool === 'line') return { type: 'line', x1, y1, x2, y2 };
@@ -313,6 +317,24 @@ if ('serviceWorker' in navigator) {
       const c = mmToPx({ x: s.cx, y: s.cy });
       const a0 = (s.startDeg * Math.PI) / 180, a1 = (s.endDeg * Math.PI) / 180;
       context.beginPath(); context.arc(c.x, c.y, Math.max(0.01, s.r * view.scale), a0, a1);
+    } else if (s.type === 'freehand' || s.type === 'polyline') {
+      const pts = s.points.map(mmToPx);
+      context.beginPath();
+      if (pts.length) {
+        context.moveTo(pts[0].x, pts[0].y);
+        if (s.type === 'freehand') {
+          // smooth the raw pointer path through midpoints — lets one stroke
+          // read as a clean curve or a clean straight line, whichever the
+          // hand actually drew, instead of a jagged point-to-point trace.
+          for (let i = 1; i < pts.length - 1; i++) {
+            const mx = (pts[i].x + pts[i + 1].x) / 2, my = (pts[i].y + pts[i + 1].y) / 2;
+            context.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+          }
+          if (pts.length > 1) context.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+        } else {
+          for (let i = 1; i < pts.length; i++) context.lineTo(pts[i].x, pts[i].y);
+        }
+      }
     }
   }
 
@@ -348,6 +370,11 @@ if ('serviceWorker' in navigator) {
       } else if (s.type === 'leader') {
         const g = leaderGeometry(s);
         if (Math.min(distToSegment(p, g.p1, g.p2), distToSegment(p, g.p2, g.p3)) <= HIT_TOLERANCE_PX) return s;
+      } else if (s.type === 'freehand' || s.type === 'polyline') {
+        const pts = s.points.map(mmToPx);
+        for (let i = 0; i < pts.length - 1; i++) {
+          if (distToSegment(p, pts[i], pts[i + 1]) <= HIT_TOLERANCE_PX + s.lineWidthMm * view.scale / 2) return s;
+        }
       }
     }
     return null;
@@ -375,7 +402,7 @@ if ('serviceWorker' in navigator) {
     ctx.fillRect(0, 0, rect.width, rect.height);
 
     // page
-    const pTL = mmToPx({ x: 0, y: 0 }), pBR = mmToPx({ x: PAGE_W_MM, y: PAGE_H_MM });
+    const pTL = mmToPx({ x: 0, y: 0 }), pBR = mmToPx({ x: pageW(), y: pageH() });
     ctx.save();
     ctx.shadowColor = 'rgba(0,0,0,0.18)';
     ctx.shadowBlur = 16;
@@ -384,25 +411,11 @@ if ('serviceWorker' in navigator) {
     ctx.fillRect(pTL.x, pTL.y, pBR.x - pTL.x, pBR.y - pTL.y);
     ctx.restore();
 
-    // light 10mm reference grid, page-clipped
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(pTL.x, pTL.y, pBR.x - pTL.x, pBR.y - pTL.y);
-    ctx.clip();
-    ctx.strokeStyle = 'rgba(0,0,0,0.06)';
-    ctx.lineWidth = 1;
-    for (let x = 0; x <= PAGE_W_MM; x += 10) {
-      const a = mmToPx({ x, y: 0 }), b = mmToPx({ x, y: PAGE_H_MM });
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-    }
-    for (let y = 0; y <= PAGE_H_MM; y += 10) {
-      const a = mmToPx({ x: 0, y }), b = mmToPx({ x: PAGE_W_MM, y });
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-    }
-    ctx.restore();
+    drawSheetFrame(ctx, pTL, pBR);
 
     for (const s of shapes) renderOneShape(ctx, s, false);
     if (dragPreview) renderOneShape(ctx, dragPreview, true);
+    drawPolylineDraft(ctx);
 
     if (selected) {
       ctx.save();
@@ -421,6 +434,11 @@ if ('serviceWorker' in navigator) {
         const xs = [g.p1.x, g.p2.x, g.p3.x], ys = [g.p1.y, g.p2.y, g.p3.y];
         const x0 = Math.min(...xs) - pad, x1 = Math.max(...xs) + pad, y0 = Math.min(...ys) - pad, y1 = Math.max(...ys) + pad;
         ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      } else if (selected.type === 'freehand' || selected.type === 'polyline') {
+        const pts = selected.points.map(mmToPx);
+        const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+        const x0 = Math.min(...xs) - pad, x1 = Math.max(...xs) + pad, y0 = Math.min(...ys) - pad, y1 = Math.max(...ys) + pad;
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
       }
       ctx.restore();
     }
@@ -432,6 +450,57 @@ if ('serviceWorker' in navigator) {
   function frame() {
     requestAnimationFrame(frame);
     if (needsRedraw) render();
+  }
+
+  // Sheet border: a real drafting frame (ГОСТ-style — wider margin on the
+  // left for binding) instead of a decorative grid.
+  function drawSheetFrame(context, pTL, pBR) {
+    context.save();
+    context.strokeStyle = 'rgba(0,0,0,0.35)';
+    context.lineWidth = 1;
+    context.strokeRect(pTL.x, pTL.y, pBR.x - pTL.x, pBR.y - pTL.y);
+    context.beginPath();
+    context.rect(pTL.x, pTL.y, pBR.x - pTL.x, pBR.y - pTL.y);
+    context.clip();
+    const inset = { left: 20, top: 5, right: 5, bottom: 5 };
+    const a = mmToPx({ x: inset.left, y: inset.top });
+    const b = mmToPx({ x: pageW() - inset.right, y: pageH() - inset.bottom });
+    context.strokeStyle = 'rgba(20,20,20,0.6)';
+    context.lineWidth = Math.max(1, 0.5 * view.scale);
+    context.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    context.restore();
+  }
+
+  // Live preview of a полілінія (chain-of-segments) being built: fixed
+  // vertices + the segment currently being dragged into place.
+  function drawPolylineDraft(context) {
+    if (!polylineDraft) return;
+    const pts = polylineDraft.points.map(mmToPx);
+    context.save();
+    context.strokeStyle = state.color;
+    context.fillStyle = state.color;
+    context.lineWidth = Math.max(1, state.lineWidthMm * view.scale);
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    if (pts.length) {
+      context.beginPath();
+      context.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) context.lineTo(pts[i].x, pts[i].y);
+      context.stroke();
+    }
+    pts.forEach((pt) => { context.beginPath(); context.arc(pt.x, pt.y, 3, 0, Math.PI * 2); context.fill(); });
+    if (polylineDraft.previewEnd && pts.length) {
+      const endPx = mmToPx(polylineDraft.previewEnd);
+      context.globalAlpha = 0.7;
+      context.setLineDash([5, 4]);
+      context.beginPath();
+      context.moveTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+      context.lineTo(endPx.x, endPx.y);
+      context.stroke();
+      context.setLineDash([]);
+      context.globalAlpha = 1;
+    }
+    context.restore();
   }
 
   // ---------------------------------------------------------------------
@@ -456,10 +525,26 @@ if ('serviceWorker' in navigator) {
   const toolButtons = document.querySelectorAll('.tool-btn');
   toolButtons.forEach((btn) => {
     btn.addEventListener('click', () => {
+      if (polylineDraft && btn.dataset.tool !== 'polyline') finishPolyline();
       toolButtons.forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       state.tool = btn.dataset.tool;
       if (state.tool !== 'select') deselect();
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Sheet format — А4/А3/А2/А1. Changing it re-fits the page in view and
+  // is what the print function targets, so a drawing made on an А4 sheet
+  // always comes out of the printer as А4, not whatever paper is loaded.
+  // ---------------------------------------------------------------------
+  const pageSizeButtons = document.querySelectorAll('.page-size-btn');
+  pageSizeButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      pageSizeButtons.forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      pageKey = btn.dataset.pageSize;
+      fitPageToView();
     });
   });
 
@@ -626,6 +711,9 @@ if ('serviceWorker' in navigator) {
   let moveShapeStart = null; // snapshot of its coordinates at drag start
   let moveGrabMm = null;
   let pinchStartDist = 0, pinchStartScale = 1, pinchMidClient = null;
+  let freehandPoints = null;  // 'Олівець' — raw sampled path of the stroke in progress
+  let polylineDraft = null;   // 'Полілінія' — { points: [mm,...], previewEnd: mm|null }
+  let erasing = false;        // 'Ластик' — dragging deletes whatever passes under the finger
 
   function currentPinchDist() {
     const pts = [...activePointers.values()];
@@ -636,8 +724,61 @@ if ('serviceWorker' in navigator) {
     return { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
   }
 
+  // 'Ластик' — wipe whatever is directly under the finger, no selection step.
+  function eraseAt(clientX, clientY) {
+    const hit = hitTest(clientX, clientY);
+    if (!hit) return;
+    if (selected === hit) deselect();
+    shapes = shapes.filter((s) => s !== hit);
+    requestRedraw();
+  }
+
+  // 'Полілінія' — commit the segment currently being dragged (previewEnd)
+  // as a fixed vertex, ready for the next segment to continue from it.
+  function commitPolylineSegment() {
+    if (!polylineDraft || !polylineDraft.previewEnd) return;
+    const last = polylineDraft.points[polylineDraft.points.length - 1];
+    const end = polylineDraft.previewEnd;
+    if (Math.hypot(end.x - last.x, end.y - last.y) >= 1.5) polylineDraft.points.push(end);
+    polylineDraft.previewEnd = null;
+    requestRedraw();
+    renderChainBar();
+  }
+  function finishPolyline() {
+    if (polylineDraft && polylineDraft.points.length >= 2) {
+      shapes.push({ type: 'polyline', points: polylineDraft.points, color: state.color, lineWidthMm: state.lineWidthMm, id: nextId++ });
+      select(shapes[shapes.length - 1]);
+    }
+    polylineDraft = null;
+    requestRedraw();
+    renderChainBar();
+  }
+  function cancelPolyline() {
+    polylineDraft = null;
+    requestRedraw();
+    renderChainBar();
+  }
+  function undoPolylinePoint() {
+    if (!polylineDraft) return;
+    polylineDraft.points.pop();
+    if (!polylineDraft.points.length) polylineDraft = null;
+    requestRedraw();
+    renderChainBar();
+  }
+  const chainBar = document.getElementById('chainBar2d');
+  function renderChainBar() {
+    if (chainBar) chainBar.classList.toggle('hidden', !polylineDraft);
+  }
+  const chainUndoBtn = document.getElementById('chainUndoBtn');
+  const chainCancelBtn = document.getElementById('chainCancelBtn');
+  const chainDoneBtn = document.getElementById('chainDoneBtn');
+  if (chainUndoBtn) chainUndoBtn.addEventListener('click', undoPolylinePoint);
+  if (chainCancelBtn) chainCancelBtn.addEventListener('click', cancelPolyline);
+  if (chainDoneBtn) chainDoneBtn.addEventListener('click', finishPolyline);
+
   function cloneShapeCoords(s) {
     if (s.type === 'line' || s.type === 'rect' || s.type === 'leader') return { x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2 };
+    if (s.type === 'freehand' || s.type === 'polyline') return { points: s.points.map((p) => ({ x: p.x, y: p.y })) };
     return { cx: s.cx, cy: s.cy };
   }
 
@@ -659,8 +800,19 @@ if ('serviceWorker' in navigator) {
           moveGrabMm = mm;
         } else {
           deselect();
-          panStart = { offsetX: view.offsetX, offsetY: view.offsetY, clientX: e.clientX, clientY: e.clientY };
+          panStart = { offsetX: view.offsetX, offsetY: view.offsetY, clientX: e.clientX, clientY: e.clientY, committed: false };
         }
+      } else if (state.tool === 'freehand') {
+        freehandPoints = [mm];
+        dragPreview = { type: 'freehand', points: freehandPoints, color: state.color, lineWidthMm: state.lineWidthMm };
+        requestRedraw();
+      } else if (state.tool === 'polyline') {
+        if (!polylineDraft) polylineDraft = { points: [mm], previewEnd: null };
+        requestRedraw();
+        renderChainBar();
+      } else if (state.tool === 'eraser') {
+        erasing = true;
+        eraseAt(e.clientX, e.clientY);
       } else {
         drawStartMm = mm;
         dragPreview = makePreviewShape(state.tool, mm.x, mm.y, mm.x, mm.y);
@@ -672,6 +824,8 @@ if ('serviceWorker' in navigator) {
       pinchMidClient = currentPinchMid();
       // a mid-gesture second finger cancels whatever the first was doing
       panStart = null; moveShape = null; drawStartMm = null; dragPreview = null;
+      freehandPoints = null; erasing = false;
+      if (polylineDraft) polylineDraft.previewEnd = null;
     }
   });
 
@@ -700,15 +854,36 @@ if ('serviceWorker' in navigator) {
       const dx = mm.x - moveGrabMm.x, dy = mm.y - moveGrabMm.y;
       if (moveShape.type === 'circle' || moveShape.type === 'arc') {
         moveShape.cx = moveShapeStart.cx + dx; moveShape.cy = moveShapeStart.cy + dy;
+      } else if (moveShape.type === 'freehand' || moveShape.type === 'polyline') {
+        moveShape.points = moveShapeStart.points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
       } else {
         moveShape.x1 = moveShapeStart.x1 + dx; moveShape.y1 = moveShapeStart.y1 + dy;
         moveShape.x2 = moveShapeStart.x2 + dx; moveShape.y2 = moveShapeStart.y2 + dy;
       }
       requestRedraw();
     } else if (panStart) {
+      if (!panStart.committed) {
+        const movedPx = Math.hypot(e.clientX - panStart.clientX, e.clientY - panStart.clientY);
+        if (movedPx < PAN_START_THRESHOLD_PX) return; // dead zone — a tap's natural tremor must not "walk" the sheet
+        panStart.committed = true;
+        panStart.offsetX = view.offsetX; panStart.offsetY = view.offsetY;
+        panStart.clientX = e.clientX; panStart.clientY = e.clientY;
+      }
       view.offsetX = panStart.offsetX + (e.clientX - panStart.clientX);
       view.offsetY = panStart.offsetY + (e.clientY - panStart.clientY);
       requestRedraw();
+    } else if (state.tool === 'freehand' && freehandPoints) {
+      const mm = clientToMm(e.clientX, e.clientY);
+      const last = freehandPoints[freehandPoints.length - 1];
+      if (Math.hypot((mm.x - last.x) * view.scale, (mm.y - last.y) * view.scale) > 2) {
+        freehandPoints.push(mm);
+        requestRedraw();
+      }
+    } else if (state.tool === 'polyline' && polylineDraft) {
+      polylineDraft.previewEnd = clientToMm(e.clientX, e.clientY);
+      requestRedraw();
+    } else if (state.tool === 'eraser' && erasing) {
+      eraseAt(e.clientX, e.clientY);
     } else if (drawStartMm) {
       const mm = clientToMm(e.clientX, e.clientY);
       dragPreview = makePreviewShape(state.tool, drawStartMm.x, drawStartMm.y, mm.x, mm.y);
@@ -725,6 +900,21 @@ if ('serviceWorker' in navigator) {
 
     if (moveShape) { moveShape = null; moveShapeStart = null; requestRedraw(); return; }
     if (panStart) { panStart = null; return; }
+    if (erasing) { erasing = false; return; }
+    if (state.tool === 'polyline' && polylineDraft) { commitPolylineSegment(); return; }
+
+    if (state.tool === 'freehand' && freehandPoints) {
+      const dt = performance.now() - downTime;
+      const movedPx = Math.hypot(e.clientX - downClient.x, e.clientY - downClient.y);
+      const pts = freehandPoints;
+      freehandPoints = null;
+      dragPreview = null;
+      if (pts.length < 2 || (movedPx < 3 && dt < 250)) { requestRedraw(); return; } // accidental tap, discard
+      const shape = { type: 'freehand', points: pts, color: state.color, lineWidthMm: state.lineWidthMm, id: nextId++ };
+      shapes.push(shape);
+      select(shape);
+      return;
+    }
 
     if (drawStartMm) {
       const mm = clientToMm(e.clientX, e.clientY);
@@ -769,14 +959,14 @@ if ('serviceWorker' in navigator) {
   // ---------------------------------------------------------------------
   function renderPageToCanvas(pxPerMm) {
     const out = document.createElement('canvas');
-    out.width = Math.round(PAGE_W_MM * pxPerMm);
-    out.height = Math.round(PAGE_H_MM * pxPerMm);
+    out.width = Math.round(pageW() * pxPerMm);
+    out.height = Math.round(pageH() * pxPerMm);
     const octx = out.getContext('2d');
     octx.fillStyle = '#ffffff';
     octx.fillRect(0, 0, out.width, out.height);
     const savedView = { ...view };
     view.scale = pxPerMm; view.offsetX = 0; view.offsetY = 0;
-    for (const s of shapes) drawShape(octx, s, false);
+    for (const s of shapes) renderOneShape(octx, s, false);
     Object.assign(view, savedView);
     return out;
   }
@@ -784,7 +974,7 @@ if ('serviceWorker' in navigator) {
   document.getElementById('exportBtn').addEventListener('click', () => {
     const out = renderPageToCanvas(96 / 25.4); // 96 DPI, matches the original export
     const link = document.createElement('a');
-    link.download = 'creslarnet-a4.png';
+    link.download = `creslarnet-${pageKey.toLowerCase()}.png`;
     link.href = out.toDataURL('image/png');
     link.click();
   });
@@ -795,7 +985,21 @@ if ('serviceWorker' in navigator) {
     const img = document.createElement('img');
     img.id = 'printSheet';
     img.src = dataUrl;
+    img.style.width = `${pageW()}mm`;
+    img.style.height = `${pageH()}mm`;
     document.body.appendChild(img);
+
+    // The print sheet size follows whatever format this drawing was made
+    // on — an А4 drawing prints as А4, an А1 drawing as А1 — set fresh
+    // each time since the user can switch format between prints.
+    let pageRule = document.getElementById('dynamicPageSize');
+    if (!pageRule) {
+      pageRule = document.createElement('style');
+      pageRule.id = 'dynamicPageSize';
+      document.head.appendChild(pageRule);
+    }
+    pageRule.textContent = `@page { size: ${pageW()}mm ${pageH()}mm; margin: 0; }`;
+
     const cleanup = () => { img.remove(); window.removeEventListener('afterprint', cleanup); };
     window.addEventListener('afterprint', cleanup);
     requestAnimationFrame(() => window.print());
@@ -807,5 +1011,11 @@ if ('serviceWorker' in navigator) {
   fitPageToView();
   frame();
 
-  window.__creslarnet2d = { get shapes() { return shapes; }, get selected() { return selected; }, view, clientToMm, fitPageToView };
+  window.__creslarnet2d = {
+    get shapes() { return shapes; },
+    get selected() { return selected; },
+    get pageKey() { return pageKey; },
+    get polylineDraft() { return polylineDraft; },
+    pageW, pageH, view, clientToMm, fitPageToView,
+  };
 })();

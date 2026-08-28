@@ -294,6 +294,53 @@ body {
   background: #fafaf8; font-size: 14px; cursor: pointer;
 }
 .dim-panel-title { margin: 0 0 10px; font-weight: 700; font-size: 14px; }
+/* ---------- sheet format (А4/А3/А2/А1) ---------- */
+.page-size-options { display: flex; gap: 6px; }
+.page-size-btn {
+  flex: 1;
+  padding: 8px 4px;
+  border: 1px solid var(--border);
+  background: #fafaf8;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.page-size-btn.active {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---------- floating chain-controls for the "Полілінія" tool ---------- */
+.chain-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: var(--shadow);
+}
+.chain-bar button {
+  border: 1px solid var(--border);
+  background: #fafaf8;
+  border-radius: 6px;
+  padding: 7px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--text);
+  white-space: nowrap;
+}
+.chain-bar #chainDoneBtn { color: #1a7f37; border-color: #bfe3c9; background: #eafbf0; font-weight: 600; }
+.chain-bar #chainCancelBtn { color: #c1121f; border-color: #f2c9cd; background: #fdecee; }
+
 .hatch-label { margin: 2px 0 6px; font-size: 12px; color: var(--text-muted); }
 .hatch-options { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .hatch-btn {
@@ -325,7 +372,10 @@ body {
   font-size: 13px;
 }
 
-/* ---------- print: only the generated page image, at real A4 size ---------- */
+/* ---------- print: only the generated page image, at the sheet's own size ----------
+   Actual width/height and the @page size come from JS (script.js sets them
+   right before printing, matching whichever format — А4/А3/А2/А1 — the
+   drawing was made on), so nothing sheet-size-specific is hardcoded here. */
 #printSheet { display: none; }
 @media print {
   body * { visibility: hidden; }
@@ -334,10 +384,7 @@ body {
     visibility: visible;
     position: fixed;
     left: 0; top: 0;
-    width: 210mm;
-    height: 297mm;
   }
-  @page { size: A4; margin: 0; }
 }
 
 @media (max-width: 860px) {
