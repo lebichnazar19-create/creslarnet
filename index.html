@@ -111,6 +111,7 @@
         <button class="action-btn" id="clearBtn">Очистити полотно</button>
         <button class="action-btn" id="exportBtn">Зберегти як PNG</button>
         <button class="action-btn" id="printBtn">🖨 Друк</button>
+        <button class="action-btn" id="scanBtn">📷 Скан малюнка з фото</button>
       </div>
     </aside>
 
@@ -125,11 +126,37 @@
         <button id="chainCancelBtn" title="Скасувати всю полілінію">✕ Скасувати</button>
         <button id="chainDoneBtn" title="Завершити полілінію">✓ Завершити</button>
       </div>
-      <p class="canvas-hint">Лист зафіксований — панорамування тільки свідомим перетягуванням порожнього місця · два пальці — масштаб · «Плитка» — задайте приміщення, розмір плитки й фото з галереї</p>
+      <p class="canvas-hint" id="canvasHint">Лист зафіксований — панорамування тільки свідомим перетягуванням порожнього місця · два пальці — масштаб · «Плитка» — задайте приміщення, розмір плитки й фото з галереї</p>
     </main>
   </div>
 
   <input type="file" accept="image/*" id="tilePhotoInput" class="hidden">
+  <input type="file" accept="image/*" capture="environment" id="scanPhotoInput" class="hidden">
+
+  <div id="scanModal" class="scan-modal hidden">
+    <div class="scan-modal-inner">
+      <div class="scan-modal-header">
+        <h3>Скан малюнка з фото</h3>
+        <button id="scanCloseBtn" class="scan-close-x" title="Закрити">✕</button>
+      </div>
+      <p class="scan-hint">Перетягніть 4 точки на кути аркуша паперу на фото — це вирівняє перспективу.</p>
+      <canvas id="scanPhotoCanvas" class="scan-photo-canvas"></canvas>
+
+      <label class="scan-sensitivity-label">
+        Чутливість розпізнавання ліній
+        <input type="range" id="scanSensitivity" min="0" max="100" value="50">
+      </label>
+      <p class="scan-hint">Попередній перегляд — чорне стане векторними лініями:</p>
+      <canvas id="scanPreviewCanvas" class="scan-preview-canvas"></canvas>
+
+      <p id="scanStatus" class="scan-status"></p>
+      <div class="scan-modal-actions">
+        <button id="scanCancelBtn" class="action-btn ghost">Скасувати</button>
+        <button id="scanCommitBtn" class="action-btn primary">✓ Розпізнати і додати на аркуш</button>
+      </div>
+    </div>
+  </div>
+
   <script src="script.js"></script>
 </body>
 </html>

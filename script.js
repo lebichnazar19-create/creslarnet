@@ -396,6 +396,281 @@ if ('serviceWorker' in navigator) {
       : `${base} (усі цілі, без підрізки)`;
   }
 
+  // ---------------------------------------------------------------------
+  // "Скан малюнка" — photograph a hand sketch on paper, mark its 4 corners
+  // (perspective correction), and get real editable line/polyline shapes
+  // on the sheet instead of just a picture. Everything below is plain
+  // pixel math done on a <canvas> — no external CV library, so it keeps
+  // working fully offline like the rest of this PWA.
+  //
+  // Pipeline: 4-point homography straightens the photo -> grayscale ->
+  // Otsu threshold (+ user sensitivity) makes a black/white "ink" mask ->
+  // Zhang-Suen thinning reduces every stroke to a 1px-wide skeleton ->
+  // walking the skeleton traces it into pixel chains -> Douglas-Peucker
+  // simplifies each chain down to a handful of straight vertices, which
+  // become ordinary 'line' (2 points) or 'polyline' (3+) shapes.
+  // ---------------------------------------------------------------------
+
+  // Solve the 3x3 homography H (as a flat row-major array of 9, H[8]=1)
+  // mapping each `dstPts[i]` to `srcPts[i]`, via an 8x8 linear system
+  // (the standard DLT formulation for a 4-point perspective transform).
+  function solveLinearSystem(A, b) {
+    const n = b.length;
+    const M = A.map((row, i) => [...row, b[i]]);
+    for (let col = 0; col < n; col++) {
+      let piv = col;
+      for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+      [M[col], M[piv]] = [M[piv], M[col]];
+      const pivVal = M[col][col] || 1e-12;
+      for (let r = 0; r < n; r++) {
+        if (r === col) continue;
+        const factor = M[r][col] / pivVal;
+        for (let c = col; c <= n; c++) M[r][c] -= factor * M[col][c];
+      }
+    }
+    return M.map((row, i) => row[n] / (row[i] || 1e-12));
+  }
+  function solveHomography(dstPts, srcPts) {
+    const A = [], b = [];
+    for (let i = 0; i < 4; i++) {
+      const { x, y } = dstPts[i], { x: X, y: Y } = srcPts[i];
+      A.push([x, y, 1, 0, 0, 0, -x * X, -y * X]); b.push(X);
+      A.push([0, 0, 0, x, y, 1, -x * Y, -y * Y]); b.push(Y);
+    }
+    const h = solveLinearSystem(A, b);
+    return [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1];
+  }
+  function applyHomography(H, x, y) {
+    const w = H[6] * x + H[7] * y + H[8];
+    return { x: (H[0] * x + H[1] * y + H[2]) / w, y: (H[3] * x + H[4] * y + H[5]) / w };
+  }
+
+  function sampleBilinear(imgData, x, y) {
+    const w = imgData.width, h = imgData.height, d = imgData.data;
+    if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) return [255, 255, 255];
+    const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+    const at = (xx, yy, c) => d[(yy * w + xx) * 4 + c];
+    const out = [0, 0, 0];
+    for (let c = 0; c < 3; c++) {
+      const top = at(x0, y0, c) + (at(x0 + 1, y0, c) - at(x0, y0, c)) * fx;
+      const bot = at(x0, y0 + 1, c) + (at(x0 + 1, y0 + 1, c) - at(x0, y0 + 1, c)) * fx;
+      out[c] = top + (bot - top) * fy;
+    }
+    return out;
+  }
+
+  // Un-warps the quadrilateral `srcCorners` (in srcCanvas pixel space) into
+  // a clean outW×outH rectangle — the actual perspective correction step.
+  function warpPerspective(srcCanvas, srcCorners, outW, outH) {
+    const dstCorners = [{ x: 0, y: 0 }, { x: outW, y: 0 }, { x: outW, y: outH }, { x: 0, y: outH }];
+    const H = solveHomography(dstCorners, srcCorners); // maps a point in the OUTPUT to where it came from in the source
+    const sctx = srcCanvas.getContext('2d');
+    const sImg = sctx.getImageData(0, 0, srcCanvas.width, srcCanvas.height);
+    const out = document.createElement('canvas');
+    out.width = outW; out.height = outH;
+    const octx = out.getContext('2d');
+    const oImg = octx.createImageData(outW, outH);
+    for (let y = 0; y < outH; y++) {
+      for (let x = 0; x < outW; x++) {
+        const p = applyHomography(H, x + 0.5, y + 0.5);
+        const [r, g, b] = sampleBilinear(sImg, p.x, p.y);
+        const di = (y * outW + x) * 4;
+        oImg.data[di] = r; oImg.data[di + 1] = g; oImg.data[di + 2] = b; oImg.data[di + 3] = 255;
+      }
+    }
+    octx.putImageData(oImg, 0, 0);
+    return out;
+  }
+
+  function toGrayscale(canvas) {
+    const ctx2 = canvas.getContext('2d');
+    const { data, width, height } = ctx2.getImageData(0, 0, canvas.width, canvas.height);
+    const gray = new Uint8ClampedArray(width * height);
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    return { gray, width, height };
+  }
+
+  function otsuThreshold(gray) {
+    const hist = new Array(256).fill(0);
+    for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+    const total = gray.length;
+    let sum = 0; for (let t = 0; t < 256; t++) sum += t * hist[t];
+    let sumB = 0, wB = 0, maxVar = 0, threshold = 127;
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t]; if (!wB) continue;
+      const wF = total - wB; if (!wF) break;
+      sumB += t * hist[t];
+      const mB = sumB / wB, mF = (sum - sumB) / wF;
+      const varBetween = wB * wF * (mB - mF) * (mB - mF);
+      if (varBetween > maxVar) { maxVar = varBetween; threshold = t; }
+    }
+    return threshold;
+  }
+
+  // sensitivity in [0,1]: higher picks up fainter pencil marks (raises the
+  // cutoff so more grayish pixels count as "ink" rather than paper).
+  function binarize(gray, threshold, sensitivity) {
+    const t = threshold + (sensitivity - 0.5) * 90;
+    const bin = new Uint8Array(gray.length);
+    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] < t ? 1 : 0;
+    return bin;
+  }
+
+  // Zhang-Suen thinning — reduces a blob of "ink" pixels to a 1px skeleton
+  // while preserving connectivity, so each stroke becomes a traceable line.
+  function zhangSuenThin(bin, w, h) {
+    let img = bin.slice();
+    const idx = (x, y) => y * w + x;
+    let changed = true;
+    let guard = 0;
+    while (changed && guard++ < 60) {
+      changed = false;
+      for (const step of [0, 1]) {
+        const toRemove = [];
+        for (let y = 1; y < h - 1; y++) {
+          for (let x = 1; x < w - 1; x++) {
+            if (!img[idx(x, y)]) continue;
+            const p = [
+              img[idx(x, y - 1)], img[idx(x + 1, y - 1)], img[idx(x + 1, y)], img[idx(x + 1, y + 1)],
+              img[idx(x, y + 1)], img[idx(x - 1, y + 1)], img[idx(x - 1, y)], img[idx(x - 1, y - 1)],
+            ]; // N, NE, E, SE, S, SW, W, NW
+            const B = p.reduce((a, v) => a + v, 0);
+            if (B < 2 || B > 6) continue;
+            let A = 0;
+            for (let k = 0; k < 8; k++) if (p[k] === 0 && p[(k + 1) % 8] === 1) A++;
+            if (A !== 1) continue;
+            if (step === 0) {
+              if (p[0] * p[2] * p[4] !== 0) continue;
+              if (p[2] * p[4] * p[6] !== 0) continue;
+            } else {
+              if (p[0] * p[2] * p[6] !== 0) continue;
+              if (p[0] * p[4] * p[6] !== 0) continue;
+            }
+            toRemove.push(idx(x, y));
+          }
+        }
+        if (toRemove.length) { changed = true; for (const i of toRemove) img[i] = 0; }
+      }
+    }
+    return img;
+  }
+
+  // Walks the skeleton into pixel chains (a simple greedy tracer — good
+  // enough for "recognize the clear lines of a sketch", not a full
+  // topology solver for every crossing).
+  function traceSkeleton(bin, w, h) {
+    const pixels = new Set();
+    for (let i = 0; i < bin.length; i++) if (bin[i]) pixels.add(i);
+    const neighborsOf = (i) => {
+      const x = i % w, y = (i / w) | 0, out = [];
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const ni = ny * w + nx;
+        if (pixels.has(ni)) out.push(ni);
+      }
+      return out;
+    };
+    const visitedEdges = new Set();
+    const edgeKey = (a, b) => (a < b ? a + '_' + b : b + '_' + a);
+
+    function walkFrom(start) {
+      const path = [start];
+      let current = start, prev = null;
+      for (;;) {
+        const neigh = neighborsOf(current).filter((n) => n !== prev && !visitedEdges.has(edgeKey(current, n)));
+        if (!neigh.length) break;
+        let next = neigh[0];
+        if (neigh.length > 1 && prev !== null) {
+          const px = prev % w, py = (prev / w) | 0, cx = current % w, cy = (current / w) | 0;
+          const dirX = cx - px, dirY = cy - py;
+          let best = -Infinity;
+          for (const n of neigh) {
+            const nx = n % w, ny = (n / w) | 0;
+            const score = (nx - cx) * dirX + (ny - cy) * dirY;
+            if (score > best) { best = score; next = n; }
+          }
+        }
+        visitedEdges.add(edgeKey(current, next));
+        path.push(next);
+        prev = current; current = next;
+      }
+      return path;
+    }
+
+    const degree = new Map();
+    for (const i of pixels) degree.set(i, neighborsOf(i).length);
+    const endpoints = [...pixels].filter((i) => degree.get(i) === 1);
+    const paths = [];
+    for (const start of [...endpoints, ...pixels]) {
+      const hasFreeEdge = neighborsOf(start).some((n) => !visitedEdges.has(edgeKey(start, n)));
+      if (!hasFreeEdge) continue;
+      const path = walkFrom(start);
+      if (path.length >= 2) paths.push(path);
+    }
+    return paths.map((path) => path.map((i) => ({ x: i % w, y: (i / w) | 0 })));
+  }
+
+  function perpendicularDistance(p, a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    return Math.abs((p.x - a.x) * dy - (p.y - a.y) * dx) / len;
+  }
+  function simplifyRDP(points, epsilon) {
+    if (points.length < 3) return points;
+    let maxDist = 0, index = 0;
+    const first = points[0], last = points[points.length - 1];
+    for (let i = 1; i < points.length - 1; i++) {
+      const d = perpendicularDistance(points[i], first, last);
+      if (d > maxDist) { maxDist = d; index = i; }
+    }
+    if (maxDist > epsilon) {
+      const left = simplifyRDP(points.slice(0, index + 1), epsilon);
+      const right = simplifyRDP(points.slice(index), epsilon);
+      return left.slice(0, -1).concat(right);
+    }
+    return [first, last];
+  }
+
+  function pathLengthPx(points) {
+    let len = 0;
+    for (let i = 1; i < points.length; i++) len += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+    return len;
+  }
+
+  const SCAN_MAX_SHAPES = 400;
+  const SCAN_MIN_PATH_PX = 14; // discard specks/noise shorter than this
+
+  // The full pipeline, from a straightened photo canvas to ready-to-use
+  // mm-space line/polyline shape data. Kept separate from any DOM/UI so it
+  // can run against a synthetic canvas in tests, not just a real photo.
+  function runScanPipeline(correctedCanvas, sensitivity, mmW, mmH, offsetXmm, offsetYmm) {
+    const { gray, width, height } = toGrayscale(correctedCanvas);
+    const threshold = otsuThreshold(gray);
+    const bin = binarize(gray, threshold, sensitivity);
+    const thinned = zhangSuenThin(bin, width, height);
+    const rawPaths = traceSkeleton(thinned, width, height);
+    const epsilon = Math.max(1.2, Math.min(width, height) * 0.003);
+    let simplified = rawPaths
+      .map((p) => simplifyRDP(p, epsilon))
+      .filter((p) => p.length >= 2 && pathLengthPx(p) >= SCAN_MIN_PATH_PX);
+    simplified.sort((a, b) => pathLengthPx(b) - pathLengthPx(a));
+    const dropped = Math.max(0, simplified.length - SCAN_MAX_SHAPES);
+    simplified = simplified.slice(0, SCAN_MAX_SHAPES);
+
+    const sx = mmW / width, sy = mmH / height;
+    const toMm = (p) => ({ x: p.x * sx + offsetXmm, y: p.y * sy + offsetYmm });
+    const newShapes = simplified.map((p) => {
+      const pts = p.map(toMm);
+      const base = { color: state.color, lineWidthMm: 0.4, id: nextId++ };
+      return pts.length === 2
+        ? { type: 'line', x1: pts[0].x, y1: pts[0].y, x2: pts[1].x, y2: pts[1].y, ...base }
+        : { type: 'polyline', points: pts, ...base };
+    });
+    return { shapes: newShapes, dropped, threshold };
+  }
+
   function renderOneShape(context, s, isPreview) {
     if (s.type === 'leader') { drawLeader(context, s, isPreview); return; }
     if (s.type === 'tilearea') { drawTileArea(context, s, isPreview); return; }
@@ -700,6 +975,204 @@ if ('serviceWorker' in navigator) {
       img.src = reader.result;
     };
     reader.readAsDataURL(file);
+  });
+
+  // Brief transient status in the hint bar — the closest thing this mode has
+  // to a toast, reused so the scan flow doesn't need its own notification UI.
+  const canvasHintEl = document.getElementById('canvasHint');
+  const canvasHintDefault = canvasHintEl ? canvasHintEl.textContent : '';
+  let hintTimer = null;
+  function flashHint(msg, ms = 4000) {
+    if (!canvasHintEl) return;
+    canvasHintEl.textContent = msg;
+    clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => { canvasHintEl.textContent = canvasHintDefault; }, ms);
+  }
+
+  // -----------------------------------------------------------------------
+  // "Скан малюнка" modal wiring — pick a photo, drag its 4 corners onto the
+  // paper's actual corners, tune sensitivity against a live preview, commit.
+  // -----------------------------------------------------------------------
+  const scanModal = document.getElementById('scanModal');
+  const scanPhotoInput = document.getElementById('scanPhotoInput');
+  const scanPhotoCanvas = document.getElementById('scanPhotoCanvas');
+  const scanPreviewCanvas = document.getElementById('scanPreviewCanvas');
+  const scanSensitivityInput = document.getElementById('scanSensitivity');
+  const scanStatusEl = document.getElementById('scanStatus');
+
+  let scanState = null; // { img, fullCanvas, dispW, dispH, corners: [{x,y}x4] }
+  let scanDraggingCorner = -1;
+
+  function scanCanvasPoint(canvas, clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((clientX - rect.left) / rect.width) * canvas.width,
+      y: ((clientY - rect.top) / rect.height) * canvas.height,
+    };
+  }
+
+  function openScanModal(img) {
+    // A working display resolution for the corner-picking canvas — capped
+    // so dragging stays smooth regardless of the photo's real megapixels.
+    const maxDim = 480;
+    const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+    const dispW = Math.round(img.naturalWidth * scale), dispH = Math.round(img.naturalHeight * scale);
+    scanPhotoCanvas.width = dispW; scanPhotoCanvas.height = dispH;
+
+    const fullCanvas = document.createElement('canvas');
+    fullCanvas.width = img.naturalWidth; fullCanvas.height = img.naturalHeight;
+    fullCanvas.getContext('2d').drawImage(img, 0, 0);
+
+    const insetX = dispW * 0.12, insetY = dispH * 0.12;
+    scanState = {
+      img, fullCanvas, dispW, dispH,
+      corners: [
+        { x: insetX, y: insetY }, { x: dispW - insetX, y: insetY },
+        { x: dispW - insetX, y: dispH - insetY }, { x: insetX, y: dispH - insetY },
+      ],
+    };
+    scanSensitivityInput.value = 50;
+    scanStatusEl.textContent = '';
+    scanModal.classList.remove('hidden');
+    redrawScanPhoto();
+    updateScanPreview();
+  }
+
+  function closeScanModal() {
+    scanModal.classList.add('hidden');
+    scanState = null;
+    scanDraggingCorner = -1;
+  }
+
+  function redrawScanPhoto() {
+    if (!scanState) return;
+    const ctx2 = scanPhotoCanvas.getContext('2d');
+    ctx2.clearRect(0, 0, scanState.dispW, scanState.dispH);
+    ctx2.drawImage(scanState.img, 0, 0, scanState.dispW, scanState.dispH);
+    const c = scanState.corners;
+    ctx2.save();
+    ctx2.strokeStyle = '#8338ec';
+    ctx2.lineWidth = 2;
+    ctx2.setLineDash([6, 4]);
+    ctx2.beginPath();
+    ctx2.moveTo(c[0].x, c[0].y);
+    for (let i = 1; i < 4; i++) ctx2.lineTo(c[i].x, c[i].y);
+    ctx2.closePath();
+    ctx2.stroke();
+    ctx2.setLineDash([]);
+    ctx2.fillStyle = '#ffffff';
+    for (const p of c) {
+      ctx2.beginPath(); ctx2.arc(p.x, p.y, 9, 0, Math.PI * 2); ctx2.fill();
+      ctx2.beginPath(); ctx2.arc(p.x, p.y, 9, 0, Math.PI * 2); ctx2.stroke();
+      ctx2.fillStyle = '#8338ec';
+      ctx2.beginPath(); ctx2.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx2.fill();
+      ctx2.fillStyle = '#ffffff';
+    }
+    ctx2.restore();
+  }
+
+  // Cheap-ish live preview: warp at a small working resolution and just
+  // threshold (skip thinning/tracing, which only need to run once on commit).
+  function updateScanPreview() {
+    if (!scanState) return;
+    const previewW = 220, previewH = 310;
+    const fullScale = scanState.img.naturalWidth / scanState.dispW;
+    const srcCorners = scanState.corners.map((p) => ({ x: p.x * fullScale, y: p.y * fullScale }));
+    const corrected = warpPerspective(scanState.fullCanvas, srcCorners, previewW, previewH);
+    const { gray, width, height } = toGrayscale(corrected);
+    const threshold = otsuThreshold(gray);
+    const sensitivity = Number(scanSensitivityInput.value) / 100;
+    const bin = binarize(gray, threshold, sensitivity);
+    scanPreviewCanvas.width = width; scanPreviewCanvas.height = height;
+    const pctx = scanPreviewCanvas.getContext('2d');
+    const out = pctx.createImageData(width, height);
+    for (let i = 0; i < bin.length; i++) {
+      const v = bin[i] ? 0 : 255;
+      out.data[i * 4] = v; out.data[i * 4 + 1] = v; out.data[i * 4 + 2] = v; out.data[i * 4 + 3] = 255;
+    }
+    pctx.putImageData(out, 0, 0);
+  }
+
+  scanPhotoCanvas.addEventListener('pointerdown', (e) => {
+    if (!scanState) return;
+    const p = scanCanvasPoint(scanPhotoCanvas, e.clientX, e.clientY);
+    let best = -1, bestDist = 26; // px tolerance in canvas-internal units
+    scanState.corners.forEach((c, i) => {
+      const d = Math.hypot(c.x - p.x, c.y - p.y);
+      if (d < bestDist) { bestDist = d; best = i; }
+    });
+    scanDraggingCorner = best;
+    scanPhotoCanvas.setPointerCapture(e.pointerId);
+  });
+  scanPhotoCanvas.addEventListener('pointermove', (e) => {
+    if (!scanState || scanDraggingCorner < 0) return;
+    const p = scanCanvasPoint(scanPhotoCanvas, e.clientX, e.clientY);
+    scanState.corners[scanDraggingCorner] = {
+      x: Math.max(0, Math.min(scanState.dispW, p.x)),
+      y: Math.max(0, Math.min(scanState.dispH, p.y)),
+    };
+    redrawScanPhoto();
+  });
+  function endScanDrag() {
+    if (scanDraggingCorner >= 0) { scanDraggingCorner = -1; updateScanPreview(); }
+  }
+  scanPhotoCanvas.addEventListener('pointerup', endScanDrag);
+  scanPhotoCanvas.addEventListener('pointercancel', endScanDrag);
+
+  scanSensitivityInput.addEventListener('input', updateScanPreview);
+
+  document.getElementById('scanBtn').addEventListener('click', () => scanPhotoInput.click());
+  scanPhotoInput.addEventListener('change', () => {
+    const file = scanPhotoInput.files[0];
+    scanPhotoInput.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => openScanModal(img);
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+  document.getElementById('scanCancelBtn').addEventListener('click', closeScanModal);
+  document.getElementById('scanCloseBtn').addEventListener('click', closeScanModal);
+
+  document.getElementById('scanCommitBtn').addEventListener('click', () => {
+    if (!scanState) return;
+    scanStatusEl.textContent = 'Обробка…';
+    // let the "Обробка…" message actually paint before the (synchronous,
+    // CPU-heavy) pipeline blocks the main thread.
+    setTimeout(() => {
+      const fullScale = scanState.img.naturalWidth / scanState.dispW;
+      const srcCorners = scanState.corners.map((p) => ({ x: p.x * fullScale, y: p.y * fullScale }));
+
+      // Orientation follows the shape the user actually traced onto the
+      // photo — a wide quad means the sheet was photographed sideways.
+      const avgW = (Math.hypot(srcCorners[1].x - srcCorners[0].x, srcCorners[1].y - srcCorners[0].y)
+        + Math.hypot(srcCorners[2].x - srcCorners[3].x, srcCorners[2].y - srcCorners[3].y)) / 2;
+      const avgH = (Math.hypot(srcCorners[3].x - srcCorners[0].x, srcCorners[3].y - srcCorners[0].y)
+        + Math.hypot(srcCorners[2].x - srcCorners[1].x, srcCorners[2].y - srcCorners[1].y)) / 2;
+      const landscape = avgW > avgH;
+      const mmW = landscape ? 297 : 210, mmH = landscape ? 210 : 297;
+
+      const workingLong = 900;
+      const pxW = landscape ? workingLong : Math.round(workingLong * (mmW / mmH));
+      const pxH = landscape ? Math.round(workingLong * (mmH / mmW)) : workingLong;
+
+      const corrected = warpPerspective(scanState.fullCanvas, srcCorners, pxW, pxH);
+      const sensitivity = Number(scanSensitivityInput.value) / 100;
+      const offsetX = Math.max(0, (pageW() - mmW) / 2), offsetY = Math.max(0, (pageH() - mmH) / 2);
+      const { shapes: newShapes, dropped } = runScanPipeline(corrected, sensitivity, mmW, mmH, offsetX, offsetY);
+
+      shapes.push(...newShapes);
+      requestRedraw();
+      closeScanModal();
+      flashHint(
+        newShapes.length
+          ? `Розпізнано ${newShapes.length} лін.${dropped ? ` (ще ${dropped} відкинуто як шум)` : ''} — можна редагувати як звичайні фігури`
+          : 'Не вдалося розпізнати чіткі лінії — спробуйте підняти чутливість або перезняти фото при кращому освітленні',
+      );
+    }, 30);
   });
 
   document.getElementById('undoBtn').addEventListener('click', () => {
@@ -1180,5 +1653,7 @@ if ('serviceWorker' in navigator) {
     pageW, pageH, view, clientToMm, fitPageToView,
     hasTileImage: (id) => tileImageCache.has(id),
     computeTileGrid,
+    warpPerspective, runScanPipeline, solveHomography, applyHomography,
+    zhangSuenThin, traceSkeleton, simplifyRDP, otsuThreshold, toGrayscale, binarize,
   };
 })();

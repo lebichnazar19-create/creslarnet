@@ -396,3 +396,84 @@ body {
     max-height: 40vh;
   }
 }
+
+/* ---------- "Скан малюнка" modal — photo -> vector lines ---------- */
+.scan-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgba(20, 18, 14, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.scan-modal-inner {
+  background: var(--panel-bg);
+  border-radius: 14px;
+  padding: 18px;
+  width: 100%;
+  max-width: 460px;
+  max-height: 92vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+}
+.scan-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.scan-modal-header h3 { margin: 0; font-size: 16px; }
+.scan-close-x {
+  border: none;
+  background: none;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 4px 6px;
+}
+.scan-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 8px 0;
+}
+.scan-photo-canvas, .scan-preview-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  touch-action: none;
+  background: #222;
+}
+.scan-preview-canvas { background: #fff; }
+.scan-sensitivity-label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-muted);
+  margin: 12px 0 4px;
+}
+.scan-sensitivity-label input[type="range"] { width: 100%; margin-top: 4px; }
+.scan-status {
+  font-size: 12px;
+  color: var(--text-muted);
+  min-height: 16px;
+  margin: 8px 0 0;
+}
+.scan-modal-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+.scan-modal-actions .action-btn { margin-bottom: 0; flex: 1; }
+.scan-modal-actions .primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.scan-modal-actions .ghost {
+  background: none;
+}
