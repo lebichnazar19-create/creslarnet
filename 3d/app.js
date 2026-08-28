@@ -426,6 +426,26 @@ function findRoomParts(roomId) {
   return objects.filter((r) => r.roomId === roomId);
 }
 
+// Is the camera currently standing inside any room's own footprint/height —
+// not "did the user press Всередині", an actual geometric check, so it
+// stays correct as they walk around, and works the same regardless of how
+// they got in there. A little horizontal/vertical slack so standing right
+// up against a wall still counts as inside.
+function isCameraInsideAnyRoom() {
+  const seen = new Set();
+  const margin = 50; // mm
+  for (const rec of objects) {
+    if (!rec.roomId || seen.has(rec.roomId)) continue;
+    seen.add(rec.roomId);
+    const p = rec.roomParams, c = rec.roomCenter;
+    const hw = p.width / 2 + margin, hl = p.length / 2 + margin;
+    const px = camera.position.x, py = camera.position.y, pz = camera.position.z;
+    if (px > c.x - hw && px < c.x + hw && pz > c.z - hl && pz < c.z + hl &&
+        py > c.y - margin && py < c.y + p.height + margin) return true;
+  }
+  return false;
+}
+
 // The outdoor sun can't reach an enclosed room — its own ceiling blocks it
 // — and the ambient hemisphere/environment light alone shades every
 // vertical wall almost identically regardless of which way it faces (their
@@ -2346,10 +2366,22 @@ canvas.addEventListener('pointermove', (e) => {
         outlineHelper?.update();
         refreshSizeInputs();
       }
+    } else if (!selected && pinchStartDist > 0 && mode === 'edit' && isCameraInsideAnyRoom()) {
+      // Inside a room, two-finger pinch is an optical zoom (camera.fov)
+      // instead of moving the camera: a small room only has a metre or two
+      // of actual floor space to dolly back into, nowhere near enough to
+      // fit a whole wall (floor to ceiling) in view — widening the FOV
+      // does, without needing to move at all. Spread apart = zoom in
+      // (narrower FOV), pinch together = zoom out and see more, same
+      // direction as pinch-zoom everywhere else.
+      const delta = dist - pinchStartDist;
+      setFov(camera.fov - delta * 0.15);
+      pinchStartDist = dist;
     } else if (!selected && pinchStartDist > 0) {
-      // navigation pinch: spreading fingers apart moves forward, pinching
-      // together moves back — tracked incrementally so continuing the
-      // gesture keeps moving rather than saturating at one ratio
+      // navigation pinch (outside any room): spreading fingers apart moves
+      // forward, pinching together moves back — tracked incrementally so
+      // continuing the gesture keeps moving rather than saturating at one
+      // ratio
       const delta = dist - pinchStartDist;
       const dir = new THREE.Vector3();
       camera.getWorldDirection(dir);
