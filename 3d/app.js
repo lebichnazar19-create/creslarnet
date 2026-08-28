@@ -462,10 +462,19 @@ function addRoomLight(roomId, params, center) {
   const light = new THREE.PointLight(0xfff4e0, 2.2, 0, 2);
   light.position.set(center.x, center.y + params.height - 250, center.z);
   light.castShadow = true;
-  light.shadow.mapSize.set(512, 512);
-  light.shadow.camera.near = 50;
+  light.shadow.mapSize.set(1024, 1024);
+  light.shadow.camera.near = 100;
   light.shadow.camera.far = Math.max(params.width, params.length, params.height) * 1.6;
-  light.shadow.bias = -0.002;
+  // The noisy/speckled "dithered" look on the walls was shadow acne: a flat
+  // wall self-shadowing against its own depth map from floating-point
+  // rounding, not a texture or colour bug. depthBias alone (in NDC units)
+  // wasn't nearly enough here because this whole scene is millimetre-scale
+  // (comment at the top of the file) — normalBias, which offsets the
+  // shadow sample along the surface's own normal in WORLD units (mm here),
+  // is the standard fix for exactly this on point/spot lights, and is what
+  // actually clears it at this scale.
+  light.shadow.bias = -0.0008;
+  light.shadow.normalBias = 18; // mm
   scene.add(light);
   roomLights.set(roomId, light);
 }
