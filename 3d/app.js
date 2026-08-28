@@ -2272,6 +2272,192 @@ function attachSelectedPipe() {
 }
 
 // ---------------------------------------------------------------------------
+// "Зігнути" — a single-mesh pipe/rebar/beam gets bent at a tapped point by
+// a slider angle. Only single-mesh objects (kind pipe/rebar/beam whose
+// root IS the mesh, not a Group) — a multi-segment run from "Просторова
+// лінія" already has its own joints and isn't what this tool is for.
+// The bend is a straight — circular arc — straight path built fresh from
+// the object's ORIGINAL straight measurements every time the point or
+// angle changes (never compounding onto an already-bent geometry), so the
+// slider always represents "how bent from straight", not "how much more".
+// ---------------------------------------------------------------------------
+let bendActive = false;
+let bendTarget = null;     // record being bent
+let bendOriginal = null;   // { length, halfY, halfZ } measured once, from the straight geometry
+let bendFrac = 0.5;        // 0..1 along the length
+let bendAngleDeg = 0;
+let bendPointSet = false;
+
+class BentPathCurve extends THREE.Curve {
+  constructor(L1, R, angleRad, L3) {
+    super();
+    this.L1 = L1; this.R = R; this.angleRad = angleRad; this.L3 = L3;
+    this.arcLen = R * Math.abs(angleRad);
+    this.total = Math.max(1, L1 + this.arcLen + L3);
+  }
+  getPoint(t, target = new THREE.Vector3()) {
+    const s = Math.max(0, Math.min(1, t)) * this.total;
+    const sign = this.angleRad >= 0 ? 1 : -1;
+    if (s <= this.L1) {
+      target.set(s, 0, 0);
+    } else if (s <= this.L1 + this.arcLen) {
+      const a = this.R > 0 ? (s - this.L1) / this.R : 0;
+      target.set(this.L1 + this.R * Math.sin(a), sign * this.R * (1 - Math.cos(a)), 0);
+    } else {
+      const s3 = s - this.L1 - this.arcLen;
+      const a = Math.abs(this.angleRad);
+      const p1x = this.L1 + this.R * Math.sin(a), p1y = sign * this.R * (1 - Math.cos(a));
+      target.set(p1x + s3 * Math.cos(this.angleRad), p1y + s3 * Math.sin(this.angleRad), 0);
+    }
+    return target;
+  }
+}
+
+function measureBendable(record) {
+  const root = record.root;
+  root.geometry.computeBoundingBox();
+  const size = root.geometry.boundingBox.getSize(new THREE.Vector3());
+  return { length: size.x, halfY: size.y / 2, halfZ: size.z / 2 };
+}
+
+// Cross-section shape in the local YZ plane, matching each kind's own
+// existing proportions (buildPipeGeometry's outer/inner ratio for pipe,
+// a plain disc for rebar, a rectangle for beam).
+function buildBendCrossSection(kind, halfY, halfZ) {
+  if (kind === 'pipe') {
+    const outerR = (halfY + halfZ) / 2;
+    const shape = new THREE.Shape();
+    shape.absarc(0, 0, outerR, 0, Math.PI * 2, false);
+    const hole = new THREE.Path();
+    hole.absarc(0, 0, outerR * (55 / 70), 0, Math.PI * 2, true); // same wall-thickness ratio as buildPipeGeometry's defaults
+    shape.holes.push(hole);
+    return shape;
+  }
+  if (kind === 'rebar') {
+    const r = (halfY + halfZ) / 2;
+    const shape = new THREE.Shape();
+    shape.absarc(0, 0, r, 0, Math.PI * 2, false);
+    return shape;
+  }
+  const shape = new THREE.Shape(); // beam
+  shape.moveTo(-halfY, -halfZ);
+  shape.lineTo(halfY, -halfZ);
+  shape.lineTo(halfY, halfZ);
+  shape.lineTo(-halfY, halfZ);
+  shape.closePath();
+  return shape;
+}
+
+function buildStraightBendGeometry(kind, orig) {
+  const shape = buildBendCrossSection(kind, orig.halfY, orig.halfZ);
+  const geometry = new THREE.ExtrudeGeometry(shape, { depth: orig.length, bevelEnabled: false, curveSegments: 24 });
+  geometry.rotateY(-Math.PI / 2); // same remap buildPipeGeometry uses: default +Z depth -> local +X
+  geometry.translate(orig.length / 2, 0, 0);
+  return geometry;
+}
+
+function applyBend(record, frac, angleDeg) {
+  const orig = record.bendOriginal || bendOriginal;
+  if (!orig) return;
+  const angleRad = (angleDeg * Math.PI) / 180;
+  const crossSize = Math.max(orig.halfY, orig.halfZ, 5);
+  const R = Math.max(crossSize * 4, 40); // arc radius scaled to the cross-section, so it reads as a smooth bend, not a sharp kink
+  const L1 = Math.max(0, orig.length * frac);
+  const L3 = Math.max(0, orig.length * (1 - frac));
+
+  try {
+    const geometry = Math.abs(angleDeg) < 0.5
+      ? buildStraightBendGeometry(record.kind, orig)
+      : new THREE.ExtrudeGeometry(buildBendCrossSection(record.kind, orig.halfY, orig.halfZ), {
+          steps: 48, extrudePath: new BentPathCurve(L1, R, angleRad, L3), bevelEnabled: false,
+        });
+    geometry.computeBoundingBox();
+    const c = geometry.boundingBox.getCenter(new THREE.Vector3());
+    geometry.translate(-c.x, -c.y, -c.z);
+    record.root.geometry.dispose();
+    record.root.geometry = geometry;
+    if (selected === record) outlineHelper?.update();
+  } catch (e) {
+    toast('Не вдалося застосувати згин тут — спробуйте інший кут або точку');
+  }
+}
+
+function setBendPointFromTap(clientX, clientY) {
+  if (!bendTarget) return;
+  const hits = rayFromClient(clientX, clientY).intersectObject(bendTarget.root, true);
+  if (!hits.length) { toast('Торкніться самого об’єкта'); return; }
+  const local = bendTarget.root.worldToLocal(hits[0].point.clone());
+  bendFrac = Math.max(0.05, Math.min(0.95, (local.x + bendOriginal.length / 2) / bendOriginal.length));
+  bendPointSet = true;
+  applyBend(bendTarget, bendFrac, bendAngleDeg);
+  renderBendPill();
+}
+
+function enterBendMode(record) {
+  bendActive = true;
+  bendTarget = record;
+  bendOriginal = measureBendable(record);
+  bendFrac = 0.5;
+  bendAngleDeg = 0;
+  bendPointSet = false;
+  // Stays selected (same pattern as the hole tool) so the selection panel
+  // can be refreshed with the bend's new size on exit — but the move/
+  // rotate gizmo's arrows are hidden for now: they'd sit right on top of
+  // the very object the user needs to tap along its length to place the
+  // bend point, and would otherwise steal that tap first.
+  hideEl(selectionPanelEl);
+  removeGizmo();
+  renderBendPill();
+  showEl(modePillEl);
+  toast('Торкніться об’єкта, щоб позначити точку згину, тоді тягніть повзунок кута');
+}
+
+function exitBendMode(keep) {
+  if (!keep && bendTarget && bendOriginal) applyBend(bendTarget, 0.5, 0); // revert to straight
+  const record = bendTarget;
+  bendActive = false;
+  bendTarget = null;
+  bendOriginal = null;
+  hideEl(modePillEl);
+  // Rebuild the gizmo removeGizmo() took down, and refresh the panel with
+  // the bend's actual new dimensions — select() no-ops if already
+  // selected, so deselect first.
+  if (record) { deselect(); select(record); }
+}
+
+function renderBendPill() {
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = bendPointSet ? `Точка згину: ${Math.round(bendFrac * 100)}%` : 'Торкніться об’єкта — точка згину';
+  modePillEl.appendChild(label);
+
+  const angleInput = document.createElement('input');
+  angleInput.type = 'range'; angleInput.min = '-120'; angleInput.max = '120'; angleInput.step = '1';
+  angleInput.value = String(bendAngleDeg);
+  angleInput.className = 'bend-angle-slider';
+  const angleLabel = document.createElement('span');
+  angleLabel.className = 'bend-angle-label';
+  angleLabel.textContent = `${bendAngleDeg}°`;
+  angleInput.addEventListener('input', () => {
+    bendAngleDeg = Number(angleInput.value);
+    angleLabel.textContent = `${bendAngleDeg}°`;
+    if (bendPointSet) applyBend(bendTarget, bendFrac, bendAngleDeg);
+  });
+  modePillEl.appendChild(angleInput);
+  modePillEl.appendChild(angleLabel);
+
+  const doneBtn = document.createElement('button');
+  doneBtn.textContent = '✓ Готово';
+  doneBtn.addEventListener('click', () => exitBendMode(true));
+  modePillEl.appendChild(doneBtn);
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = '✕ Скасувати';
+  cancelBtn.addEventListener('click', () => exitBendMode(false));
+  modePillEl.appendChild(cancelBtn);
+}
+
+// ---------------------------------------------------------------------------
 // Selection panel rendering
 // ---------------------------------------------------------------------------
 const selectionPanelEl = document.getElementById('selectionPanel');
@@ -2427,6 +2613,13 @@ function renderSelectionPanel() {
     attachBtn.className = 'pbtn'; attachBtn.textContent = '⚭ Прикріпити';
     attachBtn.addEventListener('click', attachSelectedPipe);
     actions.appendChild(attachBtn);
+  }
+
+  if (selected.root.isMesh && ['pipe', 'rebar', 'beam'].includes(selected.kind)) {
+    const bendBtn = document.createElement('button');
+    bendBtn.className = 'pbtn'; bendBtn.textContent = '🦾 Зігнути';
+    bendBtn.addEventListener('click', () => enterBendMode(selected));
+    actions.appendChild(bendBtn);
   }
 
   if (canExplode(selected)) {
@@ -3190,6 +3383,7 @@ function handleEditTap(x, y) {
   if (wallDrawing) { addWallPoint(x, y); return; }
   if (windowToolActive) { insertWindowAt(x, y); return; }
   if (holeToolActive) { performHolePlacement(x, y); return; }
+  if (bendActive) { setBendPointFromTap(x, y); return; }
   // tileToolActive is handled entirely as a drag in pointerdown/move/up
   // (see beginTileAreaDrag etc.) — a tap that isn't a drag just falls
   // through to normal selection below, same as with nothing active.

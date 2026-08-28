@@ -516,6 +516,17 @@ html, body {
   cursor: pointer;
 }
 
+.bend-angle-slider {
+  width: 140px;
+  accent-color: var(--accent);
+}
+.bend-angle-label {
+  font-variant-numeric: tabular-nums;
+  color: var(--hud-text);
+  min-width: 34px;
+  text-align: right;
+}
+
 .mode-pill button.ghost {
   background: transparent;
   color: var(--hud-text-muted);
