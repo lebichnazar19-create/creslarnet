@@ -1579,13 +1579,144 @@ if ('serviceWorker' in navigator) {
     return { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
   }
 
-  // 'Ластик' — wipe whatever is directly under the finger, no selection step.
+  // 'Ластик' — erases only the part of a line/polyline/freehand stroke that
+  // actually passes under the eraser, splitting it into whatever piece(s)
+  // remain — not "delete the whole shape you happened to touch". Closed/
+  // filled shapes (rect, circle, arc, leader, tile area) don't have a
+  // meaningful partial cut, so those still erase as a whole shape.
+  const ERASE_RADIUS_PX = 14;
+
+  // All t's (0..1) where segment a->b crosses the circle — 0, 1, or 2 of
+  // them (a straight segment can pass through a circle without either
+  // endpoint being inside it, entering and exiting again — that "chord"
+  // case needs both roots, not just one, or the middle of a long line
+  // erases as nothing at all).
+  function segmentCircleTs(a, b, center, radius) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const fx = a.x - center.x, fy = a.y - center.y;
+    const A = dx * dx + dy * dy;
+    if (A < 1e-9) return [];
+    const B = 2 * (fx * dx + fy * dy);
+    const C = fx * fx + fy * fy - radius * radius;
+    const disc = B * B - 4 * A * C;
+    if (disc < 0) return [];
+    const sqrtDisc = Math.sqrt(disc);
+    return [(-B - sqrtDisc) / (2 * A), (-B + sqrtDisc) / (2 * A)]
+      .filter((t) => t >= 0 && t <= 1)
+      .sort((x, y) => x - y);
+  }
+
+  function pointsPathLength(pts) {
+    let len = 0;
+    for (let i = 1; i < pts.length; i++) len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    return len;
+  }
+
+  const lerpPt = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+
+  // Cuts the part of a point-path that passes within `radius` of `center`,
+  // returning the remaining piece(s) with clean edges interpolated exactly
+  // onto the eraser's circle — or null if the path doesn't reach that far
+  // at all (nothing to erase, leave the shape untouched). Used for both
+  // multi-point paths (freehand/polyline) and a plain 2-point line.
+  function erasePointsPath(points, center, radius) {
+    if (points.length < 2) return null;
+    const isIn = (p) => Math.hypot(p.x - center.x, p.y - center.y) <= radius;
+    let touched = isIn(points[0]);
+    const pieces = [];
+    let current = touched ? [] : [points[0]];
+
+    for (let i = 1; i < points.length; i++) {
+      const a = points[i - 1], b = points[i];
+      const ts = segmentCircleTs(a, b, center, radius);
+      const bIn = isIn(b);
+
+      if (!ts.length) {
+        // no crossing on this segment — either fully outside (keep b) or
+        // fully inside (both endpoints already within radius, drop it)
+        if (bIn) touched = true;
+        else current.push(b);
+        continue;
+      }
+
+      touched = true;
+      let curIn = isIn(a);
+      for (const t of ts) {
+        const cross = lerpPt(a, b, t);
+        if (!curIn) {
+          // entering the eraser — close off the piece so far
+          current.push(cross);
+          if (current.length >= 2) pieces.push(current);
+          current = [];
+        } else {
+          // exiting the eraser — start the next piece at the crossing
+          current = [cross];
+        }
+        curIn = !curIn;
+      }
+      if (!bIn) current.push(b);
+    }
+    if (current.length >= 2) pieces.push(current);
+    if (!touched) return null;
+    return pieces.filter((pts) => pointsPathLength(pts) > 1); // drop slivers at the cut edge
+  }
+
+  // Whole-shape hit test for the types a partial cut doesn't apply to —
+  // same tolerances as hitTest, but checked against one given shape rather
+  // than searching for the topmost match, so the eraser can take out every
+  // shape it actually touches, not just the one on top.
+  function shapeHitsPoint(s, p) {
+    if (s.type === 'rect') {
+      const a = mmToPx({ x: s.x1, y: s.y1 }), b = mmToPx({ x: s.x2, y: s.y2 });
+      const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x), y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y);
+      const onEdge = Math.abs(p.x - x0) <= HIT_TOLERANCE_PX || Math.abs(p.x - x1) <= HIT_TOLERANCE_PX || Math.abs(p.y - y0) <= HIT_TOLERANCE_PX || Math.abs(p.y - y1) <= HIT_TOLERANCE_PX;
+      const within = p.x >= x0 - HIT_TOLERANCE_PX && p.x <= x1 + HIT_TOLERANCE_PX && p.y >= y0 - HIT_TOLERANCE_PX && p.y <= y1 + HIT_TOLERANCE_PX;
+      return within && onEdge;
+    }
+    if (s.type === 'circle' || s.type === 'arc') {
+      const c = mmToPx({ x: s.cx, y: s.cy });
+      const dist = Math.hypot(p.x - c.x, p.y - c.y);
+      return Math.abs(dist - s.r * view.scale) <= HIT_TOLERANCE_PX + (s.lineWidthMm * view.scale) / 2;
+    }
+    if (s.type === 'leader') {
+      const g = leaderGeometry(s);
+      return Math.min(distToSegment(p, g.p1, g.p2), distToSegment(p, g.p2, g.p3)) <= HIT_TOLERANCE_PX;
+    }
+    if (s.type === 'tilearea') {
+      const b = tileAreaBounds(s);
+      return p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1;
+    }
+    return false;
+  }
+
   function eraseAt(clientX, clientY) {
-    const hit = hitTest(clientX, clientY);
-    if (!hit) return;
-    if (selected === hit) deselect();
-    setShapes(shapes.filter((s) => s !== hit));
-    requestRedraw();
+    const centerMm = clientToMm(clientX, clientY);
+    const centerPx = clientToPx(clientX, clientY);
+    const radiusMm = ERASE_RADIUS_PX / view.scale;
+    const next = [];
+    let changed = false;
+
+    for (const s of shapes) {
+      if (s.type === 'freehand' || s.type === 'polyline') {
+        const pieces = erasePointsPath(s.points, centerMm, radiusMm);
+        if (!pieces) { next.push(s); continue; }
+        changed = true;
+        if (selected === s) deselect();
+        for (const pts of pieces) next.push({ ...s, points: pts, id: nextId++ });
+      } else if (s.type === 'line') {
+        const pieces = erasePointsPath([{ x: s.x1, y: s.y1 }, { x: s.x2, y: s.y2 }], centerMm, radiusMm);
+        if (!pieces) { next.push(s); continue; }
+        changed = true;
+        if (selected === s) deselect();
+        for (const pts of pieces) next.push({ ...s, x1: pts[0].x, y1: pts[0].y, x2: pts[1].x, y2: pts[1].y, id: nextId++ });
+      } else if (shapeHitsPoint(s, centerPx)) {
+        changed = true;
+        if (selected === s) deselect();
+      } else {
+        next.push(s);
+      }
+    }
+    if (changed) { setShapes(next); requestRedraw(); }
   }
 
   // 'Полілінія' — commit the segment currently being dragged (previewEnd)

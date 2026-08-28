@@ -33,8 +33,21 @@ const KIND_LABELS = {
   wall: 'Стіна', window: 'Вікно', paper: 'Папір', sketchLine: 'Лінія на папері',
   rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт', ground: 'Земля',
   compound: 'Складений об’єкт', roomFloor: 'Підлога кімнати', roomCeiling: 'Стеля кімнати',
-  tile: 'Плитка', tileGrout: 'Шов (фуга)',
+  tile: 'Плитка', tileGrout: 'Шов (фуга)', spatialLine: 'Просторова лінія', wire: 'Провід',
 };
+
+// Standard-ish electrical wire colours — brown/blue/green-yellow (EU phase/
+// neutral/earth) plus the usual extras.
+const WIRE_COLORS = [
+  { color: '#6b4226', name: 'коричневий' },
+  { color: '#2a5db0', name: 'синій' },
+  { color: '#2f8f4e', name: 'зелений' },
+  { color: '#c9a227', name: 'жовтий' },
+  { color: '#1a1a1a', name: 'чорний' },
+  { color: '#c1272d', name: 'червоний' },
+  { color: '#e8e4da', name: 'білий' },
+  { color: '#8a8378', name: 'сірий' },
+];
 
 // Default footprint for a freshly-created room — a common small-bedroom size.
 const DEFAULT_ROOM_PARAMS = { width: 4000, length: 3000, height: 2600 };
@@ -945,6 +958,405 @@ function convertSketchLine(record, targetKind) {
   const newRecord = registerObject(targetKind, mesh, def.extra);
   select(newRecord);
   toast(`Перетворено на: ${KIND_LABELS[targetKind]}`);
+}
+
+// ---------------------------------------------------------------------------
+// "Просторова лінія" — a polyline drawn freely in 3D space (not confined to
+// a paper sheet), point by point, with a small gizmo instead of a flat
+// drag: six one-way arrows (up/down/left/right/forward/back) extend the
+// line along a world axis from wherever it currently ends, and a rotation
+// ring aims a seventh "custom angle" arrow anywhere in the horizontal
+// plane — softly snapping every 15° — for a run that doesn't sit strictly
+// on-axis (a 45° diagonal, say). Finished, it's a `spatialLine` you select
+// and convert into a pipe, an electrical wire (any of the usual wire
+// colours), or rebar — each becomes one multi-segment run with its own
+// colour and a small always-on label naming what it is.
+// ---------------------------------------------------------------------------
+let spatialLineActive = false;
+let spatialLineDraft = null;          // { points: [Vector3, ...] } while drawing
+let spatialLineGizmo = null;          // THREE.Group at the last committed point
+let spatialLineGizmoTargets = [];     // hit-test meshes tagged userData.slAxis or .slRing
+let spatialLineGizmoCustomGroup = null; // the rotating "custom angle" arrow, child of the gizmo
+let spatialLineDrag = null;           // { axisWorld, basePoint, candidatePoint, length } while extending
+let spatialLineRingDrag = null;       // { centerScreen, prevAngle } while aiming the custom arrow
+let spatialLineCustomAngle = 0;       // radians, current custom-arrow angle in the XZ plane
+let spatialLinePreviewMesh = null;    // thin line covering committed + in-progress segments
+
+const SL_AXIS_DIRS = {
+  x: new THREE.Vector3(1, 0, 0), negx: new THREE.Vector3(-1, 0, 0),
+  y: new THREE.Vector3(0, 1, 0), negy: new THREE.Vector3(0, -1, 0),
+  z: new THREE.Vector3(0, 0, 1), negz: new THREE.Vector3(0, 0, -1),
+};
+
+function roundVec(v) { return new THREE.Vector3(roundMm(v.x), roundMm(v.y), roundMm(v.z)); }
+
+function spatialLineCustomDir() {
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spatialLineCustomAngle);
+  return new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize();
+}
+
+// Six unidirectional arrows (not three bidirectional axes — the user aims
+// one arrow at a time, so a separate mesh per direction keeps the hit-test
+// unambiguous) plus a rotation ring and the custom-angle arrow it aims.
+const SPATIAL_LINE_GIZMO_SIZE = 280; // mm — fixed, there's no "selected object" to size against here
+function buildSpatialLineGizmo() {
+  const group = new THREE.Group();
+  group.userData.isHelper = true;
+  const targets = [];
+  const size = SPATIAL_LINE_GIZMO_SIZE;
+  const shaftLen = size * 0.9, shaftR = size * 0.05, headLen = size * 0.3, headR = size * 0.13;
+  const hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, depthTest: false });
+
+  const AXES = [
+    { key: 'x', dir: SL_AXIS_DIRS.x, color: AXIS_COLOR.x },
+    { key: 'negx', dir: SL_AXIS_DIRS.negx, color: AXIS_COLOR.x },
+    { key: 'y', dir: SL_AXIS_DIRS.y, color: AXIS_COLOR.y },
+    { key: 'negy', dir: SL_AXIS_DIRS.negy, color: AXIS_COLOR.y },
+    { key: 'z', dir: SL_AXIS_DIRS.z, color: AXIS_COLOR.z },
+    { key: 'negz', dir: SL_AXIS_DIRS.negz, color: AXIS_COLOR.z },
+  ];
+  for (const axis of AXES) {
+    const mat = new THREE.MeshBasicMaterial({ color: axis.color, depthTest: false, transparent: true, opacity: 0.95 });
+    const arrow = new THREE.Group();
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 10), mat);
+    shaft.position.y = shaftLen / 2;
+    shaft.renderOrder = 999;
+    const head = new THREE.Mesh(new THREE.ConeGeometry(headR, headLen, 10), mat);
+    head.position.y = shaftLen + headLen / 2;
+    head.renderOrder = 999;
+    arrow.add(shaft, head);
+    arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis.dir);
+    shaft.userData.isHelper = true; head.userData.isHelper = true;
+
+    const shaftHit = new THREE.Mesh(new THREE.CylinderGeometry(shaftR * 3.5, shaftR * 3.5, shaftLen, 8), hitMat);
+    shaftHit.position.y = shaftLen / 2;
+    const headHit = new THREE.Mesh(new THREE.ConeGeometry(headR * 1.5, headLen * 1.3, 8), hitMat);
+    headHit.position.y = shaftLen + headLen / 2;
+    shaftHit.userData.slAxis = axis.key; headHit.userData.slAxis = axis.key;
+    shaftHit.userData.isHelper = true; headHit.userData.isHelper = true;
+    arrow.add(shaftHit, headHit);
+    targets.push(shaftHit, headHit);
+    group.add(arrow);
+  }
+
+  // Rotation ring (horizontal plane) — aims the custom-angle arrow below.
+  const ringR = size * 0.75, tubeR = size * 0.045;
+  const ringMat = new THREE.MeshBasicMaterial({ color: 0x8338ec, depthTest: false, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), ringMat);
+  ring.rotateX(-Math.PI / 2);
+  ring.userData.isHelper = true;
+  group.add(ring);
+  const ringHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 4, 8, 48), hitMat);
+  ringHit.rotateX(-Math.PI / 2);
+  ringHit.userData.slRing = true;
+  ringHit.userData.isHelper = true;
+  group.add(ringHit);
+  targets.push(ringHit);
+
+  // Custom-angle arrow (purple) — orientation kept in sync with
+  // spatialLineCustomAngle by updateSpatialLineCustomArrow().
+  const customGroup = new THREE.Group();
+  const customMat = new THREE.MeshBasicMaterial({ color: 0x8338ec, depthTest: false, transparent: true, opacity: 0.95 });
+  const customShaftLen = size * 0.65;
+  const customShaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, customShaftLen, 10), customMat);
+  customShaft.position.y = customShaftLen / 2;
+  customShaft.renderOrder = 999;
+  const customHead = new THREE.Mesh(new THREE.ConeGeometry(headR, headLen, 10), customMat);
+  customHead.position.y = customShaftLen + headLen / 2;
+  customHead.renderOrder = 999;
+  customGroup.add(customShaft, customHead);
+  customShaft.userData.isHelper = true; customHead.userData.isHelper = true;
+  const customShaftHit = new THREE.Mesh(new THREE.CylinderGeometry(shaftR * 3.5, shaftR * 3.5, customShaftLen, 8), hitMat);
+  customShaftHit.position.y = customShaftLen / 2;
+  const customHeadHit = new THREE.Mesh(new THREE.ConeGeometry(headR * 1.5, headLen * 1.3, 8), hitMat);
+  customHeadHit.position.y = customShaftLen + headLen / 2;
+  customShaftHit.userData.slAxis = 'custom'; customHeadHit.userData.slAxis = 'custom';
+  customShaftHit.userData.isHelper = true; customHeadHit.userData.isHelper = true;
+  customGroup.add(customShaftHit, customHeadHit);
+  targets.push(customShaftHit, customHeadHit);
+  group.add(customGroup);
+
+  return { group, targets, customGroup };
+}
+
+function updateSpatialLineCustomArrow() {
+  if (!spatialLineGizmoCustomGroup) return;
+  spatialLineGizmoCustomGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), spatialLineCustomDir());
+}
+
+function attachSpatialLineGizmo(point) {
+  detachSpatialLineGizmo();
+  const built = buildSpatialLineGizmo();
+  spatialLineGizmo = built.group;
+  spatialLineGizmoTargets = built.targets;
+  spatialLineGizmoCustomGroup = built.customGroup;
+  spatialLineGizmo.position.copy(point);
+  scene.add(spatialLineGizmo);
+  updateSpatialLineCustomArrow();
+}
+
+function detachSpatialLineGizmo() {
+  if (!spatialLineGizmo) return;
+  spatialLineGizmo.parent?.remove(spatialLineGizmo);
+  spatialLineGizmo.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
+  spatialLineGizmo = null;
+  spatialLineGizmoTargets = [];
+  spatialLineGizmoCustomGroup = null;
+}
+
+function beginSpatialLineDrag(axisKey, ray) {
+  const axisWorld = axisKey === 'custom' ? spatialLineCustomDir() : SL_AXIS_DIRS[axisKey].clone();
+  const basePoint = spatialLineGizmo.position.clone();
+  const startPoint = closestPointOnLineToRay(basePoint, axisWorld, ray.ray.origin, ray.ray.direction);
+  spatialLineDrag = { axisWorld, basePoint, startPoint, candidatePoint: basePoint.clone(), length: 0 };
+}
+
+function updateSpatialLineDrag(ray) {
+  const g = spatialLineDrag;
+  const newPoint = closestPointOnLineToRay(g.basePoint, g.axisWorld, ray.ray.origin, ray.ray.direction);
+  // Only the positive direction along this specific arrow's axis counts —
+  // each of the six arrows already only points one way.
+  const offset = Math.max(0, new THREE.Vector3().subVectors(newPoint, g.basePoint).dot(g.axisWorld));
+  g.candidatePoint = g.basePoint.clone().addScaledVector(g.axisWorld, offset);
+  g.length = offset;
+  updateSpatialLinePreview();
+  updateSpatialLineLengthLabel(g.basePoint, g.candidatePoint, g.length);
+}
+
+function endSpatialLineDrag() {
+  const g = spatialLineDrag;
+  spatialLineDrag = null;
+  hideSpatialLineLengthLabel();
+  if (!g || g.length < 10) { updateSpatialLinePreview(); return; } // ignore a near-zero/no-op drag
+  const point = roundVec(g.candidatePoint);
+  spatialLineDraft.points.push(point);
+  attachSpatialLineGizmo(point);
+  updateSpatialLinePreview();
+  renderSpatialLinePill();
+}
+
+// Softly snaps to every 15° (so 45°, 90°… are easy to hit exactly) once
+// within 3° of one, otherwise leaves the angle exactly where dragged.
+function snapAngleRad(rad) {
+  const deg = (rad * 180) / Math.PI;
+  const nearest = Math.round(deg / 15) * 15;
+  return Math.abs(deg - nearest) <= 3 ? (nearest * Math.PI) / 180 : rad;
+}
+
+function beginSpatialLineRingDrag(clientX, clientY) {
+  const centerScreen = projectToScreenPx(spatialLineGizmo.position);
+  spatialLineRingDrag = { centerScreen, prevAngle: Math.atan2(clientY - centerScreen.y, clientX - centerScreen.x) };
+}
+
+function updateSpatialLineRingDrag(clientX, clientY) {
+  const g = spatialLineRingDrag;
+  const angle = Math.atan2(clientY - g.centerScreen.y, clientX - g.centerScreen.x);
+  let step = angle - g.prevAngle;
+  if (step > Math.PI) step -= Math.PI * 2;
+  if (step < -Math.PI) step += Math.PI * 2;
+  g.prevAngle = angle;
+  spatialLineCustomAngle = snapAngleRad(spatialLineCustomAngle + step * ROTATE_DRAG_SENSITIVITY);
+  updateSpatialLineCustomArrow();
+}
+
+function updateSpatialLinePreview() {
+  clearSpatialLinePreview();
+  if (!spatialLineDraft) return;
+  const pts = spatialLineDraft.points.slice();
+  if (spatialLineDrag) pts.push(spatialLineDrag.candidatePoint);
+  if (pts.length < 2) return;
+  const geom = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({ color: 0x8338ec, depthTest: false });
+  const line = new THREE.Line(geom, mat);
+  line.renderOrder = 998;
+  scene.add(line);
+  spatialLinePreviewMesh = line;
+}
+
+function clearSpatialLinePreview() {
+  if (!spatialLinePreviewMesh) return;
+  spatialLinePreviewMesh.parent?.remove(spatialLinePreviewMesh);
+  spatialLinePreviewMesh.geometry.dispose();
+  spatialLinePreviewMesh.material.dispose();
+  spatialLinePreviewMesh = null;
+}
+
+// Same NDC->pixel projection as the axis-rotate gizmo (projectToScreenPx)
+// and the same pattern updateAxisLabels/updateHoleLabels use for their own
+// SVG overlays — kept local here rather than factored out, to match.
+function slProjectToScreen(v) {
+  const ndc = v.clone().project(camera);
+  return { x: (ndc.x * 0.5 + 0.5) * window.innerWidth, y: (-ndc.y * 0.5 + 0.5) * window.innerHeight, behind: ndc.z < -1 || ndc.z > 1 };
+}
+
+const spatialLineLengthGroupEl = document.getElementById('spatialLineLengthGroup');
+const spatialLineLengthLineEl = spatialLineLengthGroupEl.querySelector('.spatial-line-length-line');
+const spatialLineLengthTextEl = spatialLineLengthGroupEl.querySelector('.spatial-line-length-text');
+
+function updateSpatialLineLengthLabel(aWorld, bWorld, lengthMm) {
+  const a = slProjectToScreen(aWorld), b = slProjectToScreen(bWorld);
+  if (a.behind || b.behind) { hideSpatialLineLengthLabel(); return; }
+  spatialLineLengthLineEl.setAttribute('x1', a.x); spatialLineLengthLineEl.setAttribute('y1', a.y);
+  spatialLineLengthLineEl.setAttribute('x2', b.x); spatialLineLengthLineEl.setAttribute('y2', b.y);
+  spatialLineLengthTextEl.setAttribute('x', (a.x + b.x) / 2);
+  spatialLineLengthTextEl.setAttribute('y', (a.y + b.y) / 2 - 14);
+  spatialLineLengthTextEl.textContent = `${formatMm(lengthMm, 0)} мм`;
+  spatialLineLengthGroupEl.classList.remove('hidden');
+}
+function hideSpatialLineLengthLabel() {
+  spatialLineLengthGroupEl.classList.add('hidden');
+}
+
+function renderSpatialLinePill() {
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  const n = spatialLineDraft ? spatialLineDraft.points.length : 0;
+  label.textContent = spatialLineGizmo
+    ? `Точок: ${n} — тягніть стрілку гізмо або кільце для кута`
+    : 'Торкніться, щоб поставити першу точку';
+  modePillEl.appendChild(label);
+
+  if (spatialLineDraft && spatialLineDraft.points.length > 1) {
+    const undoBtn = document.createElement('button');
+    undoBtn.textContent = '⌫ Точка';
+    undoBtn.addEventListener('click', () => {
+      spatialLineDraft.points.pop();
+      attachSpatialLineGizmo(spatialLineDraft.points[spatialLineDraft.points.length - 1]);
+      updateSpatialLinePreview();
+      renderSpatialLinePill();
+    });
+    modePillEl.appendChild(undoBtn);
+  }
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = '✕ Скасувати';
+  cancelBtn.addEventListener('click', cancelSpatialLine);
+  modePillEl.appendChild(cancelBtn);
+
+  if (spatialLineDraft && spatialLineDraft.points.length >= 2) {
+    const doneBtn = document.createElement('button');
+    doneBtn.textContent = '✓ Завершити';
+    doneBtn.addEventListener('click', finishSpatialLine);
+    modePillEl.appendChild(doneBtn);
+  }
+  showEl(modePillEl);
+}
+
+function cancelSpatialLine() {
+  spatialLineActive = false;
+  spatialLineDraft = null;
+  spatialLineDrag = null;
+  spatialLineRingDrag = null;
+  detachSpatialLineGizmo();
+  clearSpatialLinePreview();
+  hideSpatialLineLengthLabel();
+  hideEl(modePillEl);
+}
+
+// Reuses the sketch-line conversion geometry (pipe/rebar build along local
+// +X, same as CONVERT_DEFS above) but walks every segment of a multi-point
+// run instead of just one, and adds "провід" with a colour of its own.
+// isPipe is deliberately left off — attachSelectedPipe assumes a single
+// mesh with its own .geometry, and a converted run here is a Group.
+const SPATIAL_LINE_RUN_DEFS = {
+  pipe: { buildGeometry: CONVERT_DEFS.pipe.buildGeometry, buildMaterial: CONVERT_DEFS.pipe.buildMaterial, label: () => KIND_LABELS.pipe },
+  rebar: { buildGeometry: CONVERT_DEFS.rebar.buildGeometry, buildMaterial: CONVERT_DEFS.rebar.buildMaterial, label: () => KIND_LABELS.rebar },
+  wire: {
+    buildGeometry: (length) => { const g = new THREE.CylinderGeometry(4, 4, length, 10); g.rotateZ(Math.PI / 2); return g; },
+    buildMaterial: (color) => createPaintMaterial(color),
+    label: (color) => `${KIND_LABELS.wire} · ${(WIRE_COLORS.find((w) => w.color === color) || {}).name || ''}`,
+  },
+};
+
+// Shared by finishSpatialLine, convertSpatialLine, and the save/load
+// reconstruction below (buildObjectFromItem) — one segment mesh per pair
+// of consecutive points, `kind` either 'spatialLine' (the raw draft look —
+// a fixed purple) or one of SPATIAL_LINE_RUN_DEFS's converted types.
+function buildSpatialLineRunGroup(points, kind, color) {
+  const def = SPATIAL_LINE_RUN_DEFS[kind]; // undefined for the raw draft
+  const rawMat = def ? null : createPaintMaterial('#8338ec');
+  const group = new THREE.Group();
+  let totalLen = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    const dir = new THREE.Vector3().subVectors(b, a);
+    const length = dir.length();
+    if (length < 1) continue;
+    dir.normalize();
+    let geom, mat;
+    if (def) {
+      geom = def.buildGeometry(length);
+      mat = def.buildMaterial(color);
+    } else {
+      geom = new THREE.CylinderGeometry(5, 5, length, 8);
+      geom.rotateZ(Math.PI / 2); // local +Y (cylinder's own axis) -> local +X, matching CONVERT_DEFS's convention
+      mat = rawMat;
+    }
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir);
+    mesh.position.copy(a).add(b).multiplyScalar(0.5);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    group.add(mesh);
+    totalLen += length;
+  }
+  return { group, totalLen };
+}
+
+function finishSpatialLine() {
+  if (!spatialLineDraft || spatialLineDraft.points.length < 2) { cancelSpatialLine(); return; }
+  const points = spatialLineDraft.points;
+  const { group, totalLen } = buildSpatialLineRunGroup(points, 'spatialLine', null);
+  if (!group.children.length) { toast('Лінія замала для збереження'); cancelSpatialLine(); return; }
+
+  const record = registerObject('spatialLine', group, { spatialLinePoints: points.map((p) => p.clone()) });
+  spatialLineActive = false;
+  spatialLineDraft = null;
+  detachSpatialLineGizmo();
+  clearSpatialLinePreview();
+  hideSpatialLineLengthLabel();
+  hideEl(modePillEl);
+  select(record);
+  toast(`Лінію завершено — ${points.length} точок, ${formatMm(totalLen, 0)} мм. Оберіть, у що перетворити.`);
+}
+
+function convertSpatialLine(record, targetKind, color) {
+  const def = SPATIAL_LINE_RUN_DEFS[targetKind];
+  const points = record.spatialLinePoints;
+  if (!points || points.length < 2) { toast('Немає даних лінії для перетворення'); return; }
+
+  const { group } = buildSpatialLineRunGroup(points, targetKind, color);
+  if (!group.children.length) { toast('Лінія замала для перетворення'); return; }
+
+  const runLabel = def.label(color);
+  removeObject(record);
+  const newRecord = registerObject(targetKind, group, { spatialLinePoints: points.map((p) => p.clone()), runLabel, runColor: color });
+  select(newRecord);
+  toast(`Перетворено на: ${runLabel}`);
+}
+
+const spatialLineLabelsGroupEl = document.getElementById('spatialLineLabelsGroup');
+function updateSpatialLineTypeLabels() {
+  const runs = mode === 'edit' ? objects.filter((r) => r.runLabel) : [];
+  if (!runs.length) {
+    if (spatialLineLabelsGroupEl.childElementCount) spatialLineLabelsGroupEl.innerHTML = '';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const rec of runs) {
+    const pts = rec.spatialLinePoints;
+    if (!pts || !pts.length) continue;
+    const mid = pts[Math.floor(pts.length / 2)];
+    const s = slProjectToScreen(mid);
+    if (s.behind) continue;
+    const text = document.createElementNS(SVG_NS, 'text');
+    text.setAttribute('class', 'pipe-run-label');
+    text.setAttribute('x', s.x);
+    text.setAttribute('y', s.y - 16);
+    text.textContent = rec.runLabel;
+    frag.appendChild(text);
+  }
+  spatialLineLabelsGroupEl.innerHTML = '';
+  spatialLineLabelsGroupEl.appendChild(frag);
 }
 
 function enterPaperDrawMode() {
@@ -1863,6 +2275,55 @@ function renderSelectionPanel() {
     return;
   }
 
+  if (selected.kind === 'spatialLine') {
+    const pts = selected.spatialLinePoints || [];
+    let totalLen = 0;
+    for (let i = 1; i < pts.length; i++) totalLen += pts[i - 1].distanceTo(pts[i]);
+    const info = document.createElement('p');
+    info.className = 'dim-readout';
+    info.textContent = `Точок: ${pts.length}, довжина: ${formatMm(totalLen)} мм`;
+    selectionPanelEl.appendChild(info);
+
+    const hint = document.createElement('p');
+    hint.className = 'dim-readout';
+    hint.textContent = 'Перетворити на:';
+    selectionPanelEl.appendChild(hint);
+
+    const convertRow = document.createElement('div');
+    convertRow.className = 'panel-row';
+    for (const kind of ['pipe', 'rebar']) {
+      const b = document.createElement('button');
+      b.className = 'pbtn';
+      b.textContent = `→ ${KIND_LABELS[kind]}`;
+      b.addEventListener('click', () => convertSpatialLine(selected, kind));
+      convertRow.appendChild(b);
+    }
+    selectionPanelEl.appendChild(convertRow);
+
+    const wireHint = document.createElement('p');
+    wireHint.className = 'dim-readout';
+    wireHint.textContent = '→ Провід — оберіть колір:';
+    selectionPanelEl.appendChild(wireHint);
+    const wireRow = document.createElement('div');
+    wireRow.className = 'panel-row';
+    for (const w of WIRE_COLORS) {
+      const b = document.createElement('button');
+      b.className = 'swatch';
+      b.style.background = w.color;
+      b.title = w.name;
+      b.addEventListener('click', () => convertSpatialLine(selected, 'wire', w.color));
+      wireRow.appendChild(b);
+    }
+    selectionPanelEl.appendChild(wireRow);
+
+    const delBtn2 = document.createElement('button');
+    delBtn2.className = 'pbtn danger wide';
+    delBtn2.textContent = '🗑 Видалити лінію';
+    delBtn2.addEventListener('click', () => removeObject(selected));
+    selectionPanelEl.appendChild(delBtn2);
+    return;
+  }
+
   // A room part's length/height/rotation come from the room spec above —
   // its own generic size/rotation controls would just fight that on the
   // next resize, so only offer them for objects outside any room.
@@ -2104,6 +2565,27 @@ function buildPopoverContent(panel) {
     });
     toggleRow.appendChild(toggleBtn);
     popoverEl.appendChild(toggleRow);
+  }
+
+  if (panel === 'spatialline') {
+    const h = document.createElement('h3'); h.textContent = 'Просторова лінія'; popoverEl.appendChild(h);
+    const hint = document.createElement('p');
+    hint.className = 'dim-readout';
+    hint.textContent = 'Малюйте лінію вільно у просторі: перший дотик ставить точку, далі тягніть стрілку гізмо в потрібному напрямку (кільце — щоб задати кут, наприклад 45°), відпустіть — точка додасться. «✓ Завершити», коли лінія готова — тоді її можна перетворити на трубу, провід чи арматуру.';
+    popoverEl.appendChild(hint);
+    const row = document.createElement('div'); row.className = 'panel-row';
+    const startBtn = document.createElement('button');
+    startBtn.className = 'pbtn wide';
+    startBtn.textContent = '✎ Малювати';
+    startBtn.addEventListener('click', () => {
+      spatialLineActive = true;
+      deselect();
+      closePopover();
+      renderSpatialLinePill();
+      toast('Торкніться, щоб поставити першу точку лінії');
+    });
+    row.appendChild(startBtn);
+    popoverEl.appendChild(row);
   }
 
   if (panel === 'walls') {
@@ -2434,6 +2916,32 @@ canvas.addEventListener('pointerdown', (e) => {
         const rec = findRecordByMesh(hits[0].object);
         if (rec) beginTileAreaDrag(rec, hits[0].point);
       }
+    } else if (mode === 'edit' && spatialLineActive) {
+      scene.updateMatrixWorld(true);
+      if (spatialLineGizmo) {
+        const hits = rayFromClient(e.clientX, e.clientY).intersectObjects(spatialLineGizmoTargets, false);
+        if (hits.length) {
+          const hitMesh = hits[0].object;
+          if (hitMesh.userData.slRing) beginSpatialLineRingDrag(e.clientX, e.clientY);
+          else beginSpatialLineDrag(hitMesh.userData.slAxis, rayFromClient(e.clientX, e.clientY));
+        }
+      } else {
+        // First point: land it on whatever's under the tap, or 1.5 m out in
+        // front of the camera if nothing's there — there's no paper/ground
+        // plane requirement here, unlike the wall tool.
+        const hits = rayFromClient(e.clientX, e.clientY).intersectObjects(raycastTargets, false);
+        let point;
+        if (hits.length) {
+          point = hits[0].point.clone();
+        } else {
+          const dir = new THREE.Vector3();
+          camera.getWorldDirection(dir);
+          point = camera.position.clone().addScaledVector(dir, 1500);
+        }
+        spatialLineDraft = { points: [roundVec(point)] };
+        attachSpatialLineGizmo(point);
+        renderSpatialLinePill();
+      }
     } else if (!moveMode && !paperDrawing) {
       lookPointerId = e.pointerId;
       lastLookX = e.clientX; lastLookY = e.clientY;
@@ -2513,6 +3021,14 @@ canvas.addEventListener('pointermove', (e) => {
     if (hits.length) updateTileAreaDrag(hits[0].point);
     return;
   }
+  if (mode === 'edit' && spatialLineDrag && e.pointerId === primaryPointerId) {
+    updateSpatialLineDrag(rayFromClient(e.clientX, e.clientY));
+    return;
+  }
+  if (mode === 'edit' && spatialLineRingDrag && e.pointerId === primaryPointerId) {
+    updateSpatialLineRingDrag(e.clientX, e.clientY);
+    return;
+  }
   if (lookPointerId !== null && e.pointerId === lookPointerId) {
     handleFreeLook(e);
   }
@@ -2530,6 +3046,12 @@ function endPointer(e) {
     if (mode === 'edit' && moveMode) moveDragging = false;
     if (mode === 'edit' && paperDrawing) { paperDrawDragging = false; drawStartWorld = null; clearPreviewLine(); }
     if (mode === 'edit' && tileToolActive) { tileDrag = null; clearTileAreaPreview(); renderTilePill(); }
+    if (mode === 'edit' && spatialLineActive) {
+      spatialLineDrag = null; spatialLineRingDrag = null;
+      hideSpatialLineLengthLabel();
+      updateSpatialLinePreview();
+      if (spatialLineGizmo) renderSpatialLinePill();
+    }
     return;
   }
 
@@ -2562,6 +3084,11 @@ function endPointer(e) {
         renderTilePill();
       }
     }
+    return;
+  }
+  if (mode === 'edit' && spatialLineActive) {
+    if (spatialLineDrag && e.pointerId === primaryPointerId) endSpatialLineDrag();
+    if (spatialLineRingDrag && e.pointerId === primaryPointerId) spatialLineRingDrag = null;
     return;
   }
   if (wasPinching) return; // a pinch finger lifting is never a tap
@@ -2758,6 +3285,21 @@ function updateFreeCamera(dt, refDist) {
 // caller store a position relative to some anchor (used by the object
 // library) instead of the record's own absolute world position.
 function serializeObjectRecord(rec, positionOverride) {
+  if (rec.spatialLinePoints) {
+    // A "Просторова лінія" run (raw draft, or a converted pipe/wire/rebar)
+    // is a Group of per-segment meshes, not one mesh with its own
+    // .geometry/.material like the generic fallback below assumes — saved
+    // as its points + target kind/colour instead, and rebuilt with
+    // buildSpatialLineRunGroup on load, same as converting fresh.
+    return {
+      id: rec.id, kind: rec.kind,
+      spatialLinePoints: rec.spatialLinePoints.map((p) => p.toArray()),
+      runLabel: rec.runLabel, runColor: rec.runColor,
+      position: (positionOverride || rec.root.position).toArray(),
+      quaternion: rec.root.quaternion.toArray(),
+      scale: rec.root.scale.toArray(),
+    };
+  }
   if (rec.kind === 'window') {
     const p = rec.root.userData.windowParams;
     return {
@@ -2898,6 +3440,13 @@ function loadProject(data) {
 // absolute position; library insertion offsets it by wherever the user
 // tapped instead).
 function buildObjectFromItem(item) {
+  if (item.spatialLinePoints) {
+    const points = item.spatialLinePoints.map((a) => new THREE.Vector3().fromArray(a));
+    const { group } = buildSpatialLineRunGroup(points, item.kind, item.runColor);
+    group.quaternion.fromArray(item.quaternion);
+    if (item.scale) group.scale.fromArray(item.scale);
+    return { root: group, extra: { spatialLinePoints: points, runLabel: item.runLabel, runColor: item.runColor } };
+  }
   if (item.kind === 'window') {
     const group = buildWindowGroup(item.width, item.height, item.thickness, item.frameColor);
     group.quaternion.fromArray(item.quaternion);
@@ -3432,6 +3981,7 @@ function animate() {
     updateAxisLabels();
     updateHoleLabels();
     updateTileCutLabels();
+    updateSpatialLineTypeLabels();
   } else if (mode === 'walk') {
     updateFreeCamera(dt, 0);
   }

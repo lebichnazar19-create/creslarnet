@@ -360,6 +360,33 @@ html, body {
   dominant-baseline: middle;
 }
 
+/* ---------- "Просторова лінія" — live length + converted-run labels ---------- */
+.spatial-line-length-line { stroke: #8338ec; stroke-width: 1.5; }
+.spatial-line-length-text {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  fill: #cbb0ff;
+  paint-order: stroke;
+  stroke: rgba(20, 18, 26, 0.85);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
+.pipe-run-label {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  fill: #f4f2f8;
+  paint-order: stroke;
+  stroke: rgba(20, 18, 26, 0.85);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
+
 /* ---------- object dimension readout ---------- */
 .dim-readout {
   margin: 0 0 10px;
