@@ -458,21 +458,17 @@ function isCameraInsideAnyRoom() { return !!findRoomContainingCamera(); }
 // one flat pale surface with no sense of individual walls. Each room gets
 // a ceiling-mounted point light so walls get real distance/angle falloff
 // and cast soft shadows, same as a real light fixture would.
-function addRoomLight(roomId, params, center) {
-  // No shadow on this light — a point-light cube shadow map is exactly the
-  // kind of thing weaker/older mobile GPUs render as solid speckled noise
-  // across everything it touches, tuned bias or not; a normalBias fix that
-  // was fine to reason about on paper made it worse in practice on the
-  // actual device. The light still gives every wall real distance/angle
-  // falloff (the original "flat white blob" fix) without any shadow map
-  // at all, so it's the simple, reliably-flat-colour option this needs to
-  // be: no texture, no shader trickery, nothing that can come out as noise.
-  const light = new THREE.PointLight(0xfff4e0, 2.2, 0, 2);
-  light.position.set(center.x, center.y + params.height - 250, center.z);
-  light.castShadow = false;
-  scene.add(light);
-  roomLights.set(roomId, light);
-}
+// Disabled entirely — two attempts at a per-room point light (with, then
+// without, its own shadow) both came back as the scene rendering as solid
+// pixelated noise on the actual device. Turning the shadow off wasn't
+// enough, so the light itself is the suspect, not just its shadow map;
+// rather than keep guessing at *why* on hardware this can't be tested
+// directly against, rooms go back to exactly the lighting they had before
+// any of this — the scene's plain hemisphere + directional sun, nothing
+// room-specific. Walls are (and always were) flat MeshStandardMaterial
+// paint, no texture — see buildRoomParts's per-wall colours below for the
+// safe way to make each wall visually distinct instead.
+function addRoomLight() {}
 
 function removeRoomLight(roomId) {
   const light = roomLights.get(roomId);
@@ -507,17 +503,25 @@ function buildRoomParts(params, roomId, center) {
     { p1: { x: hw, z: hl }, p2: { x: -hw, z: hl } },
     { p1: { x: -hw, z: hl }, p2: { x: -hw, z: -hl } },
   ];
-  for (const w of wallDefs) {
+  // Four distinct flat paint colours, one per wall, muted enough to still
+  // read as one coherent room — plain createPaintMaterial like every other
+  // object's colour, nothing dynamic, so this can't be a source of the
+  // rendering-noise regression the per-room light turned out to be. Lets
+  // "the left wall" etc. be told apart at a glance without needing to tap
+  // each one; any wall's colour can still be repainted individually from
+  // its own selection panel afterward.
+  const ROOM_WALL_COLORS = ['#d8c9b0', '#b0c4d8', '#c0d0b0', '#d0b8c0'];
+  wallDefs.forEach((w, i) => {
     const dx = w.p2.x - w.p1.x, dz = w.p2.z - w.p1.z;
     const len = Math.hypot(dx, dz);
     const wallGeom = new THREE.BoxGeometry(len, height, WALL_THICKNESS);
-    const wallMesh = new THREE.Mesh(wallGeom, createPaintMaterial(DEFAULT_WALL_COLOR));
+    const wallMesh = new THREE.Mesh(wallGeom, createPaintMaterial(ROOM_WALL_COLORS[i % ROOM_WALL_COLORS.length]));
     wallMesh.position.set(center.x + (w.p1.x + w.p2.x) / 2, center.y + height / 2, center.z + (w.p1.z + w.p2.z) / 2);
     wallMesh.rotation.y = Math.atan2(-dz, dx);
     wallMesh.castShadow = true;
     wallMesh.receiveShadow = true;
     parts.push({ kind: 'wall', mesh: wallMesh, extra: { ...roomMeta, wallLength: len } });
-  }
+  });
   return parts;
 }
 
