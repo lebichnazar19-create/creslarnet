@@ -32,8 +32,12 @@ const KIND_LABELS = {
   cube: 'Куб', cylinder: 'Циліндр', pipe: 'Труба', sphere: 'Сфера', cone: 'Конус',
   wall: 'Стіна', window: 'Вікно', paper: 'Папір', sketchLine: 'Лінія на папері',
   rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт', ground: 'Земля',
-  compound: 'Складений об’єкт',
+  compound: 'Складений об’єкт', roomFloor: 'Підлога кімнати', roomCeiling: 'Стеля кімнати',
+  tile: 'Плитка', tileGrout: 'Шов (фуга)',
 };
+
+// Default footprint for a freshly-created room — a common small-bedroom size.
+const DEFAULT_ROOM_PARAMS = { width: 4000, length: 3000, height: 2600 };
 
 // How far apart an exploded object's own bounding box (in mm) — a small
 // window opens by a few cm, a metre-wide assembly by proportionally more.
@@ -207,6 +211,9 @@ let windowToolActive = false;
 let windowFrameColor = '#f2efe6';
 let holeToolActive = false;
 let holeRadius = 80; // mm
+let activeRoomId = null; // most recently created/selected room — what the "Кімната" popover edits
+let tileToolActive = false;
+const tileConfig = { w: 600, h: 1200, color: '#e8e4da', groutColor: '#8a8378', grout: 2 };
 let moveMode = false;
 let moveDragging = false;
 let paperDrawing = false;
@@ -394,6 +401,261 @@ function addWallSegment(p1, p2, color) {
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   return registerObject('wall', mesh, { wallLength: length });
+}
+
+// ---------------------------------------------------------------------------
+// "Кімната" — a full room (floor + 4 walls + ceiling) generated from a single
+// {width, length, height} spec and rebuilt from scratch whenever that spec
+// changes, rather than resized by scaling. Every part is a normal top-level
+// object (kind 'wall' for the walls — the same kind hand-drawn walls use, so
+// window insertion and every other wall tool already works on them for
+// free), just tagged with a shared roomId/roomParams/roomCenter so they can
+// be found, edited together, and rebuilt in place.
+// ---------------------------------------------------------------------------
+let roomCounter = 0;
+
+function findRoomParts(roomId) {
+  return objects.filter((r) => r.roomId === roomId);
+}
+
+// Builds the 6 meshes for one room spec, already offset by `center` and
+// tagged for the registry — callers still need to registerObject() each one.
+function buildRoomParts(params, roomId, center) {
+  const { width, length, height } = params;
+  const roomMeta = { roomId, roomParams: { ...params }, roomCenter: { x: center.x, y: center.y, z: center.z } };
+  const parts = [];
+
+  const floorGeom = new THREE.BoxGeometry(width, WALL_THICKNESS, length);
+  const floorMesh = new THREE.Mesh(floorGeom, createPaintMaterial('#c9c3b3'));
+  floorMesh.position.set(center.x, center.y - WALL_THICKNESS / 2, center.z);
+  floorMesh.receiveShadow = true;
+  parts.push({ kind: 'roomFloor', mesh: floorMesh, extra: { ...roomMeta } });
+
+  const ceilGeom = new THREE.BoxGeometry(width, WALL_THICKNESS, length);
+  const ceilMesh = new THREE.Mesh(ceilGeom, createPaintMaterial('#f2f0ea'));
+  ceilMesh.position.set(center.x, center.y + height + WALL_THICKNESS / 2, center.z);
+  ceilMesh.receiveShadow = true;
+  parts.push({ kind: 'roomCeiling', mesh: ceilMesh, extra: { ...roomMeta } });
+
+  const hw = width / 2, hl = length / 2;
+  const wallDefs = [
+    { p1: { x: -hw, z: -hl }, p2: { x: hw, z: -hl } },
+    { p1: { x: hw, z: -hl }, p2: { x: hw, z: hl } },
+    { p1: { x: hw, z: hl }, p2: { x: -hw, z: hl } },
+    { p1: { x: -hw, z: hl }, p2: { x: -hw, z: -hl } },
+  ];
+  for (const w of wallDefs) {
+    const dx = w.p2.x - w.p1.x, dz = w.p2.z - w.p1.z;
+    const len = Math.hypot(dx, dz);
+    const wallGeom = new THREE.BoxGeometry(len, height, WALL_THICKNESS);
+    const wallMesh = new THREE.Mesh(wallGeom, createPaintMaterial(DEFAULT_WALL_COLOR));
+    wallMesh.position.set(center.x + (w.p1.x + w.p2.x) / 2, center.y + height / 2, center.z + (w.p1.z + w.p2.z) / 2);
+    wallMesh.rotation.y = Math.atan2(-dz, dx);
+    wallMesh.castShadow = true;
+    wallMesh.receiveShadow = true;
+    parts.push({ kind: 'wall', mesh: wallMesh, extra: { ...roomMeta, wallLength: len } });
+  }
+  return parts;
+}
+
+function createRoom(params = DEFAULT_ROOM_PARAMS, center = new THREE.Vector3(0, 0, 0)) {
+  const roomId = `room_${++roomCounter}_${Date.now().toString(36)}`;
+  const parts = buildRoomParts(params, roomId, center);
+  const records = parts.map((p) => registerObject(p.kind, p.mesh, p.extra));
+  const wallRecord = records.find((r) => r.kind === 'wall');
+  select(wallRecord || records[0]);
+  toast('Кімнату створено — розміри можна змінити в панелі об’єкта');
+  return roomId;
+}
+
+// Tears down every part of a room (including any tiles/grout placed on its
+// walls/floor — they carry the same roomId) and rebuilds it fresh from a new
+// spec, keeping the room centred where it was.
+function rebuildRoom(roomId, newParams) {
+  const existing = findRoomParts(roomId);
+  if (!existing.length) return;
+  const center = existing[0].roomCenter;
+  const wasSelected = selected && existing.includes(selected);
+  const centerVec = new THREE.Vector3(center.x, center.y, center.z);
+  // buildRoomParts always emits parts in the same fixed order (floor,
+  // ceiling, then the 4 walls) — capture each part's own paint/material by
+  // that position so a resize doesn't quietly reset a wall someone painted.
+  const savedMaterials = existing.map((r) => ({
+    type: r.root.material.userData.creslarnetType,
+    color: r.root.material.userData.creslarnetColor,
+  }));
+  existing.forEach(removeObject);
+  const parts = buildRoomParts(newParams, roomId, centerVec);
+  const records = parts.map((p, i) => {
+    const saved = savedMaterials[i];
+    if (saved) {
+      p.mesh.material.dispose();
+      p.mesh.material = saved.type === 'paint' ? createPaintMaterial(saved.color) : createMaterial(saved.type, saved.color, scene.environment);
+    }
+    return registerObject(p.kind, p.mesh, p.extra);
+  });
+  if (wasSelected) select(records.find((r) => r.kind === 'wall') || records[0]);
+  else renderSelectionPanel();
+}
+
+function removeRoom(roomId) {
+  findRoomParts(roomId).forEach(removeObject);
+  toast('Кімнату видалено');
+}
+
+// The room-dimension editor — reused both in a room part's own selection
+// panel and in the "Кімната" popover, so the two stay in sync automatically.
+function buildRoomDimsSection(roomId) {
+  const wrap = document.createElement('div');
+  const parts = findRoomParts(roomId);
+  if (!parts.length) return wrap;
+
+  const title = document.createElement('p');
+  title.className = 'panel-title';
+  title.textContent = 'Розміри кімнати';
+  wrap.appendChild(title);
+
+  const section = document.createElement('div');
+  section.className = 'size-section';
+  const fields = [
+    { key: 'width', label: 'Ширина' },
+    { key: 'length', label: 'Довжина' },
+    { key: 'height', label: 'Висота' },
+  ];
+  for (const f of fields) {
+    const row = document.createElement('div');
+    row.className = 'size-row';
+    const label = document.createElement('span');
+    label.className = 'axis-label';
+    label.textContent = f.label;
+
+    const minus = document.createElement('button');
+    minus.type = 'button'; minus.className = 'stepper-btn'; minus.textContent = '–';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.inputMode = 'decimal';
+    input.className = 'size-input';
+    const plus = document.createElement('button');
+    plus.type = 'button'; plus.className = 'stepper-btn'; plus.textContent = '+';
+    const unit = document.createElement('span');
+    unit.className = 'unit-label';
+    unit.textContent = 'мм';
+
+    const current = () => (findRoomParts(roomId)[0] || { roomParams: {} }).roomParams[f.key];
+    const apply = (v) => {
+      if (!Number.isFinite(v) || v < 500) { input.value = formatMm(current()); return; }
+      const next = { ...findRoomParts(roomId)[0].roomParams, [f.key]: roundMm(v) };
+      rebuildRoom(roomId, next);
+    };
+    input.value = formatMm(current());
+    minus.addEventListener('click', () => apply(current() - 100));
+    plus.addEventListener('click', () => apply(current() + 100));
+    input.addEventListener('change', () => apply(parseFloat(input.value.replace(',', '.'))));
+
+    row.append(label, minus, input, plus, unit);
+    section.appendChild(row);
+  }
+  wrap.appendChild(section);
+
+  const delBtn = document.createElement('button');
+  delBtn.className = 'pbtn danger wide';
+  delBtn.textContent = '🗑 Видалити кімнату';
+  delBtn.addEventListener('click', () => { deselect(); removeRoom(roomId); });
+  wrap.appendChild(delBtn);
+  return wrap;
+}
+
+// ---------------------------------------------------------------------------
+// "Плитка" (3D) — tap a wall or floor to lay one tile at a time; each new
+// tile snaps to a grid anchored on the FIRST tile placed on that surface, so
+// consecutive taps always land flush against their neighbours with an exact
+// grout-width gap, in any order, without the user having to aim precisely.
+// A grout-coloured backing plate goes in first (once per surface) so the
+// gap between tiles actually shows the chosen grout colour, not raw wall.
+// ---------------------------------------------------------------------------
+const TILE_THICKNESS = 8; // mm
+const tileGridOrigins = new Map(); // "meshUuid_faceSign" -> { u0, v0 }
+const placedTileCells = new Set(); // "meshUuid_faceSign_cellU_cellV" — avoids stacking duplicates
+const tileBackings = new Set(); // "meshUuid_faceSign" already has its grout plate
+
+// A wall's local frame runs (length, height, thickness) along (X, Y, Z); a
+// floor/ceiling's runs (width, thickness, length) along (X, Y, Z) — so the
+// "along the surface" axes are (X,Y) for a wall but (X,Z) for a floor/ceiling,
+// and the "outward" axis is Z for a wall but Y for a floor/ceiling.
+function isWallLike(kind) { return kind === 'wall'; }
+function surfaceUV(kind, local) {
+  return isWallLike(kind) ? { u: local.x, v: local.y } : { u: local.x, v: local.z };
+}
+function surfaceLocalFromUV(kind, u, v, normalOffset) {
+  return isWallLike(kind)
+    ? new THREE.Vector3(u, v, normalOffset)
+    : new THREE.Vector3(u, normalOffset, v);
+}
+function surfaceFaceSign(kind, local) {
+  return isWallLike(kind) ? (local.z >= 0 ? 1 : -1) : (local.y >= 0 ? 1 : -1);
+}
+function surfaceFootprint(kind, mesh) {
+  const p = mesh.geometry.parameters;
+  return isWallLike(kind) ? { w: p.width, h: p.height } : { w: p.width, h: p.depth };
+}
+function buildTileGeometry(kind, w, h, thickness) {
+  return isWallLike(kind) ? new THREE.BoxGeometry(w, h, thickness) : new THREE.BoxGeometry(w, thickness, h);
+}
+
+function ensureGroutBacking(targetRecord, mesh, kind, faceSign, key) {
+  if (tileBackings.has(key)) return;
+  tileBackings.add(key);
+  const { w, h } = surfaceFootprint(kind, mesh);
+  const backingGeom = buildTileGeometry(kind, w, h, 2);
+  const backingMesh = new THREE.Mesh(backingGeom, createPaintMaterial(tileConfig.groutColor));
+  const localOffset = faceSign * (WALL_THICKNESS / 2 + 1);
+  const localPos = surfaceLocalFromUV(kind, 0, 0, localOffset);
+  backingMesh.position.copy(mesh.localToWorld(localPos));
+  backingMesh.quaternion.copy(mesh.quaternion);
+  backingMesh.receiveShadow = true;
+  registerObject('tileGrout', backingMesh, targetRecord.roomId ? { roomId: targetRecord.roomId } : {});
+}
+
+function placeTileAt(targetRecord, worldPoint) {
+  const mesh = targetRecord.root;
+  const kind = targetRecord.kind;
+  const local = mesh.worldToLocal(worldPoint.clone());
+  const { u, v } = surfaceUV(kind, local);
+  const faceSign = surfaceFaceSign(kind, local);
+  const key = `${mesh.uuid}_${faceSign}`;
+
+  let origin = tileGridOrigins.get(key);
+  if (!origin) { origin = { u0: u, v0: v }; tileGridOrigins.set(key, origin); }
+  const stepU = tileConfig.w + tileConfig.grout, stepV = tileConfig.h + tileConfig.grout;
+  const cellU = Math.round((u - origin.u0) / stepU);
+  const cellV = Math.round((v - origin.v0) / stepV);
+  const cellKey = `${key}_${cellU}_${cellV}`;
+  if (placedTileCells.has(cellKey)) { toast('Тут уже покладено плитку'); return; }
+
+  ensureGroutBacking(targetRecord, mesh, kind, faceSign, key);
+
+  const snappedU = origin.u0 + cellU * stepU, snappedV = origin.v0 + cellV * stepV;
+  const localOffset = faceSign * (WALL_THICKNESS / 2 + TILE_THICKNESS / 2 + 1);
+  const localPos = surfaceLocalFromUV(kind, snappedU, snappedV, localOffset);
+
+  const tileGeom = buildTileGeometry(kind, tileConfig.w, tileConfig.h, TILE_THICKNESS);
+  const tileMesh = new THREE.Mesh(tileGeom, createPaintMaterial(tileConfig.color));
+  tileMesh.position.copy(mesh.localToWorld(localPos));
+  tileMesh.quaternion.copy(mesh.quaternion);
+  tileMesh.castShadow = true;
+  tileMesh.receiveShadow = true;
+  registerObject('tile', tileMesh, targetRecord.roomId ? { roomId: targetRecord.roomId } : {});
+  placedTileCells.add(cellKey);
+}
+
+function renderTilePill() {
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = 'Торкніться стіни або підлоги';
+  const done = document.createElement('button');
+  done.textContent = '✓ Готово';
+  done.addEventListener('click', () => { tileToolActive = false; hideEl(modePillEl); });
+  modePillEl.append(label, done);
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +883,7 @@ function select(record) {
   if (selected === record) return;
   deselect();
   selected = record;
+  if (record.roomId) activeRoomId = record.roomId;
 
   const roundOutline = record.root.isMesh ? buildRoundOutlineGeometry(record.kind) : null;
   if (record.kind === 'ground') {
@@ -1219,6 +1482,10 @@ function renderSelectionPanel() {
   title.textContent = KIND_LABELS[selected.kind] || selected.kind;
   selectionPanelEl.appendChild(title);
 
+  if (selected.roomId) {
+    selectionPanelEl.appendChild(buildRoomDimsSection(selected.roomId));
+  }
+
   if (selected.kind === 'ground') {
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
@@ -1259,8 +1526,13 @@ function renderSelectionPanel() {
     return;
   }
 
-  selectionPanelEl.appendChild(buildSizeSection(selected));
-  selectionPanelEl.appendChild(buildRotationSection(selected));
+  // A room part's length/height/rotation come from the room spec above —
+  // its own generic size/rotation controls would just fight that on the
+  // next resize, so only offer them for objects outside any room.
+  if (!selected.roomId) {
+    selectionPanelEl.appendChild(buildSizeSection(selected));
+    selectionPanelEl.appendChild(buildRotationSection(selected));
+  }
 
   selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
   selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
@@ -1391,6 +1663,89 @@ function buildPopoverContent(panel) {
       row.appendChild(b);
     }
     popoverEl.appendChild(row);
+  }
+
+  if (panel === 'room') {
+    const h = document.createElement('h3'); h.textContent = 'Кімната'; popoverEl.appendChild(h);
+    const row = document.createElement('div'); row.className = 'panel-row';
+    const newBtn = document.createElement('button');
+    newBtn.className = 'pbtn wide';
+    newBtn.textContent = '➕ Нова кімната';
+    newBtn.addEventListener('click', () => {
+      activeRoomId = createRoom();
+      closePopover();
+    });
+    row.appendChild(newBtn);
+    popoverEl.appendChild(row);
+
+    if (activeRoomId && findRoomParts(activeRoomId).length) {
+      popoverEl.appendChild(buildRoomDimsSection(activeRoomId));
+    } else {
+      const hint = document.createElement('p');
+      hint.className = 'dim-readout';
+      hint.textContent = 'Створіть кімнату, щоб задати її розміри — ширину, довжину й висоту в міліметрах.';
+      popoverEl.appendChild(hint);
+    }
+  }
+
+  if (panel === 'tile3d') {
+    const h = document.createElement('h3'); h.textContent = 'Плитка'; popoverEl.appendChild(h);
+
+    const hint = document.createElement('p');
+    hint.className = 'dim-readout';
+    hint.textContent = 'Задайте розмір, кольори — тоді торкайтесь стіни чи підлоги, плитки самі приляжуть з рівним швом.';
+    popoverEl.appendChild(hint);
+
+    const sizeRow = document.createElement('div'); sizeRow.className = 'panel-row';
+    for (const dim of [{ key: 'w', label: 'Ширина' }, { key: 'h', label: 'Висота' }]) {
+      const label = document.createElement('span');
+      label.className = 'axis-label';
+      label.textContent = dim.label;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.inputMode = 'decimal';
+      input.className = 'size-input';
+      input.value = formatMm(tileConfig[dim.key]);
+      input.addEventListener('change', () => {
+        const v = parseFloat(input.value.replace(',', '.'));
+        if (Number.isFinite(v) && v > 10) tileConfig[dim.key] = roundMm(v);
+        input.value = formatMm(tileConfig[dim.key]);
+      });
+      sizeRow.append(label, input);
+    }
+    popoverEl.appendChild(sizeRow);
+
+    const colorLabel = document.createElement('p'); colorLabel.className = 'dim-readout'; colorLabel.textContent = 'Колір плитки';
+    popoverEl.appendChild(colorLabel);
+    popoverEl.appendChild(colorSwatchRow(tileConfig.color, (c) => { tileConfig.color = c; }));
+
+    const groutLabel = document.createElement('p'); groutLabel.className = 'dim-readout'; groutLabel.textContent = 'Колір шва (фуги)';
+    popoverEl.appendChild(groutLabel);
+    popoverEl.appendChild(colorSwatchRow(tileConfig.groutColor, (c) => { tileConfig.groutColor = c; }));
+
+    const groutRow = document.createElement('div'); groutRow.className = 'panel-row';
+    const gLabel = document.createElement('span'); gLabel.className = 'axis-label'; gLabel.textContent = 'Шов';
+    const gMinus = document.createElement('button'); gMinus.type = 'button'; gMinus.className = 'stepper-btn'; gMinus.textContent = '–';
+    const gVal = document.createElement('span'); gVal.className = 'size-input'; gVal.style.textAlign = 'center'; gVal.textContent = `${formatMm(tileConfig.grout)} мм`;
+    const gPlus = document.createElement('button'); gPlus.type = 'button'; gPlus.className = 'stepper-btn'; gPlus.textContent = '+';
+    gMinus.addEventListener('click', () => { tileConfig.grout = Math.max(0, roundMm(tileConfig.grout - 0.5)); gVal.textContent = `${formatMm(tileConfig.grout)} мм`; });
+    gPlus.addEventListener('click', () => { tileConfig.grout = roundMm(tileConfig.grout + 0.5); gVal.textContent = `${formatMm(tileConfig.grout)} мм`; });
+    groutRow.append(gLabel, gMinus, gVal, gPlus);
+    popoverEl.appendChild(groutRow);
+
+    const toggleRow = document.createElement('div'); toggleRow.className = 'panel-row';
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'pbtn wide' + (tileToolActive ? ' on' : '');
+    toggleBtn.textContent = tileToolActive ? '■ Вимкнути інструмент' : '✓ Активувати — торкайтесь стіни/підлоги';
+    toggleBtn.addEventListener('click', () => {
+      tileToolActive = !tileToolActive;
+      deselect();
+      closePopover();
+      if (tileToolActive) { showEl(modePillEl); renderTilePill(); toast('Торкніться стіни або підлоги, щоб покласти плитку'); }
+      else hideEl(modePillEl);
+    });
+    toggleRow.appendChild(toggleBtn);
+    popoverEl.appendChild(toggleRow);
   }
 
   if (panel === 'walls') {
@@ -1771,6 +2126,14 @@ function handleEditTap(x, y) {
   if (wallDrawing) { addWallPoint(x, y); return; }
   if (windowToolActive) { insertWindowAt(x, y); return; }
   if (holeToolActive) { performHolePlacement(x, y); return; }
+  if (tileToolActive) {
+    const targets = objects.filter((r) => r.kind === 'wall' || r.kind === 'roomFloor' || r.kind === 'roomCeiling').map((r) => r.root);
+    const hits = rayFromClient(x, y).intersectObjects(targets, false);
+    if (!hits.length) { toast('Торкніться стіни або підлоги'); return; }
+    const rec = findRecordByMesh(hits[0].object);
+    if (rec) placeTileAt(rec, hits[0].point);
+    return;
+  }
 
   const ray = rayFromClient(x, y);
   const hits = ray.intersectObjects(raycastTargets, false);
@@ -1917,6 +2280,7 @@ function serializeObjectRecord(rec, positionOverride) {
     id: rec.id, kind: rec.kind, isPipe: !!rec.isPipe, wallLength: rec.wallLength,
     paperId: rec.paperId, lineLength: rec.lineLength,
     lineStart: rec.lineStart?.toArray(), lineEnd: rec.lineEnd?.toArray(),
+    roomId: rec.roomId, roomParams: rec.roomParams, roomCenter: rec.roomCenter,
     geometry: mesh.geometry.toJSON(),
     material: { type: mesh.material.userData.creslarnetType, color: mesh.material.userData.creslarnetColor },
     position: (positionOverride || mesh.position).toArray(),
@@ -2062,6 +2426,7 @@ function buildObjectFromItem(item) {
       paperId: item.paperId, lineLength: item.lineLength,
       lineStart: item.lineStart && new THREE.Vector3().fromArray(item.lineStart),
       lineEnd: item.lineEnd && new THREE.Vector3().fromArray(item.lineEnd),
+      roomId: item.roomId, roomParams: item.roomParams, roomCenter: item.roomCenter,
     },
   };
 }
@@ -2411,6 +2776,12 @@ window.__creslarnet3d = {
   get selected() { return selected; },
   scene, camera, renderer,
   buildProjectData, loadProject, select, canExplode, toggleExplode,
+  createRoom, rebuildRoom, removeRoom, findRoomParts,
+  get activeRoomId() { return activeRoomId; },
+  get tileConfig() { return tileConfig; },
+  set tileToolActive(v) { tileToolActive = v; },
+  get tileToolActive() { return tileToolActive; },
+  handleEditTap, placeTileAt,
   // fly the camera to look at a world point from a fixed relative offset —
   // handy for debugging/testing since there's no orbit pivot to aim any more
   lookAt(pos, distance = 3000) {

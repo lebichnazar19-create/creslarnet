@@ -62,6 +62,7 @@ html, body {
   display: flex;
   gap: 2px;
   padding: 4px;
+  overflow-x: auto;
   background: var(--hud-bg);
   border: 1px solid var(--hud-line);
   border-radius: 16px;
