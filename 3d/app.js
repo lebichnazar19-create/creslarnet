@@ -410,9 +410,37 @@ function addWallSegment(p1, p2, color) {
 // be found, edited together, and rebuilt in place.
 // ---------------------------------------------------------------------------
 let roomCounter = 0;
+const roomLights = new Map(); // roomId -> THREE.PointLight, see addRoomLight()
 
 function findRoomParts(roomId) {
   return objects.filter((r) => r.roomId === roomId);
+}
+
+// The outdoor sun can't reach an enclosed room — its own ceiling blocks it
+// — and the ambient hemisphere/environment light alone shades every
+// vertical wall almost identically regardless of which way it faces (their
+// surface normals are all near-horizontal, so a sky/ground ambient blend
+// barely varies between them). Without its own light source a room read as
+// one flat pale surface with no sense of individual walls. Each room gets
+// a ceiling-mounted point light so walls get real distance/angle falloff
+// and cast soft shadows, same as a real light fixture would.
+function addRoomLight(roomId, params, center) {
+  const light = new THREE.PointLight(0xfff4e0, 2.2, 0, 2);
+  light.position.set(center.x, center.y + params.height - 250, center.z);
+  light.castShadow = true;
+  light.shadow.mapSize.set(512, 512);
+  light.shadow.camera.near = 50;
+  light.shadow.camera.far = Math.max(params.width, params.length, params.height) * 1.6;
+  light.shadow.bias = -0.002;
+  scene.add(light);
+  roomLights.set(roomId, light);
+}
+
+function removeRoomLight(roomId) {
+  const light = roomLights.get(roomId);
+  if (!light) return;
+  light.parent?.remove(light);
+  roomLights.delete(roomId);
 }
 
 // Builds the 6 meshes for one room spec, already offset by `center` and
@@ -461,6 +489,7 @@ function createRoom(params = DEFAULT_ROOM_PARAMS, center = new THREE.Vector3(0, 
   const records = parts.map((p) => registerObject(p.kind, p.mesh, p.extra));
   const wallRecord = records.find((r) => r.kind === 'wall');
   select(wallRecord || records[0]);
+  addRoomLight(roomId, params, center);
   viewRoomInside(roomId);
   toast('Кімнату створено — розміри можна змінити в панелі об’єкта');
   return roomId;
@@ -515,12 +544,15 @@ function rebuildRoom(roomId, newParams) {
     }
     return registerObject(p.kind, p.mesh, p.extra);
   });
+  removeRoomLight(roomId);
+  addRoomLight(roomId, newParams, centerVec);
   if (wasSelected) select(records.find((r) => r.kind === 'wall') || records[0]);
   else renderSelectionPanel();
 }
 
 function removeRoom(roomId) {
   findRoomParts(roomId).forEach(removeObject);
+  removeRoomLight(roomId);
   toast('Кімнату видалено');
 }
 
@@ -2003,7 +2035,7 @@ canvas.addEventListener('wheel', (e) => {
   const dir = new THREE.Vector3();
   camera.getWorldDirection(dir);
   const refDist = forwardHitDistance();
-  camera.position.addScaledVector(dir, -e.deltaY * refDist * 0.002);
+  camera.position.addScaledVector(dir, -e.deltaY * refDist * 0.0011);
 }, { passive: false });
 
 function currentPinchDist() {
@@ -2084,7 +2116,7 @@ canvas.addEventListener('pointermove', (e) => {
       const dir = new THREE.Vector3();
       camera.getWorldDirection(dir);
       const refDist = forwardHitDistance();
-      camera.position.addScaledVector(dir, delta * refDist * 0.004);
+      camera.position.addScaledVector(dir, delta * refDist * 0.0018);
       if (mode === 'walk') camera.position.y = EYE_HEIGHT;
       pinchStartDist = dist;
     }
@@ -2257,7 +2289,7 @@ walkExitBtn.addEventListener('click', exitWalkMode);
 function handleFreeLook(e) {
   const dx = e.clientX - lastLookX, dy = e.clientY - lastLookY;
   lastLookX = e.clientX; lastLookY = e.clientY;
-  const sens = 0.0035;
+  const sens = 0.002;
   yaw -= dx * sens;
   pitch -= dy * sens;
   pitch = Math.max(-1.3, Math.min(1.3, pitch));
@@ -2290,7 +2322,7 @@ function updateFreeCamera(dt, refDist) {
     // true fly: forward follows the full look direction, pitch included
     forward = new THREE.Vector3();
     camera.getWorldDirection(forward);
-    speed = Math.max(150, Math.min(20000, refDist * 1.5));
+    speed = Math.max(90, Math.min(11000, refDist * 0.8));
   }
 
   const move = new THREE.Vector3().addScaledVector(forward, -my).addScaledVector(right, mx);
