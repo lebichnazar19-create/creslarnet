@@ -12,6 +12,12 @@ import { createMaterial, createPaintMaterial, MATERIAL_LABELS } from './material
 // with e.g. BoxGeometry(200, 200, 200) really is a 200 mm cube.
 // ---------------------------------------------------------------------------
 const PALETTE = ['#1a1a1a', '#e63946', '#2a9d8f', '#264653', '#f4a261', '#8338ec'];
+
+// One axis-colour convention for the whole app: X red, Y blue (vertical —
+// 3ds Max convention), Z green. Used by the move/rotate gizmos and the
+// dimension-line overlay so a colour always means the same axis everywhere.
+const AXIS_COLOR = { x: 0xd83e3e, y: 0x3a6cd8, z: 0x3aa85a };
+const AXIS_COLOR_CSS = { x: '#d83e3e', y: '#3a6cd8', z: '#3aa85a' };
 const DEFAULT_PAINT = '#cfcfd6';
 const WALL_HEIGHT = 2600;
 const WALL_THICKNESS = 150;
@@ -26,7 +32,12 @@ const KIND_LABELS = {
   cube: 'Куб', cylinder: 'Циліндр', pipe: 'Труба', sphere: 'Сфера', cone: 'Конус',
   wall: 'Стіна', window: 'Вікно', paper: 'Папір', sketchLine: 'Лінія на папері',
   rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт', ground: 'Земля',
+  compound: 'Складений об’єкт',
 };
+
+// How far apart an exploded object's own bounding box (in mm) — a small
+// window opens by a few cm, a metre-wide assembly by proportionally more.
+const EXPLODE_SPREAD_FACTOR = 0.8;
 
 // Quantize to the coordinate system's stated resolution: 0.1 mm.
 const roundMm = (v) => Math.round(v * 10) / 10;
@@ -63,8 +74,10 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
 
+// AutoCAD-style dark model space: black backdrop, white grid — objects and
+// their own materials/colours are untouched by this, only the environment.
 const scene = new THREE.Scene();
-const SKY_COLOR = 0xbfe0e6;
+const SKY_COLOR = 0x0d0d0f;
 scene.background = new THREE.Color(SKY_COLOR);
 scene.fog = new THREE.Fog(SKY_COLOR, 26000, 90000);
 
@@ -99,14 +112,15 @@ const groundGeo = new THREE.PlaneGeometry(80000, 80000);
 // Built via the same paint-material factory as everything else so the
 // ground can go through the normal colour/material picker (grass included)
 // once it's made selectable further down, once `objects`/raycastTargets exist.
-const ground = new THREE.Mesh(groundGeo, createPaintMaterial('#d8dcc9'));
+const ground = new THREE.Mesh(groundGeo, createPaintMaterial('#161618'));
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
 
 // 80 divisions across an 80 m plot = one grid line per metre (1000 mm).
-const grid = new THREE.GridHelper(80000, 80, 0x7a8a70, 0xa9b39a);
-grid.material.opacity = 0.35;
+// White, AutoCAD-style — brighter centre lines, dimmer minor grid.
+const grid = new THREE.GridHelper(80000, 80, 0xffffff, 0x666666);
+grid.material.opacity = 0.5;
 grid.material.transparent = true;
 grid.position.y = 1;
 scene.add(grid);
@@ -541,32 +555,105 @@ function buildWindowGroup(width, height, thickness, frameColor) {
 // ---------------------------------------------------------------------------
 // Selection & outline
 // ---------------------------------------------------------------------------
+// A ring of straight segments approximating a circle of the given radius,
+// in the local XZ-plane at height y — building block for the round-object
+// outlines below (returned as a flat [x,y,z, x,y,z, …] pair list, ready for
+// a LineSegments position attribute).
+function circleOutlinePoints(radius, y, segments = 48) {
+  const pts = [];
+  for (let i = 0; i < segments; i++) {
+    const a0 = (i / segments) * Math.PI * 2, a1 = ((i + 1) / segments) * Math.PI * 2;
+    pts.push(radius * Math.cos(a0), y, radius * Math.sin(a0), radius * Math.cos(a1), y, radius * Math.sin(a1));
+  }
+  return pts;
+}
+
+// EdgesGeometry is honest for sharp-edged shapes (a cube's 90° corners) but
+// on a round primitive it picks up every facet-to-facet seam around the
+// curved surface (only ~11° apart on a 32-segment cylinder) — the "chaotic
+// lines all over the surface" look. Cylinder/cone/pipe get a hand-built
+// outline instead: the real rim circle(s) plus two side lines, matching how
+// a technical drawing depicts a round solid. Base dimensions are each
+// kind's own fixed build size (KIND_DEFS/buildPipeGeometry) — resizing
+// afterward goes through record.root.scale, which this outline inherits
+// for free as a child, same as the EdgesGeometry path.
+function buildRoundOutlineGeometry(kind) {
+  let positions;
+  if (kind === 'cylinder') {
+    positions = [
+      ...circleOutlinePoints(500, 500),
+      ...circleOutlinePoints(500, -500),
+      500, 500, 0, 500, -500, 0,
+      -500, 500, 0, -500, -500, 0,
+    ];
+  } else if (kind === 'cone') {
+    positions = [
+      ...circleOutlinePoints(500, -500),
+      500, -500, 0, 0, 500, 0,
+      -500, -500, 0, 0, 500, 0,
+    ];
+  } else if (kind === 'pipe') {
+    // buildPipeGeometry's own local frame: extrusion runs along local X from
+    // 0 to `length`, cross-section (radius outerR) centred in the YZ-plane.
+    const outerR = 220, length = 1400;
+    positions = [];
+    const ringAt = (x) => {
+      const pts = [];
+      for (let i = 0; i < 48; i++) {
+        const a0 = (i / 48) * Math.PI * 2, a1 = ((i + 1) / 48) * Math.PI * 2;
+        pts.push(x, outerR * Math.cos(a0), outerR * Math.sin(a0), x, outerR * Math.cos(a1), outerR * Math.sin(a1));
+      }
+      return pts;
+    };
+    positions.push(...ringAt(0), ...ringAt(length));
+    positions.push(0, outerR, 0, length, outerR, 0);
+    positions.push(0, -outerR, 0, length, -outerR, 0);
+  } else {
+    return null;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  return geometry;
+}
+
 let outlineHelper = null;
-let axesHelper = null;
 function select(record) {
   if (selected === record) return;
   deselect();
   selected = record;
 
+  const roundOutline = record.root.isMesh ? buildRoundOutlineGeometry(record.kind) : null;
   if (record.kind === 'ground') {
     // no outline on an 80 m plane — a box around it isn't useful
   } else if (record.kind === 'window') {
     // a window really is boxy — BoxHelper is the honest shape for it
     outlineHelper = new THREE.BoxHelper(record.root, 0x8338ec);
     scene.add(outlineHelper);
+  } else if (roundOutline) {
+    outlineHelper = new THREE.LineSegments(roundOutline, new THREE.LineBasicMaterial({ color: 0x8338ec }));
+    outlineHelper.update = () => {};
+    record.root.add(outlineHelper);
   } else if (record.root.isMesh) {
-    // Hugs the object's own silhouette (round for a cylinder, sharp for a
-    // cube) instead of always drawing a box — geometry edges beyond a small
-    // angle threshold, added as a child so it tracks transform for free.
+    // Hugs the object's own silhouette (sharp for a cube/wall/beam) —
+    // geometry edges beyond a small angle threshold, added as a child so it
+    // tracks transform for free.
     const edges = new THREE.EdgesGeometry(record.root.geometry, 10);
     outlineHelper = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x8338ec }));
     outlineHelper.update = () => {}; // no-op — kept so existing outlineHelper?.update() call sites stay valid
     record.root.add(outlineHelper);
+  } else {
+    // A compound (or any other future multi-part group) — boxy is the
+    // honest shape for an assembly, same as a window.
+    outlineHelper = new THREE.BoxHelper(record.root, 0x8338ec);
+    scene.add(outlineHelper);
   }
 
   if (record.kind !== 'ground' && record.kind !== 'sketchLine') {
-    axesHelper = new THREE.AxesHelper(axisGizmoLocalSize(record));
-    record.root.add(axesHelper); // child — tracks position/rotation/scale for free
+    const built = buildGizmo(record);
+    gizmo = built.group;
+    gizmoMoveTargets = built.moveTargets;
+    gizmoRotateTargets = built.rotateTargets;
+    record.root.add(gizmo); // child — tracks position/rotation/scale for free
   }
   closePopover();
   renderSelectionPanel();
@@ -579,7 +666,7 @@ function deselect() {
     outlineHelper.material?.dispose();
     outlineHelper = null;
   }
-  if (axesHelper) { axesHelper.parent?.remove(axesHelper); axesHelper = null; }
+  removeGizmo();
   hideDimensionOverlay();
   selected = null;
   holeToolActive = false;
@@ -593,6 +680,28 @@ function deselect() {
   hideEl(modePillEl);
 }
 
+// Local-space bounding box for any record.root, mesh or group — a plain
+// mesh just reports its own geometry box; a group (window, compound) unions
+// each part's own box offset by the part's local position. Parts are simple
+// primitives with no nested rotation in practice, so this stays accurate
+// enough for sizing/gizmo/explode purposes without a full matrix walk.
+function localBoundingBox(root) {
+  if (root.isMesh) {
+    root.geometry.computeBoundingBox(); // cheap; re-run in case CSG just replaced the geometry
+    return root.geometry.boundingBox.clone();
+  }
+  const box = new THREE.Box3();
+  for (const child of root.children) {
+    if (!child.isMesh || child.userData.isHelper) continue;
+    child.geometry.computeBoundingBox();
+    const childBox = child.geometry.boundingBox.clone();
+    childBox.min.multiply(child.scale).add(child.position);
+    childBox.max.multiply(child.scale).add(child.position);
+    box.union(childBox);
+  }
+  return box;
+}
+
 // Intrinsic size (local-space bounding box × scale) — the object's own
 // width/height/depth regardless of how it's rotated in the world, matching
 // what "this cube is 200 mm" should mean.
@@ -601,10 +710,8 @@ function getObjectSizeMm(record) {
     const p = record.root.userData.windowParams;
     return new THREE.Vector3(p.width, p.height, p.thickness).multiply(record.root.scale);
   }
-  const mesh = record.root;
-  mesh.geometry.computeBoundingBox(); // cheap; re-run in case CSG just replaced the geometry
-  const size = mesh.geometry.boundingBox.getSize(new THREE.Vector3());
-  size.multiply(mesh.scale);
+  const size = localBoundingBox(record.root).getSize(new THREE.Vector3());
+  size.multiply(record.root.scale);
   return size;
 }
 
@@ -617,9 +724,153 @@ function axisGizmoLocalSize(record) {
     const p = record.root.userData.windowParams;
     return Math.max(p.width, p.height, p.thickness) * 0.6;
   }
-  record.root.geometry.computeBoundingBox();
-  const size = record.root.geometry.boundingBox.getSize(new THREE.Vector3());
+  const size = localBoundingBox(record.root).getSize(new THREE.Vector3());
   return Math.max(size.x, size.y, size.z) * 0.6;
+}
+
+// ---------------------------------------------------------------------------
+// Move + rotate gizmo — real 3D handles on the selected object (both
+// children of record.root, so they track its transform for free):
+//   - three thick arrows along local X/Y/Z: drag one to slide the object
+//     along that single axis (closest-point-between-two-lines math, the
+//     standard technique — robust from any camera angle).
+//   - three rings (a torus per axis, 3ds Max style): drag one to spin the
+//     object around that local axis, angle tracked in the ring's own plane.
+// Built once per selection at whatever size fits the object; since both
+// live under the object as children, resizing it afterward stretches them
+// along with it with no extra bookkeeping.
+// ---------------------------------------------------------------------------
+let gizmo = null;              // THREE.Group, child of selected.root
+let gizmoMoveTargets = [];     // meshes tagged with userData.gizmoAxis for move-drag hit testing
+let gizmoRotateTargets = [];   // meshes tagged with userData.gizmoAxis for rotate-drag hit testing
+let moveDragGizmo = null;      // { axisWorld, startPoint, startObjectPos }
+let rotateDragGizmo = null;    // { axisWorld, refU, refV, center, startAngle, startQuaternion }
+
+function buildGizmo(record) {
+  const size = axisGizmoLocalSize(record);
+  const group = new THREE.Group();
+  group.userData.isHelper = true; // never a "part" — explode/parts-of code must skip it
+  const moveTargets = [];
+  const rotateTargets = [];
+
+  // --- move arrows ---
+  const shaftLen = size * 0.9, shaftR = size * 0.035, headLen = size * 0.28, headR = size * 0.09;
+  const AXES = ['x', 'y', 'z'];
+  for (const axis of AXES) {
+    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, transparent: true, opacity: 0.95 });
+    const arrow = new THREE.Group();
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 10), mat);
+    shaft.position.y = shaftLen / 2;
+    shaft.renderOrder = 999;
+    const head = new THREE.Mesh(new THREE.ConeGeometry(headR, headLen, 10), mat);
+    head.position.y = shaftLen + headLen / 2;
+    head.renderOrder = 999;
+    arrow.add(shaft, head);
+    if (axis === 'x') arrow.rotation.z = -Math.PI / 2;
+    else if (axis === 'z') arrow.rotation.x = Math.PI / 2;
+    shaft.userData.gizmoAxis = axis;
+    head.userData.gizmoAxis = axis;
+    // Tagged directly (not just the outer group) so any selected.root.traverse()
+    // that walks past the group — colour/material pickers, explode's partsOf()
+    // — still recognises and skips these, instead of repainting the gizmo itself.
+    shaft.userData.isHelper = true;
+    head.userData.isHelper = true;
+    moveTargets.push(shaft, head);
+    group.add(arrow);
+  }
+
+  // --- rotate rings ---
+  const ringR = size * 0.85, tubeR = size * 0.03;
+  for (const axis of AXES) {
+    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
+    const torus = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), mat);
+    torus.renderOrder = 998;
+    if (axis === 'y') torus.rotateX(-Math.PI / 2);   // normal -> +Y (lies flat, spins around vertical)
+    else if (axis === 'x') torus.rotateY(Math.PI / 2); // normal -> +X
+    // z: default torus normal is already +Z
+    torus.userData.gizmoAxis = axis;
+    torus.userData.isHelper = true;
+    rotateTargets.push(torus);
+    group.add(torus);
+  }
+
+  return { group, moveTargets, rotateTargets };
+}
+
+function removeGizmo() {
+  if (!gizmo) return;
+  gizmo.parent?.remove(gizmo);
+  gizmo.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
+  gizmo = null;
+  gizmoMoveTargets = [];
+  gizmoRotateTargets = [];
+  moveDragGizmo = null;
+  rotateDragGizmo = null;
+}
+
+// Closest point on the infinite line (lineOrigin, lineDir) to the ray
+// (rayOrigin, rayDir) — standard skew-line formula, used to drag an object
+// smoothly along one world-space axis regardless of viewing angle.
+function closestPointOnLineToRay(lineOrigin, lineDir, rayOrigin, rayDir) {
+  const w0 = new THREE.Vector3().subVectors(lineOrigin, rayOrigin);
+  const a = lineDir.dot(lineDir), b = lineDir.dot(rayDir), c = rayDir.dot(rayDir);
+  const d = lineDir.dot(w0), e = rayDir.dot(w0);
+  const denom = a * c - b * b;
+  if (Math.abs(denom) < 1e-6) return lineOrigin.clone();
+  const t = (b * e - c * d) / denom;
+  return lineOrigin.clone().addScaledVector(lineDir, t);
+}
+
+function rayPlaneIntersect(rayOrigin, rayDir, planePoint, planeNormal) {
+  const denom = planeNormal.dot(rayDir);
+  if (Math.abs(denom) < 1e-6) return null;
+  const t = new THREE.Vector3().subVectors(planePoint, rayOrigin).dot(planeNormal) / denom;
+  return rayOrigin.clone().addScaledVector(rayDir, t);
+}
+
+function angleInPlane(point, center, refU, refV) {
+  const v = new THREE.Vector3().subVectors(point, center);
+  return Math.atan2(v.dot(refV), v.dot(refU));
+}
+
+const LOCAL_AXES = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) };
+const ROTATE_PLANE_REFS = { x: ['y', 'z'], y: ['x', 'z'], z: ['x', 'y'] };
+
+function beginMoveDrag(axisLetter, ray) {
+  const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(selected.root.matrixWorld).normalize();
+  const startPoint = closestPointOnLineToRay(selected.root.position, axisWorld, ray.ray.origin, ray.ray.direction);
+  moveDragGizmo = { axisWorld, startPoint, startObjectPos: selected.root.position.clone() };
+}
+
+function updateMoveDrag(ray) {
+  const newPoint = closestPointOnLineToRay(selected.root.position, moveDragGizmo.axisWorld, ray.ray.origin, ray.ray.direction);
+  const delta = new THREE.Vector3().subVectors(newPoint, moveDragGizmo.startPoint);
+  const pos = moveDragGizmo.startObjectPos.clone().add(delta);
+  selected.root.position.set(roundMm(pos.x), roundMm(pos.y), roundMm(pos.z));
+  outlineHelper?.update();
+}
+
+function beginRotateDrag(axisLetter, ray) {
+  const root = selected.root;
+  const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(root.matrixWorld).normalize();
+  const [uLetter, vLetter] = ROTATE_PLANE_REFS[axisLetter];
+  const refU = LOCAL_AXES[uLetter].clone().transformDirection(root.matrixWorld).normalize();
+  const refV = LOCAL_AXES[vLetter].clone().transformDirection(root.matrixWorld).normalize();
+  const center = root.position.clone();
+  const hit = rayPlaneIntersect(ray.ray.origin, ray.ray.direction, center, axisWorld);
+  if (!hit) return false;
+  rotateDragGizmo = { axisWorld, refU, refV, center, startAngle: angleInPlane(hit, center, refU, refV), startQuaternion: root.quaternion.clone() };
+  return true;
+}
+
+function updateRotateDrag(ray) {
+  const hit = rayPlaneIntersect(ray.ray.origin, ray.ray.direction, rotateDragGizmo.center, rotateDragGizmo.axisWorld);
+  if (!hit) return;
+  const angle = angleInPlane(hit, rotateDragGizmo.center, rotateDragGizmo.refU, rotateDragGizmo.refV);
+  const delta = angle - rotateDragGizmo.startAngle;
+  const deltaQuat = new THREE.Quaternion().setFromAxisAngle(rotateDragGizmo.axisWorld, delta);
+  selected.root.quaternion.multiplyQuaternions(deltaQuat, rotateDragGizmo.startQuaternion);
+  outlineHelper?.update();
 }
 
 // ---------------------------------------------------------------------------
@@ -653,10 +904,10 @@ function updateAxisLabels() {
     localMax = new THREE.Vector3(p.width / 2, p.height / 2, p.thickness / 2);
     sizeMm = new THREE.Vector3(p.width, p.height, p.thickness).multiply(root.scale);
   } else {
-    root.geometry.computeBoundingBox();
-    localMin = root.geometry.boundingBox.min;
-    localMax = root.geometry.boundingBox.max;
-    sizeMm = root.geometry.boundingBox.getSize(new THREE.Vector3()).multiply(root.scale);
+    const box = localBoundingBox(root);
+    localMin = box.min;
+    localMax = box.max;
+    sizeMm = box.getSize(new THREE.Vector3()).multiply(root.scale);
   }
   const localCenter = localMin.clone().add(localMax).multiplyScalar(0.5);
   // one arrow-to-arrow span per axis, running edge-to-edge through the centre
@@ -672,6 +923,15 @@ function updateAxisLabels() {
     return { x: (ndc.x * 0.5 + 0.5) * window.innerWidth, y: (-ndc.y * 0.5 + 0.5) * window.innerHeight, behind: ndc.z < -1 || ndc.z > 1 };
   };
 
+  // All three spans share the same centre point, so anchoring every label at
+  // its own line's exact midpoint puts all three labels on top of each other
+  // in screen space — that's the "solid clump of text" bug. Two independent
+  // fixes, combined: anchor each label 2/3 of the way toward its own line's
+  // end (not dead centre, so the three anchors land at genuinely different
+  // screen points), and give each axis a different perpendicular offset
+  // distance so even a coincidental viewing angle can't restack them.
+  const LABEL_ANCHOR_T = 0.68;
+  const LABEL_OFFSET_PX = { x: 14, y: 24, z: 34 };
   for (const axis of ['x', 'y', 'z']) {
     const [aLocal, bLocal] = ends[axis];
     const a = toScreen(aLocal), b = toScreen(bLocal);
@@ -679,13 +939,12 @@ function updateAxisLabels() {
     if (a.behind || b.behind || Math.hypot(a.x - b.x, a.y - b.y) < 6) { g.classList.add('hidden'); continue; }
     line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
     line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
-    // offset the label a little off the line itself so it doesn't sit on top of the arrow shaft
-    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const mx = a.x + (b.x - a.x) * LABEL_ANCHOR_T, my = a.y + (b.y - a.y) * LABEL_ANCHOR_T;
     const dx = b.x - a.x, dy = b.y - a.y;
     const len = Math.hypot(dx, dy) || 1;
     const nx = -dy / len, ny = dx / len; // perpendicular unit vector
-    text.setAttribute('x', mx + nx * 12);
-    text.setAttribute('y', my + ny * 12);
+    text.setAttribute('x', mx + nx * LABEL_OFFSET_PX[axis]);
+    text.setAttribute('y', my + ny * LABEL_OFFSET_PX[axis]);
     text.textContent = texts[axis];
     g.classList.remove('hidden');
   }
@@ -698,8 +957,7 @@ function getBaseAxisSizeMm(record, axis) {
     const p = record.root.userData.windowParams;
     return { x: p.width, y: p.height, z: p.thickness }[axis];
   }
-  record.root.geometry.computeBoundingBox();
-  return record.root.geometry.boundingBox.getSize(new THREE.Vector3())[axis] || 1;
+  return localBoundingBox(record.root).getSize(new THREE.Vector3())[axis] || 1;
 }
 
 // Live-updated while a two-finger pinch is scaling the selected object, so
@@ -827,7 +1085,7 @@ function buildRotationSection(record) {
 
 function currentPaintColor(record) {
   const meshes = [];
-  record.root.traverse((o) => { if (o.isMesh && o.userData.role !== 'glass') meshes.push(o); });
+  record.root.traverse((o) => { if (o.isMesh && o.userData.role !== 'glass' && !o.userData.isHelper) meshes.push(o); });
   const m = meshes[0]?.material;
   return m?.userData?.creslarnetColor || DEFAULT_PAINT;
 }
@@ -835,7 +1093,7 @@ function currentPaintColor(record) {
 function applyColorToSelected(color) {
   if (!selected) return;
   selected.root.traverse((o) => {
-    if (!o.isMesh || o.userData.role === 'glass') return;
+    if (!o.isMesh || o.userData.role === 'glass' || o.userData.isHelper) return;
     const type = o.material.userData.creslarnetType;
     const newMat = type && type !== 'paint' ? createMaterial(type, color, scene.environment) : createPaintMaterial(color);
     o.material.dispose();
@@ -848,7 +1106,7 @@ function applyMaterialToSelected(type) {
   if (!selected) return;
   const color = currentPaintColor(selected);
   selected.root.traverse((o) => {
-    if (!o.isMesh || o.userData.role === 'glass') return;
+    if (!o.isMesh || o.userData.role === 'glass' || o.userData.isHelper) return;
     const newMat = createMaterial(type, color, scene.environment);
     o.material.dispose();
     o.material = newMat;
@@ -1034,6 +1292,14 @@ function renderSelectionPanel() {
     attachBtn.className = 'pbtn'; attachBtn.textContent = '⚭ Прикріпити';
     attachBtn.addEventListener('click', attachSelectedPipe);
     actions.appendChild(attachBtn);
+  }
+
+  if (canExplode(selected)) {
+    const explodeBtn = document.createElement('button');
+    explodeBtn.className = 'pbtn';
+    explodeBtn.textContent = selected.exploded ? '🔧 Скласти назад' : '💥 Розібрати на частини';
+    explodeBtn.addEventListener('click', () => toggleExplode(selected));
+    actions.appendChild(explodeBtn);
   }
 
   const delBtn = document.createElement('button');
@@ -1335,7 +1601,24 @@ canvas.addEventListener('pointerdown', (e) => {
     primaryPointerId = e.pointerId;
     downX = e.clientX; downY = e.clientY; downTime = performance.now();
 
-    if (mode === 'edit' && moveMode && selected) {
+    // A gizmo just attached this frame (or one that hasn't been touched
+    // since) can still have a stale/identity matrixWorld if no render has
+    // run yet — force it current before raycasting, same as the paper-draw
+    // hit-test below does. Without this, a click that visually lands right
+    // on a ring can silently miss it and fall through to "look around".
+    if (mode === 'edit' && selected && gizmo) scene.updateMatrixWorld(true);
+    const gizmoHit = mode === 'edit' && selected && gizmo
+      ? rayFromClient(e.clientX, e.clientY).intersectObjects(gizmoMoveTargets.concat(gizmoRotateTargets), false)
+      : [];
+    if (gizmoHit.length) {
+      const hitMesh = gizmoHit[0].object;
+      const axisLetter = hitMesh.userData.gizmoAxis;
+      if (gizmoMoveTargets.includes(hitMesh)) {
+        beginMoveDrag(axisLetter, rayFromClient(e.clientX, e.clientY));
+      } else {
+        beginRotateDrag(axisLetter, rayFromClient(e.clientX, e.clientY));
+      }
+    } else if (mode === 'edit' && moveMode && selected) {
       moveDragging = true;
     } else if (mode === 'edit' && paperDrawing && selected) {
       scene.updateMatrixWorld(true);
@@ -1359,6 +1642,14 @@ canvas.addEventListener('pointerdown', (e) => {
 canvas.addEventListener('pointermove', (e) => {
   if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
+  if (moveDragGizmo && e.pointerId === primaryPointerId) {
+    updateMoveDrag(rayFromClient(e.clientX, e.clientY));
+    return;
+  }
+  if (rotateDragGizmo && e.pointerId === primaryPointerId) {
+    updateRotateDrag(rayFromClient(e.clientX, e.clientY));
+    return;
+  }
   if (activePointers.size === 2 && !moveMode && !paperDrawing) {
     const dist = currentPinchDist();
     if (selected && pinchStartScale) {
@@ -1405,9 +1696,11 @@ canvas.addEventListener('pointermove', (e) => {
 
 function endPointer(e) {
   const wasPinching = activePointers.size >= 2 && pinchStartDist > 0;
+  const wasGizmoDrag = !!(moveDragGizmo || rotateDragGizmo);
   activePointers.delete(e.pointerId);
   if (activePointers.size < 2) { pinchStartScale = null; pinchStartDist = 0; }
   if (lookPointerId === e.pointerId) lookPointerId = null;
+  if (e.pointerId === primaryPointerId) { moveDragGizmo = null; rotateDragGizmo = null; }
 
   if (e.type === 'pointercancel') {
     if (mode === 'edit' && moveMode) moveDragging = false;
@@ -1415,6 +1708,7 @@ function endPointer(e) {
     return;
   }
 
+  if (wasGizmoDrag) return; // a gizmo drag is never a tap
   if (mode === 'edit' && moveMode) { moveDragging = false; return; }
   if (mode === 'edit' && paperDrawing) {
     if (paperDrawDragging && drawStartWorld && selected && e.pointerId === primaryPointerId) {
@@ -1597,6 +1891,27 @@ function serializeObjectRecord(rec, positionOverride) {
       width: p.width, height: p.height, thickness: p.thickness, frameColor: p.frameColor,
     };
   }
+  if (rec.kind === 'compound') {
+    // Always save the COLLAPSED layout — a reloaded project starts intact,
+    // never mid-explosion — regardless of whether it's exploded right now.
+    const parts = partsOf(rec).map((child) => {
+      const pos = rec.explodeOriginal?.get(child) || child.position;
+      return {
+        geometry: child.geometry.toJSON(),
+        material: { type: child.material.userData.creslarnetType, color: child.material.userData.creslarnetColor },
+        position: pos.toArray(),
+        quaternion: child.quaternion.toArray(),
+        scale: child.scale.toArray(),
+      };
+    });
+    return {
+      id: rec.id, kind: 'compound',
+      position: (positionOverride || rec.root.position).toArray(),
+      quaternion: rec.root.quaternion.toArray(),
+      scale: rec.root.scale.toArray(),
+      parts,
+    };
+  }
   const mesh = rec.root;
   return {
     id: rec.id, kind: rec.kind, isPipe: !!rec.isPipe, wallLength: rec.wallLength,
@@ -1710,6 +2025,25 @@ function buildObjectFromItem(item) {
     group.quaternion.fromArray(item.quaternion);
     if (item.scale) group.scale.fromArray(item.scale);
     group.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+    return { root: group, extra: {} };
+  }
+  if (item.kind === 'compound') {
+    const group = new THREE.Group();
+    for (const p of item.parts) {
+      const geometry = parseGeometryJSON(p.geometry);
+      const material = p.material.type === 'paint'
+        ? createPaintMaterial(p.material.color)
+        : createMaterial(p.material.type, p.material.color, scene.environment);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.fromArray(p.position);
+      mesh.quaternion.fromArray(p.quaternion);
+      if (p.scale) mesh.scale.fromArray(p.scale);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      group.add(mesh);
+    }
+    group.quaternion.fromArray(item.quaternion);
+    if (item.scale) group.scale.fromArray(item.scale);
     return { root: group, extra: {} };
   }
   const geometry = parseGeometryJSON(item.geometry);
@@ -1870,6 +2204,15 @@ function renderGroupSelectPill() {
   });
   modePillEl.appendChild(mergeBtn);
 
+  const compoundBtn = document.createElement('button');
+  compoundBtn.textContent = '🧩 Групувати в об’єкт';
+  compoundBtn.addEventListener('click', () => {
+    if (groupSelection.size < 2) { toast('Оберіть щонайменше 2 об’єкти для групування'); return; }
+    groupSelectionIntoCompound([...groupSelection]);
+    exitGroupSelectMode();
+  });
+  modePillEl.appendChild(compoundBtn);
+
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'ghost';
   cancelBtn.textContent = 'Скасувати';
@@ -1922,6 +2265,105 @@ function mergeGroupSelection(records) {
     : `Об’єднано ${meshRecords.length} об’єктів в один. Колір/матеріал — від першого.`);
 }
 
+// Pulls a record's mesh(es) out of objects[]/raycastTargets WITHOUT
+// disposing anything — used when reparenting a whole object into a new
+// compound group, as opposed to removeObject() which deletes for good.
+function detachFromRegistry(rec) {
+  rec.root.traverse((o) => {
+    if (o.isMesh) {
+      const idx = raycastTargets.indexOf(o);
+      if (idx !== -1) raycastTargets.splice(idx, 1);
+    }
+  });
+  const idx = objects.indexOf(rec);
+  if (idx !== -1) objects.splice(idx, 1);
+  if (selected === rec) deselect();
+}
+
+// Bundles several independent objects into ONE selectable/movable object —
+// e.g. build a shoe or a chair out of several primitives, then group them so
+// they behave as a single thing (and can be exploded into their parts again,
+// or saved to "Мої об’єкти" as one reusable item). Unlike merge, this keeps
+// every part's own geometry/material/colour intact — nothing is fused.
+function groupSelectionIntoCompound(records) {
+  const groupable = records.filter((r) => r.root.isMesh);
+  const skipped = records.length - groupable.length;
+  if (groupable.length < 2) {
+    toast('Групування працює для простих об’єктів (не вікон) — оберіть щонайменше 2');
+    return;
+  }
+
+  const anchor = computeGroupAnchor(groupable);
+  const group = new THREE.Group();
+  group.position.copy(anchor);
+
+  for (const rec of groupable) {
+    detachFromRegistry(rec);
+    scene.remove(rec.root);
+    rec.root.position.sub(anchor); // world position preserved once reparented under `group`
+    group.add(rec.root);
+  }
+
+  const record = registerObject('compound', group, {});
+  select(record);
+  toast(skipped
+    ? `Згруповано ${groupable.length} об’єктів в один (вікна пропущено) — можна розібрати на частини`
+    : `Згруповано ${groupable.length} об’єктів в один — можна розібрати на частини`);
+}
+
+// ---------------------------------------------------------------------------
+// "Розібрати на частини" — for any object made of several parts (a window's
+// frame+glass, or a compound assembly like a shoe/chair built from several
+// primitives): nudge every part outward from the group's own centre so each
+// one is visible on its own. Pressing again restores every part's exact
+// original position — nothing is re-measured, just replayed from memory.
+// ---------------------------------------------------------------------------
+function partsOf(record) {
+  return record.root.children.filter((c) => c.isMesh && !c.userData.isHelper);
+}
+
+function canExplode(record) {
+  if (!record || record.kind === 'ground' || record.kind === 'sketchLine') return false;
+  return partsOf(record).length > 1;
+}
+
+function toggleExplode(record) {
+  const parts = partsOf(record);
+  if (parts.length < 2) return;
+
+  if (record.exploded) {
+    for (const child of parts) {
+      const orig = record.explodeOriginal?.get(child);
+      if (orig) child.position.copy(orig);
+    }
+    record.exploded = false;
+    record.explodeOriginal = null;
+  } else {
+    const originals = new Map();
+    const centroid = new THREE.Vector3();
+    for (const child of parts) { originals.set(child, child.position.clone()); centroid.add(child.position); }
+    centroid.divideScalar(parts.length);
+
+    const localSize = localBoundingBox(record.root).getSize(new THREE.Vector3());
+    const spread = Math.max(localSize.x, localSize.y, localSize.z, 60) * EXPLODE_SPREAD_FACTOR;
+
+    for (const child of parts) {
+      const dir = new THREE.Vector3().subVectors(child.position, centroid);
+      if (dir.lengthSq() < 1) {
+        // a part sitting exactly at the centroid (rare) still needs to move
+        // somewhere — nudge it upward so it doesn't stay hidden inside the rest
+        dir.set(0, 1, 0);
+      }
+      dir.normalize();
+      child.position.addScaledVector(dir, spread);
+    }
+    record.explodeOriginal = originals;
+    record.exploded = true;
+  }
+  outlineHelper?.update();
+  renderSelectionPanel();
+}
+
 document.getElementById('fileInput').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -1968,6 +2410,7 @@ window.__creslarnet3d = {
   get objects() { return objects; },
   get selected() { return selected; },
   scene, camera, renderer,
+  buildProjectData, loadProject, select, canExplode, toggleExplode,
   // fly the camera to look at a world point from a fixed relative offset —
   // handy for debugging/testing since there's no orbit pivot to aim any more
   lookAt(pos, distance = 3000) {
@@ -1975,5 +2418,16 @@ window.__creslarnet3d = {
     const offset = new THREE.Vector3(0.35, 0.35, 1).normalize().multiplyScalar(distance);
     camera.position.copy(target).add(offset);
     faceDirection(new THREE.Vector3().subVectors(target, camera.position).normalize());
+  },
+  debugGizmo(x, y) {
+    scene.updateMatrixWorld(true);
+    const hits = rayFromClient(x, y).intersectObjects(gizmoMoveTargets.concat(gizmoRotateTargets), false);
+    return {
+      moveTargetCount: gizmoMoveTargets.length,
+      rotateTargetCount: gizmoRotateTargets.length,
+      hits: hits.map((h) => ({ axis: h.object.userData.gizmoAxis, isRotate: gizmoRotateTargets.includes(h.object), distance: h.distance })),
+      moveDragActive: !!moveDragGizmo,
+      rotateDragActive: !!rotateDragGizmo,
+    };
   },
 };

@@ -298,8 +298,8 @@ html, body {
 .dim-group.hidden { display: none; }
 .dim-line { stroke-width: 1.5; }
 .dim-line-x { stroke: #d83e3e; }
-.dim-line-y { stroke: #3aa85a; }
-.dim-line-z { stroke: #3a6cd8; }
+.dim-line-y { stroke: #3a6cd8; }
+.dim-line-z { stroke: #3aa85a; }
 .dim-text {
   font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 11px;
@@ -312,8 +312,8 @@ html, body {
   dominant-baseline: middle;
 }
 .dim-text-x { fill: #ff8f8f; }
-.dim-text-y { fill: #7be09a; }
-.dim-text-z { fill: #8fb4ff; }
+.dim-text-y { fill: #8fb4ff; }
+.dim-text-z { fill: #7be09a; }
 
 /* ---------- object dimension readout ---------- */
 .dim-readout {
