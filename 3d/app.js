@@ -1251,6 +1251,7 @@ function cancelSpatialLine() {
   clearSpatialLinePreview();
   hideSpatialLineLengthLabel();
   hideEl(modePillEl);
+  document.getElementById('spatialLineFab')?.classList.remove('on');
 }
 
 // Reuses the sketch-line conversion geometry (pipe/rebar build along local
@@ -1315,6 +1316,7 @@ function finishSpatialLine() {
   clearSpatialLinePreview();
   hideSpatialLineLengthLabel();
   hideEl(modePillEl);
+  document.getElementById('spatialLineFab')?.classList.remove('on');
   select(record);
   toast(`Лінію завершено — ${points.length} точок, ${formatMm(totalLen, 0)} мм. Оберіть, у що перетворити.`);
 }
@@ -2567,27 +2569,6 @@ function buildPopoverContent(panel) {
     popoverEl.appendChild(toggleRow);
   }
 
-  if (panel === 'spatialline') {
-    const h = document.createElement('h3'); h.textContent = 'Просторова лінія'; popoverEl.appendChild(h);
-    const hint = document.createElement('p');
-    hint.className = 'dim-readout';
-    hint.textContent = 'Малюйте лінію вільно у просторі: перший дотик ставить точку, далі тягніть стрілку гізмо в потрібному напрямку (кільце — щоб задати кут, наприклад 45°), відпустіть — точка додасться. «✓ Завершити», коли лінія готова — тоді її можна перетворити на трубу, провід чи арматуру.';
-    popoverEl.appendChild(hint);
-    const row = document.createElement('div'); row.className = 'panel-row';
-    const startBtn = document.createElement('button');
-    startBtn.className = 'pbtn wide';
-    startBtn.textContent = '✎ Малювати';
-    startBtn.addEventListener('click', () => {
-      spatialLineActive = true;
-      deselect();
-      closePopover();
-      renderSpatialLinePill();
-      toast('Торкніться, щоб поставити першу точку лінії');
-    });
-    row.appendChild(startBtn);
-    popoverEl.appendChild(row);
-  }
-
   if (panel === 'walls') {
     const h = document.createElement('h3'); h.textContent = 'Стіни будинку'; popoverEl.appendChild(h);
     const row = document.createElement('div'); row.className = 'panel-row';
@@ -3198,6 +3179,22 @@ function wireZoomButton(btn, stepSign) {
 }
 wireZoomButton(document.getElementById('zoomInBtn'), 1);   // dolly forward — closer
 wireZoomButton(document.getElementById('zoomOutBtn'), -1); // dolly backward — see more (e.g. a whole nearby wall)
+
+// "Просторова лінія" gets its own corner button (not buried in the
+// scrollable bottom toolbar) — one tap starts it, tap again to cancel.
+const spatialLineFabBtn = document.getElementById('spatialLineFab');
+spatialLineFabBtn.addEventListener('click', () => {
+  if (spatialLineActive) {
+    cancelSpatialLine();
+    spatialLineFabBtn.classList.remove('on');
+    return;
+  }
+  spatialLineActive = true;
+  deselect();
+  spatialLineFabBtn.classList.add('on');
+  renderSpatialLinePill();
+  toast('Торкніться, щоб поставити першу точку лінії');
+});
 
 function enterWalkMode() {
   mode = 'walk';
