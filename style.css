@@ -582,6 +582,15 @@ html, body {
   display: flex;
   gap: 8px;
   margin-top: 14px;
+  /* Sticky to the bottom of the scrolling modal, not just appended after
+     the content — with two canvases plus the sensitivity slider, the
+     content can run taller than the screen on a phone, and a save button
+     you have to scroll to find reads as "there's no save button". */
+  position: sticky;
+  bottom: 0;
+  padding: 10px 0 2px;
+  background: var(--panel-bg);
+  box-shadow: 0 -8px 10px -4px rgba(0, 0, 0, 0.08);
 }
 .scan-modal-actions .action-btn { margin-bottom: 0; flex: 1; }
 .scan-modal-actions .primary {
