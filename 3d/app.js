@@ -2458,6 +2458,56 @@ function renderBendPill() {
 }
 
 // ---------------------------------------------------------------------------
+// "Різьба" — a helical ridge (a thin tube wound in a spiral, the standard
+// cheap-but-honest way to fake a screw thread visually without an actual
+// boolean cut) added near one end of a pipe/rebar, from a pitch and a
+// length. Added as a child mesh of the object's own root rather than
+// merged into its geometry — moves/scales/recolours with the parent for
+// free, at the cost of not round-tripping through project save/load
+// (serializeObjectRecord only captures the root mesh's own geometry) —
+// a real but acceptable limitation, same category as a few other things
+// this session (a bent object's exact curve isn't re-editable either).
+// ---------------------------------------------------------------------------
+class HelixCurve extends THREE.Curve {
+  constructor(radius, pitch, length, startX, direction) {
+    super();
+    this.radius = radius;
+    this.length = length;
+    this.startX = startX;
+    this.direction = direction; // +1 or -1 — which way along local X the thread runs from startX
+    this.turns = Math.max(1, length / Math.max(0.5, pitch));
+  }
+  getPoint(t, target = new THREE.Vector3()) {
+    const angle = t * this.turns * Math.PI * 2;
+    target.set(this.startX + this.direction * t * this.length, this.radius * Math.cos(angle), this.radius * Math.sin(angle));
+    return target;
+  }
+}
+
+function addThreadToObject(record, atStart, pitch, length) {
+  if (!record.root.isMesh) return;
+  const orig = measureBendable(record); // same bounding-box measurement the bend tool uses
+  const outerR = Math.max(orig.halfY, orig.halfZ, 3);
+  const halfLen = orig.length / 2;
+  const clampedLen = Math.max(2, Math.min(length, orig.length * 0.9));
+  const startX = atStart ? -halfLen : halfLen;
+  const direction = atStart ? 1 : -1; // always grows inward from the chosen end
+
+  try {
+    const curve = new HelixCurve(outerR, pitch, clampedLen, startX, direction);
+    const tubeR = Math.max(0.6, pitch * 0.22);
+    const tubularSegments = Math.max(24, Math.round(curve.turns * 14));
+    const geometry = new THREE.TubeGeometry(curve, tubularSegments, tubeR, 6, false);
+    const mesh = new THREE.Mesh(geometry, createPaintMaterial('#9a9a9a'));
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    record.root.add(mesh);
+  } catch (e) {
+    toast('Не вдалося додати різьбу тут — спробуйте інший крок або довжину');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Selection panel rendering
 // ---------------------------------------------------------------------------
 const selectionPanelEl = document.getElementById('selectionPanel');
@@ -2620,6 +2670,48 @@ function renderSelectionPanel() {
     bendBtn.className = 'pbtn'; bendBtn.textContent = '🦾 Зігнути';
     bendBtn.addEventListener('click', () => enterBendMode(selected));
     actions.appendChild(bendBtn);
+  }
+
+  if (selected.root.isMesh && ['pipe', 'rebar'].includes(selected.kind)) {
+    const threadLabel = document.createElement('p');
+    threadLabel.className = 'dim-readout';
+    threadLabel.textContent = 'Різьба на кінці:';
+    selectionPanelEl.appendChild(threadLabel);
+
+    let threadAtStart = true, threadPitch = 2, threadLen = 20;
+
+    const endRow = document.createElement('div'); endRow.className = 'panel-row';
+    const startEndBtn = document.createElement('button'); startEndBtn.className = 'pbtn on'; startEndBtn.textContent = 'Початок';
+    const endEndBtn = document.createElement('button'); endEndBtn.className = 'pbtn'; endEndBtn.textContent = 'Кінець';
+    startEndBtn.addEventListener('click', () => { threadAtStart = true; startEndBtn.classList.add('on'); endEndBtn.classList.remove('on'); });
+    endEndBtn.addEventListener('click', () => { threadAtStart = false; endEndBtn.classList.add('on'); startEndBtn.classList.remove('on'); });
+    endRow.append(startEndBtn, endEndBtn);
+    selectionPanelEl.appendChild(endRow);
+
+    function stepperRow(labelText, get, set, step, min) {
+      const row = document.createElement('div'); row.className = 'dim-row';
+      const label = document.createElement('span'); label.className = 'dim-label'; label.textContent = labelText;
+      const minus = document.createElement('button'); minus.className = 'dim-step'; minus.textContent = '–';
+      const val = document.createElement('span'); val.className = 'dim-input'; val.style.textAlign = 'center';
+      const plus = document.createElement('button'); plus.className = 'dim-step'; plus.textContent = '+';
+      const refresh = () => { val.textContent = `${formatMm(get())} мм`; };
+      refresh();
+      minus.addEventListener('click', () => { set(Math.max(min, roundMm(get() - step))); refresh(); });
+      plus.addEventListener('click', () => { set(roundMm(get() + step)); refresh(); });
+      row.append(label, minus, val, plus);
+      return row;
+    }
+    selectionPanelEl.appendChild(stepperRow('Крок різьби', () => threadPitch, (v) => { threadPitch = v; }, 0.5, 0.5));
+    selectionPanelEl.appendChild(stepperRow('Довжина різьби', () => threadLen, (v) => { threadLen = v; }, 5, 5));
+
+    const addThreadBtn = document.createElement('button');
+    addThreadBtn.className = 'pbtn wide';
+    addThreadBtn.textContent = '🔩 Додати різьбу';
+    addThreadBtn.addEventListener('click', () => {
+      addThreadToObject(selected, threadAtStart, threadPitch, threadLen);
+      toast('Різьбу додано');
+    });
+    selectionPanelEl.appendChild(addThreadBtn);
   }
 
   if (canExplode(selected)) {
