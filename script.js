@@ -967,6 +967,9 @@ if ('serviceWorker' in navigator) {
       } else if (selected.type === 'circle' || selected.type === 'arc') {
         const c = mmToPx({ x: selected.cx, y: selected.cy });
         ctx.beginPath(); ctx.arc(c.x, c.y, selected.r * view.scale + pad, 0, Math.PI * 2); ctx.stroke();
+      } else if (selected.type === 'gear') {
+        const c = mmToPx({ x: selected.cx, y: selected.cy });
+        ctx.beginPath(); ctx.arc(c.x, c.y, (selected.outerD / 2) * view.scale + pad, 0, Math.PI * 2); ctx.stroke();
       } else if (selected.type === 'leader') {
         const g = leaderGeometry(selected);
         const xs = [g.p1.x, g.p2.x, g.p3.x], ys = [g.p1.y, g.p2.y, g.p3.y];

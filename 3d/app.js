@@ -2999,7 +2999,7 @@ canvas.addEventListener('pointerdown', (e) => {
       lookPointerId = e.pointerId;
       lastLookX = e.clientX; lastLookY = e.clientY;
     }
-  } else if (activePointers.size === 2 && !moveMode && !paperDrawing) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag) {
     pinchStartDist = currentPinchDist();
     // with something selected, pinch resizes it; otherwise it drives the camera
     pinchStartScale = selected ? selected.root.scale.clone() : null;
@@ -3018,7 +3018,7 @@ canvas.addEventListener('pointermove', (e) => {
     updateRotateDrag(e.clientX, e.clientY);
     return;
   }
-  if (activePointers.size === 2 && !moveMode && !paperDrawing) {
+  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag) {
     const dist = currentPinchDist();
     if (selected && pinchStartScale) {
       if (pinchStartDist > 10) {
