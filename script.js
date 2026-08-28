@@ -665,10 +665,68 @@ if ('serviceWorker' in navigator) {
   const SCAN_MAX_SHAPES = 400;
   const SCAN_MIN_PATH_PX = 14; // discard specks/noise shorter than this
 
+  // 'Вирівняти лінії' — optional cleanup after tracing: merges consecutive
+  // segments that are nearly the same direction (removes the stair-step
+  // jitter a raw skeleton trace has even after RDP simplification), snaps
+  // any segment already close to a common drafting angle (0/45/90/135°) to
+  // exactly that angle, and finally collapses a path that ends up nearly
+  // straight end-to-end into a true 2-point line. This is what turns "a
+  // traced photo" into "a clean drawing" — off, you get the literal traced
+  // skeleton, wobble included.
+  const STRAIGHTEN_COLINEAR_DEG = 6;      // merge segments whose direction differs by less than this
+  const STRAIGHTEN_SNAP_DEG = 4;          // snap a segment within this many degrees of a "nice" angle
+  const STRAIGHTEN_COLLAPSE_RATIO = 0.01; // collapse to one line if max deviation < 1% of its length
+
+  function segAngleDeg(a, b) { return (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI; }
+  function angleDiffDeg(a, b) { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; }
+
+  function pathMaxDeviationPx(points) {
+    const first = points[0], last = points[points.length - 1];
+    let max = 0;
+    for (let i = 1; i < points.length - 1; i++) max = Math.max(max, perpendicularDistance(points[i], first, last));
+    return max;
+  }
+
+  function straightenPath(points) {
+    if (points.length < 3) return points;
+
+    // 1. merge consecutive near-colinear segments
+    const merged = [points[0]];
+    for (let i = 1; i < points.length - 1; i++) {
+      const a = merged[merged.length - 1], b = points[i], c = points[i + 1];
+      if (angleDiffDeg(segAngleDeg(a, b), segAngleDeg(b, c)) > STRAIGHTEN_COLINEAR_DEG) merged.push(b);
+    }
+    merged.push(points[points.length - 1]);
+
+    // 2. snap each remaining segment to the nearest 45° step when close
+    const snapped = [merged[0]];
+    for (let i = 1; i < merged.length; i++) {
+      const a = snapped[snapped.length - 1], b = merged[i];
+      const len = Math.hypot(b.x - a.x, b.y - a.y);
+      const ang = segAngleDeg(a, b);
+      const nice = Math.round(ang / 45) * 45;
+      if (angleDiffDeg(ang, nice) <= STRAIGHTEN_SNAP_DEG) {
+        const rad = (nice * Math.PI) / 180;
+        snapped.push({ x: a.x + Math.cos(rad) * len, y: a.y + Math.sin(rad) * len });
+      } else {
+        snapped.push(b);
+      }
+    }
+
+    // 3. a path that ends up nearly straight end-to-end collapses to one line
+    if (snapped.length > 2) {
+      const straightLen = pathLengthPx([snapped[0], snapped[snapped.length - 1]]);
+      if (straightLen > 0 && pathMaxDeviationPx(snapped) < straightLen * STRAIGHTEN_COLLAPSE_RATIO) {
+        return [snapped[0], snapped[snapped.length - 1]];
+      }
+    }
+    return snapped;
+  }
+
   // The full pipeline, from a straightened photo canvas to ready-to-use
   // mm-space line/polyline shape data. Kept separate from any DOM/UI so it
   // can run against a synthetic canvas in tests, not just a real photo.
-  function runScanPipeline(correctedCanvas, sensitivity, mmW, mmH, offsetXmm, offsetYmm) {
+  function runScanPipeline(correctedCanvas, sensitivity, mmW, mmH, offsetXmm, offsetYmm, straighten = true) {
     const { gray, width, height } = toGrayscale(correctedCanvas);
     const threshold = otsuThreshold(gray);
     const bin = binarize(gray, threshold, sensitivity);
@@ -677,6 +735,7 @@ if ('serviceWorker' in navigator) {
     const epsilon = Math.max(1.2, Math.min(width, height) * 0.003);
     let simplified = rawPaths
       .map((p) => simplifyRDP(p, epsilon))
+      .map((p) => (straighten ? straightenPath(p) : p))
       .filter((p) => p.length >= 2 && pathLengthPx(p) >= SCAN_MIN_PATH_PX);
     simplified.sort((a, b) => pathLengthPx(b) - pathLengthPx(a));
     const dropped = Math.max(0, simplified.length - SCAN_MAX_SHAPES);
@@ -1158,6 +1217,7 @@ if ('serviceWorker' in navigator) {
   const scanPhotoCanvas = document.getElementById('scanPhotoCanvas');
   const scanPreviewCanvas = document.getElementById('scanPreviewCanvas');
   const scanSensitivityInput = document.getElementById('scanSensitivity');
+  const scanStraightenInput = document.getElementById('scanStraighten');
   const scanStatusEl = document.getElementById('scanStatus');
 
   let scanState = null; // { img, fullCanvas, dispW, dispH, corners: [{x,y}x4] }
@@ -1321,8 +1381,9 @@ if ('serviceWorker' in navigator) {
 
       const corrected = warpPerspective(scanState.fullCanvas, srcCorners, pxW, pxH);
       const sensitivity = Number(scanSensitivityInput.value) / 100;
+      const straighten = scanStraightenInput ? scanStraightenInput.checked : true;
       const offsetX = Math.max(0, (pageW() - mmW) / 2), offsetY = Math.max(0, (pageH() - mmH) / 2);
-      const { shapes: newShapes, dropped } = runScanPipeline(corrected, sensitivity, mmW, mmH, offsetX, offsetY);
+      const { shapes: newShapes, dropped } = runScanPipeline(corrected, sensitivity, mmW, mmH, offsetX, offsetY, straighten);
 
       shapes.push(...newShapes);
       requestRedraw();
@@ -1946,7 +2007,7 @@ if ('serviceWorker' in navigator) {
     buildProjectData2D, loadProject2D, saveProject2D,
     hasTileImage: (id) => tileImageCache.has(id),
     computeTileGrid,
-    warpPerspective, runScanPipeline, solveHomography, applyHomography,
+    warpPerspective, runScanPipeline, straightenPath, solveHomography, applyHomography,
     zhangSuenThin, traceSkeleton, simplifyRDP, otsuThreshold, toGrayscale, binarize,
   };
 })();
