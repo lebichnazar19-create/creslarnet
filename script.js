@@ -36,9 +36,15 @@ if ('serviceWorker' in navigator) {
 
   const view = { scale: 1, offsetX: 0, offsetY: 0 }; // offsetX/Y = screen-px position of mm-origin (0,0)
 
+  // The canvas is now the whole screen (see style.css), so this fit IS the
+  // real device screen size — rect.width/height come straight off the
+  // fullscreen canvas element, in real CSS pixels for this device. A small
+  // margin still keeps the drafting frame off the very edge (bezel/notch),
+  // but the sheet otherwise fills as much of the actual screen as its
+  // proportions allow.
   function fitPageToView() {
     const rect = canvas.getBoundingClientRect();
-    const margin = 36;
+    const margin = 10;
     const availW = Math.max(50, rect.width - margin * 2);
     const availH = Math.max(50, rect.height - margin * 2);
     view.scale = Math.min(availW / pageW(), availH / pageH(), MAX_SCALE);
@@ -86,6 +92,23 @@ if ('serviceWorker' in navigator) {
   let nextId = 1;
   let shapes = [];
   let selected = null;
+
+  // ---------------------------------------------------------------------
+  // Project — an optional "book of pages", each with its own shapes array.
+  // With no project, the app behaves exactly as a single implicit sheet
+  // always has (nothing below is engaged, `shapes` is just used directly).
+  // Every place that reassigns `shapes` wholesale (clear, delete, erase, a
+  // page switch) goes through setShapes() so the active page's array
+  // inside `project` never drifts out of sync with what's actually on
+  // screen — a plain `shapes = x` would silently orphan the old array.
+  // ---------------------------------------------------------------------
+  let project = null; // { name, pages: [{ number, shapes }] } | null
+  let currentPageIndex = 0;
+
+  function setShapes(newShapes) {
+    shapes = newShapes;
+    if (project) project.pages[currentPageIndex].shapes = shapes;
+  }
 
   const KIND_LABELS = {
     line: 'Лінія', rect: 'Прямокутник', circle: 'Коло', arc: 'Дуга', leader: 'Виноска',
@@ -898,6 +921,139 @@ if ('serviceWorker' in navigator) {
   }
 
   // ---------------------------------------------------------------------
+  // Tools / project drawers — both hidden until their own edge button is
+  // tapped, both fixed overlays that never resize the canvas underneath.
+  // ---------------------------------------------------------------------
+  const toolsDrawerEl = document.getElementById('toolsDrawer');
+  const projectDrawerEl = document.getElementById('projectDrawer');
+  const drawerBackdropEl = document.getElementById('drawerBackdrop');
+
+  function openDrawer(el) {
+    toolsDrawerEl.classList.toggle('open', el === toolsDrawerEl);
+    projectDrawerEl.classList.toggle('open', el === projectDrawerEl);
+    drawerBackdropEl.classList.remove('hidden');
+  }
+  function closeDrawers() {
+    toolsDrawerEl.classList.remove('open');
+    projectDrawerEl.classList.remove('open');
+    drawerBackdropEl.classList.add('hidden');
+  }
+
+  document.getElementById('toolsFabBtn').addEventListener('click', () => openDrawer(toolsDrawerEl));
+  document.getElementById('toolsDrawerClose').addEventListener('click', closeDrawers);
+  document.getElementById('projectFabBtn').addEventListener('click', () => { renderProjectPanel(); openDrawer(projectDrawerEl); });
+  document.getElementById('projectDrawerClose').addEventListener('click', closeDrawers);
+  drawerBackdropEl.addEventListener('click', closeDrawers);
+
+  // ---------------------------------------------------------------------
+  // Project — "Створити проект" names it and starts page 1 from whatever's
+  // already on the sheet; "+" appends an auto-numbered page; the number
+  // field jumps straight to any page, however far into the book.
+  // ---------------------------------------------------------------------
+  function createProject(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    project = { name: trimmed, pages: [{ number: 1, shapes }] };
+    currentPageIndex = 0;
+    deselect();
+    renderProjectPanel();
+  }
+
+  function addPage() {
+    if (!project) return;
+    const number = project.pages.length + 1;
+    project.pages.push({ number, shapes: [] });
+    switchToPage(project.pages.length - 1);
+    renderProjectPanel();
+  }
+
+  function switchToPage(index) {
+    if (!project || !project.pages[index]) return;
+    if (polylineDraft) cancelPolyline();
+    currentPageIndex = index;
+    setShapes(project.pages[index].shapes);
+    deselect();
+    fitPageToView();
+    renderProjectPanel();
+  }
+
+  function goToPageNumber(num) {
+    if (!project) return;
+    const idx = project.pages.findIndex((p) => p.number === num);
+    if (idx === -1) { flashHint(`Сторінки № ${num} не існує`); return; }
+    switchToPage(idx);
+  }
+
+  function renderProjectPanel() {
+    const body = document.getElementById('projectDrawerBody');
+    body.innerHTML = '';
+
+    if (!project) {
+      const group = document.createElement('div');
+      group.className = 'tool-group';
+      const h = document.createElement('h2'); h.textContent = 'Новий проект'; group.appendChild(h);
+
+      const field = document.createElement('div'); field.className = 'project-field';
+      const label = document.createElement('label'); label.htmlFor = 'projectNameInput'; label.textContent = 'Назва проекту';
+      const input = document.createElement('input'); input.type = 'text'; input.id = 'projectNameInput';
+      input.placeholder = 'Наприклад, Дизайн гаража';
+      field.appendChild(label); field.appendChild(input);
+      group.appendChild(field);
+
+      const createBtn = document.createElement('button');
+      createBtn.className = 'action-btn'; createBtn.textContent = '➕ Створити проект';
+      const submit = () => createProject(input.value);
+      createBtn.addEventListener('click', submit);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+      group.appendChild(createBtn);
+      body.appendChild(group);
+
+      const hint = document.createElement('p');
+      hint.className = 'hint-text';
+      hint.textContent = 'Без проекту застосунок працює як один аркуш. Проект дозволяє тримати кілька пронумерованих сторінок в одній роботі — як книжку.';
+      body.appendChild(hint);
+      return;
+    }
+
+    const infoGroup = document.createElement('div'); infoGroup.className = 'tool-group';
+    const name = document.createElement('p'); name.className = 'project-name'; name.textContent = project.name;
+    const status = document.createElement('p'); status.className = 'hint-text';
+    status.textContent = `Сторінка ${project.pages[currentPageIndex].number} із ${project.pages.length}`;
+    const addBtn = document.createElement('button'); addBtn.className = 'action-btn'; addBtn.textContent = '➕ Додати сторінку';
+    addBtn.addEventListener('click', addPage);
+    infoGroup.appendChild(name); infoGroup.appendChild(status); infoGroup.appendChild(addBtn);
+    body.appendChild(infoGroup);
+
+    const jumpGroup = document.createElement('div'); jumpGroup.className = 'tool-group';
+    const jh = document.createElement('h2'); jh.textContent = 'Перейти на сторінку'; jumpGroup.appendChild(jh);
+    const jumpRow = document.createElement('div'); jumpRow.className = 'project-jump-row';
+    const jumpInput = document.createElement('input'); jumpInput.type = 'number'; jumpInput.min = '1';
+    jumpInput.placeholder = `1–${project.pages.length}`;
+    const jumpBtn = document.createElement('button'); jumpBtn.textContent = 'Перейти';
+    const jump = () => { const n = parseInt(jumpInput.value, 10); if (Number.isFinite(n)) goToPageNumber(n); };
+    jumpBtn.addEventListener('click', jump);
+    jumpInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') jump(); });
+    jumpRow.appendChild(jumpInput); jumpRow.appendChild(jumpBtn);
+    jumpGroup.appendChild(jumpRow);
+    body.appendChild(jumpGroup);
+
+    const listGroup = document.createElement('div'); listGroup.className = 'tool-group';
+    const lh = document.createElement('h2'); lh.textContent = 'Сторінки'; listGroup.appendChild(lh);
+    const list = document.createElement('div'); list.className = 'page-list';
+    project.pages.forEach((page, idx) => {
+      const btn = document.createElement('button');
+      btn.className = 'page-list-btn' + (idx === currentPageIndex ? ' active' : '');
+      const numSpan = document.createElement('span'); numSpan.className = 'page-list-num'; numSpan.textContent = `№ ${page.number}`;
+      const countSpan = document.createElement('span'); countSpan.textContent = `${page.shapes.length} об’єкт(ів)`;
+      btn.appendChild(numSpan); btn.appendChild(countSpan);
+      btn.addEventListener('click', () => switchToPage(idx));
+      list.appendChild(btn);
+    });
+    listGroup.appendChild(list);
+    body.appendChild(listGroup);
+  }
+
+  // ---------------------------------------------------------------------
   // Tool state
   // ---------------------------------------------------------------------
   const state = { tool: 'select', color: '#1a1a1a', lineWidthMm: 0.8 };
@@ -911,6 +1067,9 @@ if ('serviceWorker' in navigator) {
       btn.classList.add('active');
       state.tool = btn.dataset.tool;
       if (state.tool !== 'select') deselect();
+      // Picking a tool is the signal to get out of the way again — see the
+      // "toolbar isn't permanently expanded" requirement.
+      closeDrawers();
     });
   });
 
@@ -977,16 +1136,17 @@ if ('serviceWorker' in navigator) {
     reader.readAsDataURL(file);
   });
 
-  // Brief transient status in the hint bar — the closest thing this mode has
-  // to a toast, reused so the scan flow doesn't need its own notification UI.
+  // Brief transient toast over the sheet — used for scan-pipeline status,
+  // page-jump errors, etc. Invisible and empty until called, so it never
+  // takes up permanent screen space the way the old persistent hint bar did.
   const canvasHintEl = document.getElementById('canvasHint');
-  const canvasHintDefault = canvasHintEl ? canvasHintEl.textContent : '';
   let hintTimer = null;
   function flashHint(msg, ms = 4000) {
     if (!canvasHintEl) return;
     canvasHintEl.textContent = msg;
+    canvasHintEl.classList.add('show');
     clearTimeout(hintTimer);
-    hintTimer = setTimeout(() => { canvasHintEl.textContent = canvasHintDefault; }, ms);
+    hintTimer = setTimeout(() => { canvasHintEl.classList.remove('show'); }, ms);
   }
 
   // -----------------------------------------------------------------------
@@ -1182,7 +1342,7 @@ if ('serviceWorker' in navigator) {
   });
   document.getElementById('clearBtn').addEventListener('click', () => {
     if (!shapes.length) return;
-    if (confirm('Очистити все полотно?')) { shapes = []; deselect(); requestRedraw(); }
+    if (confirm('Очистити все полотно?')) { setShapes([]); deselect(); requestRedraw(); }
   });
 
   // ---------------------------------------------------------------------
@@ -1326,7 +1486,7 @@ if ('serviceWorker' in navigator) {
     delBtn.className = 'dim-delete';
     delBtn.textContent = '🗑 Видалити';
     delBtn.addEventListener('click', () => {
-      shapes = shapes.filter((s) => s !== selected);
+      setShapes(shapes.filter((s) => s !== selected));
       deselect();
     });
     dimPanel.appendChild(delBtn);
@@ -1363,7 +1523,7 @@ if ('serviceWorker' in navigator) {
     const hit = hitTest(clientX, clientY);
     if (!hit) return;
     if (selected === hit) deselect();
-    shapes = shapes.filter((s) => s !== hit);
+    setShapes(shapes.filter((s) => s !== hit));
     requestRedraw();
   }
 
@@ -1640,12 +1800,25 @@ if ('serviceWorker' in navigator) {
   });
 
   // ---------------------------------------------------------------------
-  window.addEventListener('resize', () => { resizeCanvas(); });
+  // Any actual viewport change (rotate, browser chrome show/hide, a
+  // desktop window resize) re-fits the sheet fresh instead of nudging the
+  // existing pan/zoom — that's what stops it "wandering": every layout
+  // change lands it back centred and maximised for the new screen size
+  // rather than drifting from wherever it happened to be. Opening/closing
+  // a drawer never fires any of this — the drawers are fixed overlays that
+  // don't touch the canvas's own size.
+  function handleViewportChange() { resizeCanvas(); fitPageToView(); }
+  window.addEventListener('resize', handleViewportChange);
+  window.addEventListener('orientationchange', handleViewportChange);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', handleViewportChange);
   resizeCanvas();
   fitPageToView();
   frame();
+  flashHint('Лист зафіксований — панорамування тільки свідомим перетягуванням порожнього місця · два пальці — масштаб', 6000);
 
   window.__creslarnet2d = {
+    get project() { return project; },
+    get currentPageIndex() { return currentPageIndex; },
     get shapes() { return shapes; },
     get selected() { return selected; },
     get pageKey() { return pageKey; },

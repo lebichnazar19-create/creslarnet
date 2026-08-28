@@ -100,7 +100,31 @@ function grassTexture(color) {
   });
 }
 
-const REPEAT = { glass: 1, tile: 2, fabric: 3, wood: 1.5, metal: 1, grass: 10 };
+// AutoCAD-style reference grid, baked straight into the ground's own
+// texture instead of a separate helper mesh hovering just above it. A
+// hovering grid has to sit at *some* height to avoid z-fighting with the
+// ground — but that same height then floats it above every room floor and
+// object base sitting flush on the ground, so the grid lines visibly cut
+// across their surfaces. Baked into the one ground surface, there is only
+// ever a single depth value there, so anything placed on top of the ground
+// occludes it the normal way, with nothing left to bleed through.
+function gridGroundTexture(color) {
+  return canvasTexture(512, (ctx, s) => {
+    ctx.fillStyle = `#${color.getHexString()}`;
+    ctx.fillRect(0, 0, s, s);
+    const cells = 10; // 10 grid cells per texture tile
+    const step = s / cells;
+    ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= cells; i++) {
+      const p = Math.round(i * step) + 0.5;
+      ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, s); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(s, p); ctx.stroke();
+    }
+  });
+}
+
+const REPEAT = { glass: 1, tile: 2, fabric: 3, wood: 1.5, metal: 1, grass: 10, gridGround: 8 };
 
 export const MATERIAL_LABELS = {
   glass: 'Скло',
@@ -159,6 +183,12 @@ export function createMaterial(type, colorHex, envMap) {
       material = new THREE.MeshStandardMaterial({ map, roughness: 0.95, metalness: 0 });
       break;
     }
+    case 'gridGround': {
+      const map = gridGroundTexture(color);
+      map.repeat.set(REPEAT.gridGround, REPEAT.gridGround);
+      material = new THREE.MeshStandardMaterial({ map, roughness: 0.9, metalness: 0 });
+      break;
+    }
     default:
       material = new THREE.MeshStandardMaterial({ color, roughness: 0.7, metalness: 0.05 });
   }
@@ -175,6 +205,7 @@ function defaultColor(type) {
     wood: '#9a6b3f',
     metal: '#a9adb3',
     grass: '#5a9c4a',
+    gridGround: '#161618',
   }[type] ?? '#cccccc';
 }
 

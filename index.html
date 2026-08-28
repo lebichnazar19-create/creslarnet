@@ -2,7 +2,7 @@
 <html lang="uk">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
 <title>Creslarnet — прототип 2D</title>
 
 <!-- PWA -->
@@ -18,13 +18,38 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header class="topbar">
-    <h1>Creslarnet <span class="subtitle">— прототип 2D-режиму</span></h1>
-    <a href="3d/index.html" class="mode-link">3D-режим →</a>
-  </header>
+  <!-- The sheet fills the whole screen — everything else is a floating
+       overlay or a slide-in drawer, never something that resizes/reflows
+       the canvas itself (that's what kept the sheet "wandering" before). -->
+  <canvas id="drawCanvas"></canvas>
 
-  <div class="workspace">
-    <aside class="toolbar">
+  <div class="scale-bar-2d" aria-hidden="true">
+    <div id="scaleBarFill2d" class="scale-bar-fill-2d"></div>
+    <span id="scaleBarLabel2d" class="scale-bar-label-2d">—</span>
+  </div>
+
+  <div class="chain-bar hidden" id="chainBar2d">
+    <button id="chainUndoBtn" title="Скасувати останню точку">⌫ Точка</button>
+    <button id="chainCancelBtn" title="Скасувати всю полілінію">✕ Скасувати</button>
+    <button id="chainDoneBtn" title="Завершити полілінію">✓ Завершити</button>
+  </div>
+
+  <p class="hint-toast" id="canvasHint" aria-hidden="true"></p>
+
+  <!-- Both drawers stay hidden until their own button is tapped, and the
+       tools drawer closes itself again the moment a tool is picked — see
+       the "Panel not permanently expanded" requirement. -->
+  <button id="projectFabBtn" class="fab fab-left" title="Проект і сторінки">📁</button>
+  <button id="toolsFabBtn" class="fab fab-right" title="Інструменти">🛠️</button>
+
+  <div class="drawer-backdrop hidden" id="drawerBackdrop"></div>
+
+  <aside class="drawer drawer-right" id="toolsDrawer">
+    <div class="drawer-header">
+      <h2>Інструменти</h2>
+      <button class="drawer-close" id="toolsDrawerClose" title="Закрити">✕</button>
+    </div>
+    <div class="drawer-body">
       <div class="tool-group">
         <h2>Інструменти</h2>
         <button class="tool-btn active" data-tool="select" title="Виділити / перемістити / панорамувати">
@@ -112,23 +137,21 @@
         <button class="action-btn" id="exportBtn">Зберегти як PNG</button>
         <button class="action-btn" id="printBtn">🖨 Друк</button>
         <button class="action-btn" id="scanBtn">📷 Скан малюнка з фото</button>
+        <a href="3d/index.html" class="action-btn mode-link-btn">🧊 3D-режим →</a>
       </div>
-    </aside>
+    </div>
+  </aside>
 
-    <main class="canvas-area">
-      <canvas id="drawCanvas"></canvas>
-      <div class="scale-bar-2d" aria-hidden="true">
-        <div id="scaleBarFill2d" class="scale-bar-fill-2d"></div>
-        <span id="scaleBarLabel2d" class="scale-bar-label-2d">—</span>
-      </div>
-      <div class="chain-bar hidden" id="chainBar2d">
-        <button id="chainUndoBtn" title="Скасувати останню точку">⌫ Точка</button>
-        <button id="chainCancelBtn" title="Скасувати всю полілінію">✕ Скасувати</button>
-        <button id="chainDoneBtn" title="Завершити полілінію">✓ Завершити</button>
-      </div>
-      <p class="canvas-hint" id="canvasHint">Лист зафіксований — панорамування тільки свідомим перетягуванням порожнього місця · два пальці — масштаб · «Плитка» — задайте приміщення, розмір плитки й фото з галереї</p>
-    </main>
-  </div>
+  <aside class="drawer drawer-left" id="projectDrawer">
+    <div class="drawer-header">
+      <h2>Проект</h2>
+      <button class="drawer-close" id="projectDrawerClose" title="Закрити">✕</button>
+    </div>
+    <div class="drawer-body" id="projectDrawerBody">
+      <!-- filled dynamically: "create project" form, or the project's name,
+           page list and jump-to-page field once one exists -->
+    </div>
+  </aside>
 
   <input type="file" accept="image/*" id="tilePhotoInput" class="hidden">
   <input type="file" accept="image/*" capture="environment" id="scanPhotoInput" class="hidden">

@@ -22,68 +22,127 @@ html, body {
   color: var(--text);
 }
 
-body {
+/* ---------- fullscreen sheet + floating chrome ----------
+   The sheet is the whole app: the canvas is a fixed layer covering the
+   entire viewport, and every control — tools, sheet format, project/pages —
+   lives in an overlay or a slide-in drawer instead of a layout box that
+   shares space with the canvas. That's also what keeps the sheet from
+   "wandering": nothing about opening/closing a drawer ever resizes the
+   canvas or changes the page's fit, only an actual viewport resize does
+   (see resizeCanvas/fitPageToView in script.js). */
+#drawCanvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100dvh;
+  display: block;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.fab {
+  position: fixed;
+  z-index: 20;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  box-shadow: var(--shadow);
+  font-size: 22px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+.fab:active { background: var(--accent-light); }
+
+/* Tools button lives on the right edge, as asked — the toolbar only ever
+   appears when this is tapped, and hides itself again once a tool is
+   picked (wired in script.js). */
+.fab-right {
+  right: max(14px, env(safe-area-inset-right));
+  top: 50%;
+  transform: translateY(-50%);
+}
+.fab-left {
+  left: max(14px, env(safe-area-inset-left));
+  top: max(14px, env(safe-area-inset-top));
+}
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+  background: rgba(20, 18, 14, 0.35);
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  z-index: 30;
+  width: min(320px, 86vw);
+  background: var(--panel-bg);
   display: flex;
   flex-direction: column;
+  box-shadow: var(--shadow);
+  transition: transform 0.22s ease;
 }
+.drawer-right {
+  right: 0;
+  border-left: 1px solid var(--border);
+  transform: translateX(100%);
+  padding-right: env(safe-area-inset-right);
+}
+.drawer-right.open { transform: translateX(0); }
+.drawer-left {
+  left: 0;
+  border-right: 1px solid var(--border);
+  transform: translateX(-100%);
+  padding-left: env(safe-area-inset-left);
+}
+.drawer-left.open { transform: translateX(0); }
 
-.topbar {
+.drawer-header {
   flex-shrink: 0;
-  padding: 14px 28px;
-  background: var(--panel-bg);
-  border-bottom: 1px solid var(--border);
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  padding: max(14px, env(safe-area-inset-top)) 16px 14px;
+  border-bottom: 1px solid var(--border);
 }
-
-.mode-link {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--accent);
-  text-decoration: none;
-  white-space: nowrap;
-}
-
-.mode-link:hover {
-  text-decoration: underline;
-}
-
-.topbar h1 {
+.drawer-header h2 {
   margin: 0;
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 0.2px;
-}
-
-.subtitle {
-  font-weight: 400;
-  color: var(--text-muted);
   font-size: 15px;
+  font-weight: 700;
 }
-
-.workspace {
+.drawer-close {
+  border: none;
+  background: none;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 4px 6px;
+}
+.drawer-body {
   flex: 1;
   min-height: 0;
-  display: flex;
-  align-items: stretch;
-  gap: 16px;
-  padding: 16px;
-}
-
-.toolbar {
-  width: 220px;
-  flex-shrink: 0;
   overflow-y: auto;
-  background: var(--panel-bg);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 18px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
   gap: 22px;
+}
+
+.mode-link-btn {
+  display: block;
+  text-align: center;
+  text-decoration: none;
+  box-sizing: border-box;
 }
 
 .tool-group h2 {
@@ -204,41 +263,35 @@ body {
   background: #fdecee;
 }
 
-.canvas-area {
-  flex: 1;
-  min-width: 0;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  border-radius: 12px;
-  overflow: hidden;
-  border: 1px solid var(--border);
-}
-
-#drawCanvas {
-  display: block;
-  width: 100%;
-  flex: 1;
-  min-height: 0;
-  cursor: crosshair;
-  touch-action: none;
-}
-
-.canvas-hint {
-  flex-shrink: 0;
+/* Transient status message (scan progress, page-jump errors, …) — replaces
+   the old permanently-visible hint bar, which ate a strip of screen the
+   sheet should have. Empty and invisible until script.js's flashHint()
+   fills it in and shows it briefly. */
+.hint-toast {
+  position: fixed;
+  left: 50%;
+  bottom: max(18px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 15;
+  max-width: min(92vw, 520px);
   margin: 0;
-  padding: 8px 14px;
+  padding: 8px 16px;
+  background: rgba(20, 18, 14, 0.85);
+  color: #fff;
   font-size: 12px;
-  color: var(--text-muted);
-  background: var(--panel-bg);
-  border-top: 1px solid var(--border);
+  text-align: center;
+  border-radius: 20px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.25s ease;
 }
+.hint-toast.show { opacity: 1; }
 
 /* ---------- scale bar (2D) ---------- */
 .scale-bar-2d {
-  position: absolute;
-  top: 12px;
-  right: 12px;
+  position: fixed;
+  top: max(12px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
   z-index: 5;
   display: flex;
   flex-direction: column;
@@ -315,9 +368,9 @@ body {
 
 /* ---------- floating chain-controls for the "Полілінія" tool ---------- */
 .chain-bar {
-  position: absolute;
+  position: fixed;
   left: 50%;
-  bottom: 16px;
+  bottom: max(16px, env(safe-area-inset-bottom));
   transform: translateX(-50%);
   z-index: 6;
   display: flex;
@@ -387,15 +440,78 @@ body {
   }
 }
 
-@media (max-width: 860px) {
-  .workspace {
-    flex-direction: column;
-  }
-  .toolbar {
-    width: 100%;
-    max-height: 40vh;
-  }
+/* ---------- project / pages drawer ---------- */
+.project-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 4px;
 }
+.project-field label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.project-field input[type="text"],
+.project-field input[type="number"] {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 14px;
+  width: 100%;
+}
+.project-name {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 700;
+}
+.hint-text {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0 0 8px;
+}
+.project-jump-row {
+  display: flex;
+  gap: 6px;
+}
+.project-jump-row input { flex: 1; min-width: 0; }
+.project-jump-row button {
+  flex-shrink: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  background: #fafaf8;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+}
+.page-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.page-list-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  background: #fafaf8;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text);
+}
+.page-list-btn.active {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.page-list-btn .page-list-num { font-variant-numeric: tabular-nums; }
 
 /* ---------- "Скан малюнка" modal — photo -> vector lines ---------- */
 .scan-modal {

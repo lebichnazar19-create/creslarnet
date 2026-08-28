@@ -113,21 +113,18 @@ sun.shadow.bias = -0.0008;
 scene.add(sun);
 
 const groundGeo = new THREE.PlaneGeometry(80000, 80000);
-// Built via the same paint-material factory as everything else so the
-// ground can go through the normal colour/material picker (grass included)
-// once it's made selectable further down, once `objects`/raycastTargets exist.
-const ground = new THREE.Mesh(groundGeo, createPaintMaterial('#161618'));
+// Built via the same material factory as everything else so the ground can
+// go through the normal colour/material picker (grass included) once it's
+// made selectable further down, once `objects`/raycastTargets exist. The
+// default is 'gridGround' — the AutoCAD-style reference grid painted right
+// into this one surface (see materials.js) rather than a separate helper
+// hovering just above it, so nothing placed on the ground can ever show
+// grid lines floating over its own surface — normal opaque occlusion
+// against this single plane handles that for free.
+const ground = new THREE.Mesh(groundGeo, createMaterial('gridGround', '#161618', scene.environment));
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
-
-// 80 divisions across an 80 m plot = one grid line per metre (1000 mm).
-// White, AutoCAD-style — brighter centre lines, dimmer minor grid.
-const grid = new THREE.GridHelper(80000, 80, 0xffffff, 0x666666);
-grid.material.opacity = 0.5;
-grid.material.transparent = true;
-grid.position.y = 1;
-scene.add(grid);
 
 // Free camera state — no orbit pivot, just where the camera is and which
 // way it's looking. yaw/pitch are the single source of truth for
@@ -464,8 +461,32 @@ function createRoom(params = DEFAULT_ROOM_PARAMS, center = new THREE.Vector3(0, 
   const records = parts.map((p) => registerObject(p.kind, p.mesh, p.extra));
   const wallRecord = records.find((r) => r.kind === 'wall');
   select(wallRecord || records[0]);
+  viewRoomInside(roomId);
   toast('Кімнату створено — розміри можна змінити в панелі об’єкта');
   return roomId;
+}
+
+// "Всередині" / "Зовні" — explicit camera jumps for the room popover, rather
+// than trying to guess when to move the camera on the user's behalf. Reads
+// the room's current params/centre back off its parts each time, so it
+// stays correct across resizes.
+function viewRoomInside(roomId) {
+  const parts = findRoomParts(roomId);
+  if (!parts.length) return;
+  const { roomCenter: c } = parts[0];
+  camera.position.set(c.x, c.y + EYE_HEIGHT, c.z);
+  faceDirection(new THREE.Vector3(0, 0, -1));
+}
+
+function viewRoomOutside(roomId) {
+  const parts = findRoomParts(roomId);
+  if (!parts.length) return;
+  const { roomParams: p, roomCenter: c } = parts[0];
+  const span = Math.max(p.width, p.length, p.height);
+  const offset = new THREE.Vector3(span * 0.9, span * 0.75 + p.height, span * 1.15);
+  camera.position.set(c.x + offset.x, c.y + offset.y, c.z + offset.z);
+  const lookAt = new THREE.Vector3(c.x, c.y + p.height / 2, c.z);
+  faceDirection(lookAt.sub(camera.position).normalize());
 }
 
 // Tears down every part of a room (including any tiles/grout placed on its
@@ -1007,7 +1028,7 @@ let gizmo = null;              // THREE.Group, child of selected.root
 let gizmoMoveTargets = [];     // meshes tagged with userData.gizmoAxis for move-drag hit testing
 let gizmoRotateTargets = [];   // meshes tagged with userData.gizmoAxis for rotate-drag hit testing
 let moveDragGizmo = null;      // { axisWorld, startPoint, startObjectPos }
-let rotateDragGizmo = null;    // { axisWorld, refU, refV, center, startAngle, startQuaternion }
+let rotateDragGizmo = null;    // { axisWorld, centerScreen, prevAngle, accumAngle, startQuaternion }
 
 function buildGizmo(record) {
   const size = axisGizmoLocalSize(record);
@@ -1018,6 +1039,10 @@ function buildGizmo(record) {
 
   // --- move arrows ---
   const shaftLen = size * 0.9, shaftR = size * 0.035, headLen = size * 0.28, headR = size * 0.09;
+  // Invisible, fully transparent — but still raycastable (mesh.visible must
+  // stay true, only opacity goes to 0) — proxy material shared by every
+  // fattened hit target below.
+  const hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, depthTest: false });
   const AXES = ['x', 'y', 'z'];
   for (const axis of AXES) {
     const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, transparent: true, opacity: 0.95 });
@@ -1031,14 +1056,24 @@ function buildGizmo(record) {
     arrow.add(shaft, head);
     if (axis === 'x') arrow.rotation.z = -Math.PI / 2;
     else if (axis === 'z') arrow.rotation.x = Math.PI / 2;
-    shaft.userData.gizmoAxis = axis;
-    head.userData.gizmoAxis = axis;
-    // Tagged directly (not just the outer group) so any selected.root.traverse()
-    // that walks past the group — colour/material pickers, explode's partsOf()
-    // — still recognises and skips these, instead of repainting the gizmo itself.
     shaft.userData.isHelper = true;
     head.userData.isHelper = true;
-    moveTargets.push(shaft, head);
+
+    // The painted shaft/head are too thin a target for a fingertip — a
+    // touch that visually lands right on the arrow often misses the exact
+    // geometry and falls through to "look around" instead, which is what
+    // made dragging feel unreliable. Hit-testing goes against these much
+    // fatter invisible proxies instead; the visible meshes stay slim.
+    const shaftHit = new THREE.Mesh(new THREE.CylinderGeometry(shaftR * 3.5, shaftR * 3.5, shaftLen, 8), hitMat);
+    shaftHit.position.y = shaftLen / 2;
+    const headHit = new THREE.Mesh(new THREE.ConeGeometry(headR * 1.5, headLen * 1.3, 8), hitMat);
+    headHit.position.y = shaftLen + headLen / 2;
+    shaftHit.userData.gizmoAxis = axis;
+    headHit.userData.gizmoAxis = axis;
+    shaftHit.userData.isHelper = true;
+    headHit.userData.isHelper = true;
+    arrow.add(shaftHit, headHit);
+    moveTargets.push(shaftHit, headHit);
     group.add(arrow);
   }
 
@@ -1051,10 +1086,19 @@ function buildGizmo(record) {
     if (axis === 'y') torus.rotateX(-Math.PI / 2);   // normal -> +Y (lies flat, spins around vertical)
     else if (axis === 'x') torus.rotateY(Math.PI / 2); // normal -> +X
     // z: default torus normal is already +Z
-    torus.userData.gizmoAxis = axis;
     torus.userData.isHelper = true;
-    rotateTargets.push(torus);
     group.add(torus);
+
+    // Same reasoning as the move arrows: a fatter invisible tube around the
+    // painted ring so a finger doesn't have to land exactly on the thin
+    // torus to grab it.
+    const torusHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 4, 8, 48), hitMat);
+    torusHit.renderOrder = 998;
+    torusHit.rotation.copy(torus.rotation);
+    torusHit.userData.gizmoAxis = axis;
+    torusHit.userData.isHelper = true;
+    rotateTargets.push(torusHit);
+    group.add(torusHit);
   }
 
   return { group, moveTargets, rotateTargets };
@@ -1084,20 +1128,16 @@ function closestPointOnLineToRay(lineOrigin, lineDir, rayOrigin, rayDir) {
   return lineOrigin.clone().addScaledVector(lineDir, t);
 }
 
-function rayPlaneIntersect(rayOrigin, rayDir, planePoint, planeNormal) {
-  const denom = planeNormal.dot(rayDir);
-  if (Math.abs(denom) < 1e-6) return null;
-  const t = new THREE.Vector3().subVectors(planePoint, rayOrigin).dot(planeNormal) / denom;
-  return rayOrigin.clone().addScaledVector(rayDir, t);
-}
-
-function angleInPlane(point, center, refU, refV) {
-  const v = new THREE.Vector3().subVectors(point, center);
-  return Math.atan2(v.dot(refV), v.dot(refU));
+// Projects a world point to renderer-canvas client pixels — the inverse of
+// rayFromClient's NDC conversion, used to track the rotate gizmo in screen
+// space (see beginRotateDrag below).
+function projectToScreenPx(worldPoint) {
+  const p = worldPoint.clone().project(camera);
+  const rect = renderer.domElement.getBoundingClientRect();
+  return { x: (p.x * 0.5 + 0.5) * rect.width + rect.left, y: (-p.y * 0.5 + 0.5) * rect.height + rect.top };
 }
 
 const LOCAL_AXES = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) };
-const ROTATE_PLANE_REFS = { x: ['y', 'z'], y: ['x', 'z'], z: ['x', 'y'] };
 
 function beginMoveDrag(axisLetter, ray) {
   const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(selected.root.matrixWorld).normalize();
@@ -1113,26 +1153,36 @@ function updateMoveDrag(ray) {
   outlineHelper?.update();
 }
 
-function beginRotateDrag(axisLetter, ray) {
+// Rotate-drag tracking is pure screen-space angle around the object's
+// projected centre, not a 3D ray/plane intersection: a ray/plane hit makes
+// the finger match one exact point in space, but a metre-scale ring then
+// needs a proportionally huge sweep on screen to turn all the way round —
+// that reads as sluggish. Screen-space angle stays comfortable regardless
+// of the object's size or camera distance, and the multiplier below keeps
+// it snappy rather than a 1:1 crawl.
+const ROTATE_DRAG_SENSITIVITY = 1.8;
+
+function beginRotateDrag(axisLetter, clientX, clientY) {
   const root = selected.root;
   const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(root.matrixWorld).normalize();
-  const [uLetter, vLetter] = ROTATE_PLANE_REFS[axisLetter];
-  const refU = LOCAL_AXES[uLetter].clone().transformDirection(root.matrixWorld).normalize();
-  const refV = LOCAL_AXES[vLetter].clone().transformDirection(root.matrixWorld).normalize();
-  const center = root.position.clone();
-  const hit = rayPlaneIntersect(ray.ray.origin, ray.ray.direction, center, axisWorld);
-  if (!hit) return false;
-  rotateDragGizmo = { axisWorld, refU, refV, center, startAngle: angleInPlane(hit, center, refU, refV), startQuaternion: root.quaternion.clone() };
+  const centerScreen = projectToScreenPx(root.position);
+  const startAngle = Math.atan2(clientY - centerScreen.y, clientX - centerScreen.x);
+  rotateDragGizmo = { axisWorld, centerScreen, prevAngle: startAngle, accumAngle: 0, startQuaternion: root.quaternion.clone() };
   return true;
 }
 
-function updateRotateDrag(ray) {
-  const hit = rayPlaneIntersect(ray.ray.origin, ray.ray.direction, rotateDragGizmo.center, rotateDragGizmo.axisWorld);
-  if (!hit) return;
-  const angle = angleInPlane(hit, rotateDragGizmo.center, rotateDragGizmo.refU, rotateDragGizmo.refV);
-  const delta = angle - rotateDragGizmo.startAngle;
-  const deltaQuat = new THREE.Quaternion().setFromAxisAngle(rotateDragGizmo.axisWorld, delta);
-  selected.root.quaternion.multiplyQuaternions(deltaQuat, rotateDragGizmo.startQuaternion);
+function updateRotateDrag(clientX, clientY) {
+  const g = rotateDragGizmo;
+  const angle = Math.atan2(clientY - g.centerScreen.y, clientX - g.centerScreen.x);
+  let step = angle - g.prevAngle;
+  // Shortest-path wrap so crossing the ±π seam behind the cursor doesn't
+  // snap the object around instead of continuing the turn smoothly.
+  if (step > Math.PI) step -= Math.PI * 2;
+  if (step < -Math.PI) step += Math.PI * 2;
+  g.prevAngle = angle;
+  g.accumAngle += step * ROTATE_DRAG_SENSITIVITY;
+  const deltaQuat = new THREE.Quaternion().setFromAxisAngle(g.axisWorld, g.accumAngle);
+  selected.root.quaternion.multiplyQuaternions(deltaQuat, g.startQuaternion);
   outlineHelper?.update();
 }
 
@@ -1679,6 +1729,18 @@ function buildPopoverContent(panel) {
     popoverEl.appendChild(row);
 
     if (activeRoomId && findRoomParts(activeRoomId).length) {
+      const viewRow = document.createElement('div'); viewRow.className = 'panel-row';
+      const insideBtn = document.createElement('button');
+      insideBtn.className = 'pbtn';
+      insideBtn.textContent = '🚪 Всередині';
+      insideBtn.addEventListener('click', () => { viewRoomInside(activeRoomId); closePopover(); });
+      const outsideBtn = document.createElement('button');
+      outsideBtn.className = 'pbtn';
+      outsideBtn.textContent = '🏠 Зовні';
+      outsideBtn.addEventListener('click', () => { viewRoomOutside(activeRoomId); closePopover(); });
+      viewRow.appendChild(insideBtn);
+      viewRow.appendChild(outsideBtn);
+      popoverEl.appendChild(viewRow);
       popoverEl.appendChild(buildRoomDimsSection(activeRoomId));
     } else {
       const hint = document.createElement('p');
@@ -1971,7 +2033,7 @@ canvas.addEventListener('pointerdown', (e) => {
       if (gizmoMoveTargets.includes(hitMesh)) {
         beginMoveDrag(axisLetter, rayFromClient(e.clientX, e.clientY));
       } else {
-        beginRotateDrag(axisLetter, rayFromClient(e.clientX, e.clientY));
+        beginRotateDrag(axisLetter, e.clientX, e.clientY);
       }
     } else if (mode === 'edit' && moveMode && selected) {
       moveDragging = true;
@@ -2002,7 +2064,7 @@ canvas.addEventListener('pointermove', (e) => {
     return;
   }
   if (rotateDragGizmo && e.pointerId === primaryPointerId) {
-    updateRotateDrag(rayFromClient(e.clientX, e.clientY));
+    updateRotateDrag(e.clientX, e.clientY);
     return;
   }
   if (activePointers.size === 2 && !moveMode && !paperDrawing) {
@@ -2745,6 +2807,86 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Orientation gizmo — small fixed corner widget (3ds Max / Blender style):
+// three short colour-coded axes meeting at a compact hub, a ball tipping
+// each one, X/Y/Z letters just past the tips. It's its own tiny scene +
+// orthographic camera, rendered into a scissored corner of the same canvas
+// right after the main scene each frame, with the gizmo camera mirroring
+// the main camera's rotation — so it always reads "which way is which"
+// without cluttering the model itself.
+// ---------------------------------------------------------------------------
+const axisGizmoScene = new THREE.Scene();
+const axisGizmoCamera = new THREE.OrthographicCamera(-1.5, 1.5, 1.5, -1.5, 0.1, 10);
+const AXIS_GIZMO_PX = 84;   // on-screen footprint, css px
+const AXIS_GIZMO_MARGIN = 16;
+
+function axisLabelSprite(letter, colorCss) {
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = colorCss;
+  ctx.font = '700 40px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(letter, size / 2, size / 2 + 1);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true }));
+  sprite.scale.set(0.5, 0.5, 1);
+  return sprite;
+}
+
+(function buildAxisGizmo() {
+  const AXIS_DIR = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) };
+  const AXIS_LETTER = { x: 'X', y: 'Y', z: 'Z' };
+  const shaftLen = 0.8, shaftR = 0.05, ballR = 0.17;
+  for (const axis of ['x', 'y', 'z']) {
+    const dir = AXIS_DIR[axis];
+    const colorCss = AXIS_COLOR_CSS[axis];
+    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis] });
+
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 12), mat);
+    shaft.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    shaft.position.copy(dir).multiplyScalar(shaftLen / 2);
+    axisGizmoScene.add(shaft);
+
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(ballR, 16, 12), mat);
+    ball.position.copy(dir).multiplyScalar(shaftLen);
+    axisGizmoScene.add(ball);
+
+    const label = axisLabelSprite(AXIS_LETTER[axis], colorCss);
+    label.position.copy(dir).multiplyScalar(shaftLen + ballR + 0.3);
+    axisGizmoScene.add(label);
+  }
+  // Compact hub where the three axes meet.
+  const hub = new THREE.Mesh(new THREE.SphereGeometry(0.13, 16, 12), new THREE.MeshBasicMaterial({ color: 0xaeb0b8 }));
+  axisGizmoScene.add(hub);
+})();
+
+function renderAxisGizmo() {
+  // Mirrors the main camera's rotation only — a fixed-distance camera
+  // looking at the origin from "the same direction" the main camera faces,
+  // so the little triad always shows the current view orientation.
+  const dist = 4;
+  axisGizmoCamera.position.set(0, 0, 0).addScaledVector(new THREE.Vector3(0, 0, 1).applyQuaternion(camera.quaternion), dist);
+  axisGizmoCamera.quaternion.copy(camera.quaternion);
+  axisGizmoCamera.updateMatrixWorld();
+
+  const dpr = renderer.getPixelRatio();
+  const w = Math.round(AXIS_GIZMO_PX * dpr), h = Math.round(AXIS_GIZMO_PX * dpr);
+  const x = Math.round((window.innerWidth - AXIS_GIZMO_PX - AXIS_GIZMO_MARGIN) * dpr);
+  const y = Math.round((window.innerHeight - AXIS_GIZMO_PX - AXIS_GIZMO_MARGIN) * dpr);
+
+  renderer.setScissorTest(true);
+  renderer.setScissor(x, y, w, h);
+  renderer.setViewport(x, y, w, h);
+  renderer.render(axisGizmoScene, axisGizmoCamera);
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, renderer.domElement.width, renderer.domElement.height);
+}
+
+// ---------------------------------------------------------------------------
 // Render loop
 // ---------------------------------------------------------------------------
 let lastFrame = performance.now();
@@ -2764,6 +2906,7 @@ function animate() {
     updateFreeCamera(dt, 0);
   }
   renderer.render(scene, camera);
+  renderAxisGizmo();
 }
 animate();
 
