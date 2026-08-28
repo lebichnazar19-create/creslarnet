@@ -1553,7 +1553,11 @@ function select(record) {
   selected = record;
   if (record.roomId) activeRoomId = record.roomId;
 
-  const roundOutline = record.root.isMesh ? buildRoundOutlineGeometry(record.kind) : null;
+  // A sculpted round object (sphere/cylinder/cone) is no longer actually
+  // round — the fixed circular outline shortcut below would be honest for
+  // its ORIGINAL shape but misleading for whatever lumpy thing it is now,
+  // so a sculpted mesh always falls through to the real EdgesGeometry path.
+  const roundOutline = record.root.isMesh && !record.sculpted ? buildRoundOutlineGeometry(record.kind) : null;
   if (record.kind === 'ground') {
     // no outline on an 80 m plane — a box around it isn't useful
   } else if (record.kind === 'window') {
@@ -2371,6 +2375,13 @@ function applyBend(record, frac, angleDeg) {
       : new THREE.ExtrudeGeometry(buildBendCrossSection(record.kind, orig.halfY, orig.halfZ), {
           steps: 48, extrudePath: new BentPathCurve(L1, R, angleRad, L3), bevelEnabled: false,
         });
+    // ExtrudeGeometry stores its constructor options (including our custom
+    // BentPathCurve instance, in the .parameters used by the same
+    // toJSON()-shortcut described in applySculptAt) as .parameters — which
+    // isn't just stale here the way a sculpted primitive's is, it's not
+    // JSON-serializable at all (a custom Curve subclass, not plain data).
+    // Same fix: drop it so save falls through to the real vertex data.
+    delete geometry.parameters;
     geometry.computeBoundingBox();
     const c = geometry.boundingBox.getCenter(new THREE.Vector3());
     geometry.translate(-c.x, -c.y, -c.z);
@@ -2505,6 +2516,145 @@ function addThreadToObject(record, atStart, pitch, length) {
   } catch (e) {
     toast('Не вдалося додати різьбу тут — спробуйте інший крок або довжину');
   }
+}
+
+// ---------------------------------------------------------------------------
+// "Скульптинг" — drag a finger across a selected object's own surface to
+// push (add) or pull (dig into) material along each nearby vertex's own
+// normal, falling off smoothly with distance from the touch point — real
+// per-vertex displacement on the object's actual geometry, not a decal or
+// a separate helper mesh. A default primitive (cube/sphere/cylinder/cone)
+// is rebuilt denser first — the base shapes are too coarse (a cube is 8
+// vertices) for a brush to do anything visible — anything else sculpts at
+// whatever resolution it already has.
+// ---------------------------------------------------------------------------
+let sculptActive = false;
+let sculptTarget = null;
+let sculptDragging = false;
+let sculptBrushRadius = 150; // mm, world-ish scale (adjusted for the object's own scale when applied)
+let sculptStrength = 40;     // mm, max displacement per touch-down/move event at the brush centre
+let sculptMode = 'push';     // 'push' (outward, add) or 'pull' (inward, dig in)
+
+function densifyForSculpt(record) {
+  const root = record.root;
+  if (!root.isMesh) return;
+  let newGeom = null;
+  if (record.kind === 'cube') newGeom = new THREE.BoxGeometry(1000, 1000, 1000, 20, 20, 20);
+  else if (record.kind === 'sphere') newGeom = new THREE.SphereGeometry(500, 48, 36);
+  else if (record.kind === 'cylinder') newGeom = new THREE.CylinderGeometry(500, 500, 1000, 32, 20);
+  else if (record.kind === 'cone') newGeom = new THREE.ConeGeometry(500, 1000, 32, 20);
+  if (!newGeom) return; // anything else (converted/merged/room parts…) sculpts at its native density
+  root.geometry.dispose();
+  root.geometry = newGeom;
+}
+
+// Displaces every vertex within brush reach of `worldPoint` along its own
+// (pre-displacement) normal, smoothstep-tapered so the touched area blends
+// into the rest of the surface instead of leaving a hard-edged bump.
+function applySculptAt(worldPoint) {
+  const root = sculptTarget.root;
+  const geom = root.geometry;
+  const posAttr = geom.attributes.position;
+  if (!posAttr) return;
+  if (!geom.attributes.normal) geom.computeVertexNormals();
+  const normAttr = geom.attributes.normal;
+
+  const localPoint = root.worldToLocal(worldPoint.clone());
+  const scale = Math.max(0.001, root.scale.x || 1);
+  const localRadius = sculptBrushRadius / scale;
+  const sign = sculptMode === 'push' ? 1 : -1;
+  const strengthLocal = (sculptStrength / scale) * 0.5;
+
+  const v = new THREE.Vector3();
+  let touched = false;
+  for (let i = 0; i < posAttr.count; i++) {
+    v.fromBufferAttribute(posAttr, i);
+    const d = v.distanceTo(localPoint);
+    if (d > localRadius) continue;
+    const t = 1 - d / localRadius;
+    const smooth = t * t * (3 - 2 * t); // smoothstep — no hard edge at the brush radius
+    const amt = smooth * strengthLocal * sign;
+    posAttr.setXYZ(
+      i,
+      v.x + normAttr.getX(i) * amt,
+      v.y + normAttr.getY(i) * amt,
+      v.z + normAttr.getZ(i) * amt,
+    );
+    touched = true;
+  }
+  if (touched) {
+    sculptTarget.sculpted = true;
+    // A primitive's geometry.parameters (width/height/depth/segments…) is
+    // what a plain BoxGeometry etc. serializes through project save/load
+    // via — its .toJSON() checks for .parameters and, if present, writes
+    // *only* that compact parametric shorthand, never the actual vertex
+    // buffer. Once vertices are hand-displaced that shorthand describes a
+    // shape that no longer exists, so it's cleared here — from this point
+    // on toJSON() falls through to serializing the real (sculpted)
+    // position/normal data instead of silently reverting to a plain box.
+    delete geom.parameters;
+    posAttr.needsUpdate = true;
+    geom.computeVertexNormals();
+    geom.computeBoundingSphere();
+    geom.computeBoundingBox();
+  }
+}
+
+function enterSculptMode(record) {
+  sculptActive = true;
+  sculptTarget = record;
+  densifyForSculpt(record);
+  hideEl(selectionPanelEl);
+  removeGizmo(); // same reasoning as bend mode — the arrows would sit on the exact surface being sculpted
+  renderSculptPill();
+  showEl(modePillEl);
+  toast('Ведіть пальцем по поверхні, щоб ліпити матеріал');
+}
+
+function exitSculptMode() {
+  const record = sculptTarget;
+  sculptActive = false;
+  sculptDragging = false;
+  sculptTarget = null;
+  hideEl(modePillEl);
+  if (record) { deselect(); select(record); }
+}
+
+function renderSculptPill() {
+  modePillEl.innerHTML = '';
+
+  const modeRow = document.createElement('div'); modeRow.className = 'panel-row';
+  const pushBtn = document.createElement('button');
+  pushBtn.textContent = '➕ Додати'; pushBtn.className = sculptMode === 'push' ? 'on' : '';
+  const pullBtn = document.createElement('button');
+  pullBtn.textContent = '➖ Прибрати'; pullBtn.className = sculptMode === 'pull' ? 'on' : '';
+  pushBtn.addEventListener('click', () => { sculptMode = 'push'; pushBtn.classList.add('on'); pullBtn.classList.remove('on'); });
+  pullBtn.addEventListener('click', () => { sculptMode = 'pull'; pullBtn.classList.add('on'); pushBtn.classList.remove('on'); });
+  modeRow.append(pushBtn, pullBtn);
+  modePillEl.appendChild(modeRow);
+
+  const sizeLabel = document.createElement('span'); sizeLabel.textContent = 'Розмір пензля';
+  const sizeInput = document.createElement('input');
+  sizeInput.type = 'range'; sizeInput.min = '30'; sizeInput.max = '600'; sizeInput.step = '10';
+  sizeInput.value = String(sculptBrushRadius);
+  sizeInput.className = 'bend-angle-slider';
+  sizeInput.addEventListener('input', () => { sculptBrushRadius = Number(sizeInput.value); });
+  modePillEl.appendChild(sizeLabel);
+  modePillEl.appendChild(sizeInput);
+
+  const strengthLabel = document.createElement('span'); strengthLabel.textContent = 'Сила';
+  const strengthInput = document.createElement('input');
+  strengthInput.type = 'range'; strengthInput.min = '5'; strengthInput.max = '150'; strengthInput.step = '5';
+  strengthInput.value = String(sculptStrength);
+  strengthInput.className = 'bend-angle-slider';
+  strengthInput.addEventListener('input', () => { sculptStrength = Number(strengthInput.value); });
+  modePillEl.appendChild(strengthLabel);
+  modePillEl.appendChild(strengthInput);
+
+  const doneBtn = document.createElement('button');
+  doneBtn.textContent = '✓ Готово';
+  doneBtn.addEventListener('click', exitSculptMode);
+  modePillEl.appendChild(doneBtn);
 }
 
 // ---------------------------------------------------------------------------
@@ -2670,6 +2820,13 @@ function renderSelectionPanel() {
     bendBtn.className = 'pbtn'; bendBtn.textContent = '🦾 Зігнути';
     bendBtn.addEventListener('click', () => enterBendMode(selected));
     actions.appendChild(bendBtn);
+  }
+
+  if (selected.root.isMesh) {
+    const sculptBtn = document.createElement('button');
+    sculptBtn.className = 'pbtn'; sculptBtn.textContent = '🖐 Скульптинг';
+    sculptBtn.addEventListener('click', () => enterSculptMode(selected));
+    actions.appendChild(sculptBtn);
   }
 
   if (selected.root.isMesh && ['pipe', 'rebar'].includes(selected.kind)) {
@@ -3280,11 +3437,18 @@ canvas.addEventListener('pointerdown', (e) => {
         attachSpatialLineGizmo(point);
         renderSpatialLinePill();
       }
+    } else if (mode === 'edit' && sculptActive && sculptTarget) {
+      scene.updateMatrixWorld(true);
+      const hits = rayFromClient(e.clientX, e.clientY).intersectObject(sculptTarget.root, true);
+      if (hits.length) {
+        sculptDragging = true;
+        applySculptAt(hits[0].point);
+      }
     } else if (!moveMode && !paperDrawing) {
       lookPointerId = e.pointerId;
       lastLookX = e.clientX; lastLookY = e.clientY;
     }
-  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !sculptDragging) {
     pinchStartDist = currentPinchDist();
     // with something selected, pinch resizes it; otherwise it drives the camera
     pinchStartScale = selected ? selected.root.scale.clone() : null;
@@ -3303,7 +3467,7 @@ canvas.addEventListener('pointermove', (e) => {
     updateRotateDrag(e.clientX, e.clientY);
     return;
   }
-  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag) {
+  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !sculptDragging) {
     const dist = currentPinchDist();
     if (selected && pinchStartScale) {
       if (pinchStartDist > 10) {
@@ -3367,6 +3531,11 @@ canvas.addEventListener('pointermove', (e) => {
     updateSpatialLineRingDrag(e.clientX, e.clientY);
     return;
   }
+  if (mode === 'edit' && sculptDragging && sculptTarget && e.pointerId === primaryPointerId) {
+    const hits = rayFromClient(e.clientX, e.clientY).intersectObject(sculptTarget.root, true);
+    if (hits.length) applySculptAt(hits[0].point);
+    return;
+  }
   if (lookPointerId !== null && e.pointerId === lookPointerId) {
     handleFreeLook(e);
   }
@@ -3390,6 +3559,7 @@ function endPointer(e) {
       updateSpatialLinePreview();
       if (spatialLineGizmo) renderSpatialLinePill();
     }
+    if (mode === 'edit' && sculptActive) sculptDragging = false;
     return;
   }
 
@@ -3429,6 +3599,7 @@ function endPointer(e) {
     if (spatialLineRingDrag && e.pointerId === primaryPointerId) spatialLineRingDrag = null;
     return;
   }
+  if (mode === 'edit' && sculptActive) { sculptDragging = false; return; }
   if (wasPinching) return; // a pinch finger lifting is never a tap
   if (mode === 'walk') return; // walk mode has no tap-to-place/select
   if (e.pointerId !== primaryPointerId) return;
