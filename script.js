@@ -87,7 +87,10 @@ if ('serviceWorker' in navigator) {
   let shapes = [];
   let selected = null;
 
-  const KIND_LABELS = { line: 'Лінія', rect: 'Прямокутник', circle: 'Коло', arc: 'Дуга', leader: 'Виноска', freehand: 'Олівець', polyline: 'Полілінія' };
+  const KIND_LABELS = {
+    line: 'Лінія', rect: 'Прямокутник', circle: 'Коло', arc: 'Дуга', leader: 'Виноска',
+    freehand: 'Олівець', polyline: 'Полілінія', tilearea: 'Плитка (розкладка)',
+  };
 
   function makePreviewShape(tool, x1, y1, x2, y2) {
     if (tool === 'line') return { type: 'line', x1, y1, x2, y2 };
@@ -95,6 +98,7 @@ if ('serviceWorker' in navigator) {
     if (tool === 'circle') return { type: 'circle', cx: x1, cy: y1, r: Math.hypot(x2 - x1, y2 - y1) };
     if (tool === 'arc') return { type: 'arc', cx: x1, cy: y1, r: Math.hypot(x2 - x1, y2 - y1), startDeg: 0, endDeg: 360 };
     if (tool === 'leader') return { type: 'leader', x1, y1, x2, y2, text: '' };
+    if (tool === 'tilearea') return { type: 'tilearea', x1, y1, x2, y2, tileW: 600, tileH: 1200, grout: 2, imageId: null };
     return null;
   }
 
@@ -295,8 +299,106 @@ if ('serviceWorker' in navigator) {
     context.restore();
   }
 
+  // ---------------------------------------------------------------------
+  // Tile planning: draw a room/wall area, define a tile size (+ an optional
+  // photo texture picked from the phone gallery), get an automatic layout
+  // showing how many tiles fit and what the pattern looks like — cut tiles
+  // at the edges show a cropped slice of the photo, not a squished one.
+  // ---------------------------------------------------------------------
+  const tileImageCache = new Map(); // shape.id -> loaded HTMLImageElement (photos aren't serialized into shapes directly)
+
+  function computeTileGrid(roomW, roomH, tileW, tileH, grout) {
+    const stepW = tileW + grout, stepH = tileH + grout;
+    const cols = [];
+    for (let x = 0; x < roomW - 0.01; x += stepW) cols.push(x);
+    const rows = [];
+    for (let y = 0; y < roomH - 0.01; y += stepH) rows.push(y);
+    const tiles = [];
+    let fullCount = 0;
+    for (const y of rows) {
+      for (const x of cols) {
+        const w = Math.min(tileW, roomW - x);
+        const h = Math.min(tileH, roomH - y);
+        const isFull = w >= tileW - 0.05 && h >= tileH - 0.05;
+        if (isFull) fullCount++;
+        tiles.push({ x, y, w, h, isFull });
+      }
+    }
+    return { tiles, fullCount, partialCount: tiles.length - fullCount, total: tiles.length, cols: cols.length, rows: rows.length };
+  }
+
+  function tileAreaBounds(s) {
+    const a = mmToPx({ x: s.x1, y: s.y1 }), b = mmToPx({ x: s.x2, y: s.y2 });
+    return { x0: Math.min(a.x, b.x), y0: Math.min(a.y, b.y), x1: Math.max(a.x, b.x), y1: Math.max(a.y, b.y) };
+  }
+
+  function drawTileArea(context, s, isPreview) {
+    const roomW = Math.abs(s.x2 - s.x1), roomH = Math.abs(s.y2 - s.y1);
+    const bounds = tileAreaBounds(s);
+    const img = tileImageCache.get(s.id);
+
+    context.save();
+    if (isPreview) context.globalAlpha = 0.75;
+    context.fillStyle = '#eceae4';
+    context.fillRect(bounds.x0, bounds.y0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+
+    if (roomW > 0 && roomH > 0) {
+      context.beginPath();
+      context.rect(bounds.x0, bounds.y0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+      context.clip();
+
+      const grid = computeTileGrid(roomW, roomH, s.tileW, s.tileH, s.grout);
+      const tileWpx = s.tileW * view.scale, tileHpx = s.tileH * view.scale;
+      for (const t of grid.tiles) {
+        const px = { x: bounds.x0 + t.x * view.scale, y: bounds.y0 + t.y * view.scale };
+        const wpx = t.w * view.scale, hpx = t.h * view.scale;
+        if (img && img.complete && img.naturalWidth) {
+          // a cut edge tile shows a proportionally cropped slice of the
+          // photo, not the whole image squeezed to fit — matches how a real
+          // tile would actually be cut on-site.
+          const srcW = img.naturalWidth * (t.w / s.tileW), srcH = img.naturalHeight * (t.h / s.tileH);
+          context.drawImage(img, 0, 0, srcW, srcH, px.x, px.y, wpx, hpx);
+        } else {
+          context.fillStyle = t.isFull ? '#f5f3ee' : '#ece5d6';
+          context.fillRect(px.x, px.y, wpx, hpx);
+        }
+        context.strokeStyle = 'rgba(40,36,28,0.35)';
+        context.lineWidth = 1;
+        context.strokeRect(px.x, px.y, wpx, hpx);
+        if (!t.isFull) {
+          // flag tiles that need cutting with a dashed accent border
+          context.save();
+          context.setLineDash([3, 3]);
+          context.strokeStyle = '#c1121f';
+          context.strokeRect(px.x + 1, px.y + 1, wpx - 2, hpx - 2);
+          context.restore();
+        }
+      }
+      context.restore(); // undo clip
+      context.save();
+      if (isPreview) context.globalAlpha = 0.75;
+    }
+
+    context.strokeStyle = s.color;
+    context.lineWidth = Math.max(1, s.lineWidthMm * view.scale);
+    context.strokeRect(bounds.x0, bounds.y0, bounds.x1 - bounds.x0, bounds.y1 - bounds.y0);
+    context.globalAlpha = 1;
+    context.restore();
+  }
+
+  function tileAreaSummary(s) {
+    const roomW = Math.abs(s.x2 - s.x1), roomH = Math.abs(s.y2 - s.y1);
+    if (roomW < 1 || roomH < 1) return 'Задайте розмір приміщення (потягніть за кут).';
+    const grid = computeTileGrid(roomW, roomH, s.tileW, s.tileH, s.grout);
+    const base = `${grid.cols}×${grid.rows} = ${grid.total} плиток`;
+    return grid.partialCount
+      ? `${base} (${grid.fullCount} цілих + ${grid.partialCount} із підрізкою)`
+      : `${base} (усі цілі, без підрізки)`;
+  }
+
   function renderOneShape(context, s, isPreview) {
     if (s.type === 'leader') { drawLeader(context, s, isPreview); return; }
+    if (s.type === 'tilearea') { drawTileArea(context, s, isPreview); return; }
     drawHatch(context, s);
     drawShape(context, s, isPreview);
   }
@@ -375,6 +477,10 @@ if ('serviceWorker' in navigator) {
         for (let i = 0; i < pts.length - 1; i++) {
           if (distToSegment(p, pts[i], pts[i + 1]) <= HIT_TOLERANCE_PX + s.lineWidthMm * view.scale / 2) return s;
         }
+      } else if (s.type === 'tilearea') {
+        // a filled area, unlike an empty rect — tap anywhere inside selects it
+        const b = tileAreaBounds(s);
+        if (p.x >= b.x0 - HIT_TOLERANCE_PX && p.x <= b.x1 + HIT_TOLERANCE_PX && p.y >= b.y0 - HIT_TOLERANCE_PX && p.y <= b.y1 + HIT_TOLERANCE_PX) return s;
       }
     }
     return null;
@@ -423,7 +529,7 @@ if ('serviceWorker' in navigator) {
       ctx.lineWidth = 2;
       ctx.setLineDash([6, 4]);
       const pad = 4;
-      if (selected.type === 'line' || selected.type === 'rect') {
+      if (selected.type === 'line' || selected.type === 'rect' || selected.type === 'tilearea') {
         const a = mmToPx({ x: selected.x1, y: selected.y1 }), b = mmToPx({ x: selected.x2, y: selected.y2 });
         ctx.strokeRect(Math.min(a.x, b.x) - pad, Math.min(a.y, b.y) - pad, Math.abs(b.x - a.x) + pad * 2, Math.abs(b.y - a.y) + pad * 2);
       } else if (selected.type === 'circle' || selected.type === 'arc') {
@@ -573,6 +679,29 @@ if ('serviceWorker' in navigator) {
     if (selected) { selected.lineWidthMm = state.lineWidthMm; requestRedraw(); }
   });
 
+  // Photo-as-tile-texture: one shared hidden file input, retargeted per tile
+  // area via a data attribute set right before it's opened.
+  const tilePhotoInput = document.getElementById('tilePhotoInput');
+  tilePhotoInput.addEventListener('change', () => {
+    const file = tilePhotoInput.files[0];
+    const targetId = Number(tilePhotoInput.dataset.targetId);
+    tilePhotoInput.value = '';
+    if (!file || !targetId) return;
+    const shape = shapes.find((s) => s.id === targetId);
+    if (!shape) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        tileImageCache.set(shape.id, img);
+        requestRedraw();
+        if (selected === shape) renderDimPanel();
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
   document.getElementById('undoBtn').addEventListener('click', () => {
     if (selected && shapes[shapes.length - 1] === selected) deselect();
     shapes.pop();
@@ -665,6 +794,38 @@ if ('serviceWorker' in navigator) {
       plus.addEventListener('click', () => { selected.endDeg = selected.startDeg + Math.min(360, sweep() + 15); requestRedraw(); renderDimPanel(); });
       row.append(label, minus, val, plus);
       dimPanel.appendChild(row);
+    } else if (selected.type === 'tilearea') {
+      field('Ширина приміщення', () => Math.abs(selected.x2 - selected.x1), (v) => { selected.x2 = selected.x1 + Math.sign(selected.x2 - selected.x1 || 1) * v; });
+      field('Висота приміщення', () => Math.abs(selected.y2 - selected.y1), (v) => { selected.y2 = selected.y1 + Math.sign(selected.y2 - selected.y1 || 1) * v; });
+      field('Плитка — ширина', () => selected.tileW, (v) => { selected.tileW = v; });
+      field('Плитка — висота', () => selected.tileH, (v) => { selected.tileH = v; });
+
+      const groutRow = document.createElement('div');
+      groutRow.className = 'dim-row';
+      const groutLabel = document.createElement('span'); groutLabel.className = 'dim-label'; groutLabel.textContent = 'Шов';
+      const groutMinus = document.createElement('button'); groutMinus.className = 'dim-step'; groutMinus.textContent = '–';
+      const groutVal = document.createElement('span'); groutVal.className = 'dim-input'; groutVal.style.textAlign = 'center';
+      const groutPlus = document.createElement('button'); groutPlus.className = 'dim-step'; groutPlus.textContent = '+';
+      groutVal.textContent = `${formatMm(selected.grout)} мм`;
+      const clampGrout = (v) => Math.max(0, Math.round(v * 10) / 10);
+      groutMinus.addEventListener('click', () => { selected.grout = clampGrout(selected.grout - 0.5); requestRedraw(); renderDimPanel(); });
+      groutPlus.addEventListener('click', () => { selected.grout = clampGrout(selected.grout + 0.5); requestRedraw(); renderDimPanel(); });
+      groutRow.append(groutLabel, groutMinus, groutVal, groutPlus);
+      dimPanel.appendChild(groutRow);
+
+      const photoBtn = document.createElement('button');
+      photoBtn.className = 'action-btn';
+      photoBtn.textContent = tileImageCache.has(selected.id) ? '🖼 Змінити фото плитки' : '🖼 Завантажити фото плитки';
+      photoBtn.addEventListener('click', () => {
+        tilePhotoInput.dataset.targetId = String(selected.id);
+        tilePhotoInput.click();
+      });
+      dimPanel.appendChild(photoBtn);
+
+      const summary = document.createElement('p');
+      summary.className = 'hatch-label';
+      summary.textContent = tileAreaSummary(selected);
+      dimPanel.appendChild(summary);
     }
 
     if (selected.type === 'rect' || selected.type === 'circle') {
@@ -777,7 +938,7 @@ if ('serviceWorker' in navigator) {
   if (chainDoneBtn) chainDoneBtn.addEventListener('click', finishPolyline);
 
   function cloneShapeCoords(s) {
-    if (s.type === 'line' || s.type === 'rect' || s.type === 'leader') return { x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2 };
+    if (s.type === 'line' || s.type === 'rect' || s.type === 'leader' || s.type === 'tilearea') return { x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2 };
     if (s.type === 'freehand' || s.type === 'polyline') return { points: s.points.map((p) => ({ x: p.x, y: p.y })) };
     return { cx: s.cx, cy: s.cy };
   }
@@ -1017,5 +1178,7 @@ if ('serviceWorker' in navigator) {
     get pageKey() { return pageKey; },
     get polylineDraft() { return polylineDraft; },
     pageW, pageH, view, clientToMm, fitPageToView,
+    hasTileImage: (id) => tileImageCache.has(id),
+    computeTileGrid,
   };
 })();

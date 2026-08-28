@@ -63,6 +63,10 @@
           <svg viewBox="0 0 24 24"><path d="M3 17 L13 7 L20 14 L13 21 L7 21 Z"/><line x1="9" y1="11" x2="16" y2="18"/></svg>
           Ластик
         </button>
+        <button class="tool-btn" data-tool="tilearea" title="Плитка — задайте приміщення, розмір плитки й фото, отримайте розкладку">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8"/><rect x="13" y="3" width="8" height="8"/><rect x="3" y="13" width="8" height="8"/><rect x="13" y="13" width="8" height="8"/></svg>
+          Плитка
+        </button>
       </div>
 
       <div class="tool-group">
@@ -121,10 +125,11 @@
         <button id="chainCancelBtn" title="Скасувати всю полілінію">✕ Скасувати</button>
         <button id="chainDoneBtn" title="Завершити полілінію">✓ Завершити</button>
       </div>
-      <p class="canvas-hint">Лист зафіксований — панорамування тільки свідомим перетягуванням порожнього місця · два пальці — масштаб · «Полілінія» — тягни-відпускай сегмент за сегментом, вони фіксуються й з'єднуються</p>
+      <p class="canvas-hint">Лист зафіксований — панорамування тільки свідомим перетягуванням порожнього місця · два пальці — масштаб · «Плитка» — задайте приміщення, розмір плитки й фото з галереї</p>
     </main>
   </div>
 
+  <input type="file" accept="image/*" id="tilePhotoInput" class="hidden">
   <script src="script.js"></script>
 </body>
 </html>
