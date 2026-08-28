@@ -85,7 +85,20 @@ function niceMm(raw) {
 const canvas = document.getElementById('viewport');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-renderer.shadowMap.enabled = true;
+// Shadow mapping is OFF, full stop — every wall/object still has its own
+// flat colour material (never had a texture), but a shadow map is a
+// depth-comparison render that's notoriously sensitive to exactly the kind
+// of GPU/driver quirks a phone can have, and it's what the "walls covered
+// in solid noise" reports traced back to twice in a row (first the room's
+// point light, then — since turning its shadow off didn't fix it and the
+// only other shadow-caster left is the sun below — that too). Rather than
+// keep chasing bias/normalBias values against hardware this can't be
+// tested on directly, this is the one change that removes the whole
+// mechanism: no shadow map anywhere means nothing left that can render as
+// noise. Every mesh below still sets castShadow/receiveShadow — harmless
+// with this off, and it means shadows can just be turned back on here in
+// one place if a future fix is found.
+renderer.shadowMap.enabled = false;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -124,7 +137,7 @@ const hemi = new THREE.HemisphereLight(0xffffff, 0x8a7a63, 0.9);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff3e0, 1.6);
 sun.position.set(10000, 14000, 6000);
-sun.castShadow = true;
+sun.castShadow = false; // see renderer.shadowMap.enabled = false above
 sun.shadow.mapSize.set(1536, 1536);
 sun.shadow.camera.left = -20000;
 sun.shadow.camera.right = 20000;
@@ -133,6 +146,56 @@ sun.shadow.camera.bottom = -20000;
 sun.shadow.camera.far = 50000;
 sun.shadow.bias = -0.0008;
 scene.add(sun);
+
+// ---------------------------------------------------------------------------
+// "Ландшафт" — an optional toggle away from the default AutoCAD dark model
+// space toward an outdoor look: a sky dome (a huge inverted sphere with a
+// vertical gradient, so it always reads as "infinitely far away" regardless
+// of where the camera is) replacing the flat dark backdrop, plus a lighter
+// daylight-coloured fog. The ground itself doesn't need anything new here —
+// it's already a real, selectable surface objects and rooms sit on, and
+// already has a "Трава" (grass) material option via the normal colour/
+// material picker on the ground's own selection panel.
+// ---------------------------------------------------------------------------
+let landscapeMode = false;
+let skyDomeMesh = null;
+
+function buildSkyDome() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 2; canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+  const grad = ctx.createLinearGradient(0, 0, 0, 256);
+  grad.addColorStop(0, '#3e7fc9');   // zenith
+  grad.addColorStop(0.55, '#a9cdea'); // sky
+  grad.addColorStop(0.82, '#dce8ec'); // horizon haze
+  grad.addColorStop(1, '#e8dfc9');   // ground-level warm tint
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 2, 256);
+  const tex = new THREE.CanvasTexture(canvas);
+  const geo = new THREE.SphereGeometry(60000, 24, 16);
+  const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, fog: false, depthWrite: false });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.renderOrder = -1000;
+  return mesh;
+}
+
+function setLandscapeMode(on) {
+  landscapeMode = on;
+  if (on) {
+    if (!skyDomeMesh) skyDomeMesh = buildSkyDome();
+    scene.add(skyDomeMesh);
+    scene.background = null; // the dome shows through instead of a flat colour
+    scene.fog = new THREE.Fog(0xcfe3ef, 40000, 140000);
+    hemi.intensity = 1.1;
+    toast('Ландшафтний режим — небо і земля для зовнішніх сцен');
+  } else {
+    if (skyDomeMesh) scene.remove(skyDomeMesh);
+    scene.background = new THREE.Color(SKY_COLOR);
+    scene.fog = new THREE.Fog(SKY_COLOR, 26000, 90000);
+    hemi.intensity = 0.9;
+    toast('AutoCAD-тема');
+  }
+}
 
 const groundGeo = new THREE.PlaneGeometry(80000, 80000);
 // Built via the same material factory as everything else so the ground can
@@ -2612,6 +2675,15 @@ function buildPopoverContent(panel) {
     loadBtn.addEventListener('click', () => { document.getElementById('fileInput').click(); closePopover(); });
     row.append(saveBtn, loadBtn);
     popoverEl.appendChild(row);
+
+    const hLand = document.createElement('h3'); hLand.textContent = 'Сцена'; popoverEl.appendChild(hLand);
+    const landRow = document.createElement('div'); landRow.className = 'panel-row';
+    const landBtn = document.createElement('button');
+    landBtn.className = 'pbtn wide' + (landscapeMode ? ' on' : '');
+    landBtn.textContent = landscapeMode ? '⬛ AutoCAD-тема' : '☀ Ландшафт (небо + земля)';
+    landBtn.addEventListener('click', () => { setLandscapeMode(!landscapeMode); closePopover(); });
+    landRow.appendChild(landBtn);
+    popoverEl.appendChild(landRow);
 
     const h2 = document.createElement('h3'); h2.textContent = 'Групи об’єктів'; popoverEl.appendChild(h2);
     const groupRow = document.createElement('div'); groupRow.className = 'panel-row';
