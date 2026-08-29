@@ -34,6 +34,7 @@ const KIND_LABELS = {
   rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт', ground: 'Земля',
   compound: 'Складений об’єкт', roomFloor: 'Підлога кімнати', roomCeiling: 'Стеля кімнати',
   tile: 'Плитка', tileGrout: 'Шов (фуга)', spatialLine: 'Просторова лінія', wire: 'Провід',
+  stairs: 'Сходи',
 };
 
 // Standard-ish electrical wire colours — brown/blue/green-yellow (EU phase/
@@ -208,6 +209,13 @@ const groundGeo = new THREE.PlaneGeometry(80000, 80000);
 // against this single plane handles that for free.
 const ground = new THREE.Mesh(groundGeo, createMaterial('gridGround', '#161618', scene.environment));
 ground.rotation.x = -Math.PI / 2;
+// Sits a hair below world y=0 on purpose: the room floor's own top surface
+// is exactly at y=0 too, and two coplanar surfaces fighting for the same
+// depth-buffer value is what caused the flickering/"broken" floor look
+// reported inside rooms. A few mm is far below anything visible at this
+// scene's mm scale, but it reliably makes the room floor win the depth
+// test and fully occlude the ground plane beneath it.
+ground.position.y = -3;
 ground.receiveShadow = true;
 scene.add(ground);
 
@@ -319,6 +327,7 @@ let pinchStartScale = null;
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const DOWN_VEC = new THREE.Vector3(0, -1, 0); // reused by updateWalkFloorY's straight-down raycast
 
 function rayFromClient(x, y) {
   const rect = renderer.domElement.getBoundingClientRect();
@@ -449,6 +458,30 @@ function buildPipeGeometry(outerR = 220, innerR = 140, length = 1400, radialSegm
   return geometry;
 }
 
+// Foundation for a walkable stairs object — a solid staircase-profile prism
+// (2D silhouette in the X/Y plane extruded along Z for width), one real
+// BufferGeometry so it fits the same single-Mesh KIND_DEFS path as every
+// other primitive, and its step tops are ordinary raycastable surface, so
+// updateWalkFloorY() (see near updateFreeCamera) climbs it for free — no
+// per-object special-casing needed on the walking side. Fixed default
+// proportions for now (12 risers of a fairly standard 180 mm rise, 280 mm
+// run) — this is deliberately just the walkable primitive itself, not a
+// step-count/rise editor.
+function buildStairsGeometry(steps = 12, stepRun = 280, stepRise = 180, width = 1000) {
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 0);
+  for (let i = 0; i < steps; i++) {
+    shape.lineTo(i * stepRun, (i + 1) * stepRise);       // riser — straight up
+    shape.lineTo((i + 1) * stepRun, (i + 1) * stepRise);  // tread — straight across
+  }
+  shape.lineTo(steps * stepRun, 0); // back down to the ground behind the top step
+  shape.closePath();                // ground line back to the start closes the solid
+  const geometry = new THREE.ExtrudeGeometry(shape, { depth: width, bevelEnabled: false });
+  geometry.translate(0, 0, -width / 2); // centre the width, same convention as every other primitive
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
 const KIND_DEFS = {
   cube: { build: () => ({ geometry: new THREE.BoxGeometry(1000, 1000, 1000), restY: 500 }) },
   sphere: { build: () => ({ geometry: new THREE.SphereGeometry(500, 32, 16), restY: 500 }) },
@@ -457,6 +490,10 @@ const KIND_DEFS = {
   pipe: { build: () => ({ geometry: buildPipeGeometry(), restY: 220, isPipe: true }) },
   // A4-proportioned virtual sheet of paper — a drawing surface, not a solid prop.
   paper: { build: () => ({ geometry: new THREE.BoxGeometry(210, 3, 297), restY: 1.5 }) },
+  // The shape's own y=0 is already its base, unlike the centred primitives
+  // above, so restY stays 0 — placing it puts its base exactly on the
+  // tapped surface, same as anything else placed on the ground/a floor.
+  stairs: { build: () => ({ geometry: buildStairsGeometry(), restY: 0 }) },
 };
 
 function addObject(kind, point) {
@@ -555,22 +592,37 @@ function removeRoomLight(roomId) {
 
 // Builds the 6 meshes for one room spec, already offset by `center` and
 // tagged for the registry — callers still need to registerObject() each one.
+// Six distinct flat paint colours, one per room part (floor, ceiling, then
+// the 4 walls in buildRoomParts' fixed order) — muted enough to still read
+// as one coherent room — plain createPaintMaterial like every other
+// object's colour, nothing dynamic, so this can't be a source of the
+// rendering-noise regression the per-room light turned out to be. Lets
+// "the left wall" etc. be told apart at a glance without needing to tap
+// each one; any part's colour can still be repainted individually from its
+// own selection panel afterward.
+const ROOM_PART_COLORS = ['#c9c3b3', '#f2f0ea', '#d8c9b0', '#b0c4d8', '#c0d0b0', '#d0b8c0'];
+// Purely virtual reference letters (A–F), one per room part in that same
+// fixed order — not baked into any texture, just an on-screen overlay
+// label (see updateRoomPartLabels) so a side can be pointed at ("stinu B")
+// without needing real-world meaning.
+const ROOM_PART_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'];
+
 function buildRoomParts(params, roomId, center) {
   const { width, length, height } = params;
   const roomMeta = { roomId, roomParams: { ...params }, roomCenter: { x: center.x, y: center.y, z: center.z } };
   const parts = [];
 
   const floorGeom = new THREE.BoxGeometry(width, WALL_THICKNESS, length);
-  const floorMesh = new THREE.Mesh(floorGeom, createPaintMaterial('#c9c3b3'));
+  const floorMesh = new THREE.Mesh(floorGeom, createPaintMaterial(ROOM_PART_COLORS[0]));
   floorMesh.position.set(center.x, center.y - WALL_THICKNESS / 2, center.z);
   floorMesh.receiveShadow = true;
-  parts.push({ kind: 'roomFloor', mesh: floorMesh, extra: { ...roomMeta } });
+  parts.push({ kind: 'roomFloor', mesh: floorMesh, extra: { ...roomMeta, roomPartLetter: ROOM_PART_LETTERS[0], roomPartColor: ROOM_PART_COLORS[0] } });
 
   const ceilGeom = new THREE.BoxGeometry(width, WALL_THICKNESS, length);
-  const ceilMesh = new THREE.Mesh(ceilGeom, createPaintMaterial('#f2f0ea'));
+  const ceilMesh = new THREE.Mesh(ceilGeom, createPaintMaterial(ROOM_PART_COLORS[1]));
   ceilMesh.position.set(center.x, center.y + height + WALL_THICKNESS / 2, center.z);
   ceilMesh.receiveShadow = true;
-  parts.push({ kind: 'roomCeiling', mesh: ceilMesh, extra: { ...roomMeta } });
+  parts.push({ kind: 'roomCeiling', mesh: ceilMesh, extra: { ...roomMeta, roomPartLetter: ROOM_PART_LETTERS[1], roomPartColor: ROOM_PART_COLORS[1] } });
 
   const hw = width / 2, hl = length / 2;
   const wallDefs = [
@@ -579,24 +631,17 @@ function buildRoomParts(params, roomId, center) {
     { p1: { x: hw, z: hl }, p2: { x: -hw, z: hl } },
     { p1: { x: -hw, z: hl }, p2: { x: -hw, z: -hl } },
   ];
-  // Four distinct flat paint colours, one per wall, muted enough to still
-  // read as one coherent room — plain createPaintMaterial like every other
-  // object's colour, nothing dynamic, so this can't be a source of the
-  // rendering-noise regression the per-room light turned out to be. Lets
-  // "the left wall" etc. be told apart at a glance without needing to tap
-  // each one; any wall's colour can still be repainted individually from
-  // its own selection panel afterward.
-  const ROOM_WALL_COLORS = ['#d8c9b0', '#b0c4d8', '#c0d0b0', '#d0b8c0'];
   wallDefs.forEach((w, i) => {
     const dx = w.p2.x - w.p1.x, dz = w.p2.z - w.p1.z;
     const len = Math.hypot(dx, dz);
+    const color = ROOM_PART_COLORS[(i + 2) % ROOM_PART_COLORS.length];
     const wallGeom = new THREE.BoxGeometry(len, height, WALL_THICKNESS);
-    const wallMesh = new THREE.Mesh(wallGeom, createPaintMaterial(ROOM_WALL_COLORS[i % ROOM_WALL_COLORS.length]));
+    const wallMesh = new THREE.Mesh(wallGeom, createPaintMaterial(color));
     wallMesh.position.set(center.x + (w.p1.x + w.p2.x) / 2, center.y + height / 2, center.z + (w.p1.z + w.p2.z) / 2);
     wallMesh.rotation.y = Math.atan2(-dz, dx);
     wallMesh.castShadow = true;
     wallMesh.receiveShadow = true;
-    parts.push({ kind: 'wall', mesh: wallMesh, extra: { ...roomMeta, wallLength: len } });
+    parts.push({ kind: 'wall', mesh: wallMesh, extra: { ...roomMeta, wallLength: len, roomPartLetter: ROOM_PART_LETTERS[(i + 2) % ROOM_PART_LETTERS.length], roomPartColor: color } });
   });
   return parts;
 }
@@ -1037,6 +1082,7 @@ function convertSketchLine(record, targetKind) {
 // ---------------------------------------------------------------------------
 let spatialLineActive = false;
 let spatialLineDraft = null;          // { points: [Vector3, ...] } while drawing
+let spatialLineRadius = 5;            // mm — user-adjustable draft thickness, see renderSpatialLinePill
 let spatialLineGizmo = null;          // THREE.Group at the last committed point
 let spatialLineGizmoTargets = [];     // hit-test meshes tagged userData.slAxis or .slRing
 let spatialLineGizmoCustomGroup = null; // the rotating "custom angle" arrow, child of the gizmo
@@ -1279,6 +1325,22 @@ function renderSpatialLinePill() {
     : 'Торкніться, щоб поставити першу точку';
   modePillEl.appendChild(label);
 
+  // Draft thickness — only affects the raw purple draft look; a converted
+  // pipe/rebar/wire keeps its own fixed profile from SPATIAL_LINE_RUN_DEFS.
+  const thickInput = document.createElement('input');
+  thickInput.type = 'range'; thickInput.min = '2'; thickInput.max = '40'; thickInput.step = '1';
+  thickInput.value = String(spatialLineRadius);
+  thickInput.className = 'bend-angle-slider';
+  const thickLabel = document.createElement('span');
+  thickLabel.className = 'bend-angle-label';
+  thickLabel.textContent = `⌀${spatialLineRadius * 2} мм`;
+  thickInput.addEventListener('input', () => {
+    spatialLineRadius = Number(thickInput.value);
+    thickLabel.textContent = `⌀${spatialLineRadius * 2} мм`;
+  });
+  modePillEl.appendChild(thickInput);
+  modePillEl.appendChild(thickLabel);
+
   if (spatialLineDraft && spatialLineDraft.points.length > 1) {
     const undoBtn = document.createElement('button');
     undoBtn.textContent = '⌫ Точка';
@@ -1335,8 +1397,9 @@ const SPATIAL_LINE_RUN_DEFS = {
 // Shared by finishSpatialLine, convertSpatialLine, and the save/load
 // reconstruction below (buildObjectFromItem) — one segment mesh per pair
 // of consecutive points, `kind` either 'spatialLine' (the raw draft look —
-// a fixed purple) or one of SPATIAL_LINE_RUN_DEFS's converted types.
-function buildSpatialLineRunGroup(points, kind, color) {
+// a fixed purple, user-adjustable radius) or one of SPATIAL_LINE_RUN_DEFS's
+// converted types (radius comes from their own fixed CONVERT_DEFS profile).
+function buildSpatialLineRunGroup(points, kind, color, radius = 5) {
   const def = SPATIAL_LINE_RUN_DEFS[kind]; // undefined for the raw draft
   const rawMat = def ? null : createPaintMaterial('#8338ec');
   const group = new THREE.Group();
@@ -1352,7 +1415,7 @@ function buildSpatialLineRunGroup(points, kind, color) {
       geom = def.buildGeometry(length);
       mat = def.buildMaterial(color);
     } else {
-      geom = new THREE.CylinderGeometry(5, 5, length, 8);
+      geom = new THREE.CylinderGeometry(radius, radius, length, 8);
       geom.rotateZ(Math.PI / 2); // local +Y (cylinder's own axis) -> local +X, matching CONVERT_DEFS's convention
       mat = rawMat;
     }
@@ -1369,10 +1432,10 @@ function buildSpatialLineRunGroup(points, kind, color) {
 function finishSpatialLine() {
   if (!spatialLineDraft || spatialLineDraft.points.length < 2) { cancelSpatialLine(); return; }
   const points = spatialLineDraft.points;
-  const { group, totalLen } = buildSpatialLineRunGroup(points, 'spatialLine', null);
+  const { group, totalLen } = buildSpatialLineRunGroup(points, 'spatialLine', null, spatialLineRadius);
   if (!group.children.length) { toast('Лінія замала для збереження'); cancelSpatialLine(); return; }
 
-  const record = registerObject('spatialLine', group, { spatialLinePoints: points.map((p) => p.clone()) });
+  const record = registerObject('spatialLine', group, { spatialLinePoints: points.map((p) => p.clone()), spatialLineRadius });
   spatialLineActive = false;
   spatialLineDraft = null;
   detachSpatialLineGizmo();
@@ -1382,6 +1445,20 @@ function finishSpatialLine() {
   document.getElementById('spatialLineFab')?.classList.remove('on');
   select(record);
   toast(`Лінію завершено — ${points.length} точок, ${formatMm(totalLen, 0)} мм. Оберіть, у що перетворити.`);
+}
+
+// Rebuilds a still-raw (unconverted) "Просторова лінія" at a new tube
+// radius — same tear-down/rebuild/reselect pattern as rebuildRoom, since
+// the run is a Group of per-segment meshes rather than one mesh whose
+// geometry could just be swapped in place.
+function setSpatialLineRadius(record, radiusMm) {
+  const points = record.spatialLinePoints;
+  if (!points || points.length < 2) return;
+  removeObject(record);
+  const { group } = buildSpatialLineRunGroup(points, 'spatialLine', null, radiusMm);
+  const newRecord = registerObject('spatialLine', group, { spatialLinePoints: points.map((p) => p.clone()), spatialLineRadius: radiusMm });
+  spatialLineRadius = radiusMm;
+  select(newRecord);
 }
 
 function convertSpatialLine(record, targetKind, color) {
@@ -1422,6 +1499,45 @@ function updateSpatialLineTypeLabels() {
   }
   spatialLineLabelsGroupEl.innerHTML = '';
   spatialLineLabelsGroupEl.appendChild(frag);
+}
+
+// Small colour-matched badge + letter (A–F) floating over each room part's
+// own centre — purely a virtual on-screen label (see roomPartLetter in
+// buildRoomParts), never baked into any material/texture, so it can't be
+// the source of any rendering artefact. Always on while a part is on
+// screen, same "always on" convention as updateTileCutLabels.
+const roomPartLabelsGroupEl = document.getElementById('roomPartLabelsGroup');
+function updateRoomPartLabels() {
+  const parts = mode === 'edit' ? objects.filter((r) => r.roomPartLetter) : [];
+  if (!parts.length) {
+    if (roomPartLabelsGroupEl.childElementCount) roomPartLabelsGroupEl.innerHTML = '';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  const center = new THREE.Vector3();
+  for (const rec of parts) {
+    rec.root.getWorldPosition(center);
+    const s = slProjectToScreen(center);
+    if (s.behind) continue;
+    const g = document.createElementNS(SVG_NS, 'g');
+    g.setAttribute('class', 'room-part-label');
+    const badge = document.createElementNS(SVG_NS, 'circle');
+    badge.setAttribute('class', 'room-part-badge');
+    badge.setAttribute('cx', s.x);
+    badge.setAttribute('cy', s.y);
+    badge.setAttribute('r', 10);
+    badge.setAttribute('fill', rec.roomPartColor || '#f4f2f8');
+    g.appendChild(badge);
+    const text = document.createElementNS(SVG_NS, 'text');
+    text.setAttribute('class', 'room-part-text');
+    text.setAttribute('x', s.x);
+    text.setAttribute('y', s.y + 1);
+    text.textContent = rec.roomPartLetter;
+    g.appendChild(text);
+    frag.appendChild(g);
+  }
+  roomPartLabelsGroupEl.innerHTML = '';
+  roomPartLabelsGroupEl.appendChild(frag);
 }
 
 function enterPaperDrawMode() {
@@ -1846,13 +1962,14 @@ function updateRotateDrag(clientX, clientY) {
 // for a merged object whose geometry isn't centred at its own origin.
 // ---------------------------------------------------------------------------
 const dimGroups = {
+  total: { g: document.getElementById('dimGroupTotal'), line: document.querySelector('#dimGroupTotal .dim-line'), text: document.querySelector('#dimGroupTotal .dim-text') },
   x: { g: document.getElementById('dimGroupX'), line: document.querySelector('#dimGroupX .dim-line'), text: document.querySelector('#dimGroupX .dim-text') },
   y: { g: document.getElementById('dimGroupY'), line: document.querySelector('#dimGroupY .dim-line'), text: document.querySelector('#dimGroupY .dim-text') },
   z: { g: document.getElementById('dimGroupZ'), line: document.querySelector('#dimGroupZ .dim-line'), text: document.querySelector('#dimGroupZ .dim-text') },
 };
 
 function hideDimensionOverlay() {
-  for (const axis of ['x', 'y', 'z']) dimGroups[axis].g.classList.add('hidden');
+  for (const axis of ['total', 'x', 'y', 'z']) dimGroups[axis].g.classList.add('hidden');
 }
 
 function updateAxisLabels() {
@@ -1887,6 +2004,14 @@ function updateAxisLabels() {
     return { x: (ndc.x * 0.5 + 0.5) * window.innerWidth, y: (-ndc.y * 0.5 + 0.5) * window.innerHeight, behind: ndc.z < -1 || ndc.z > 1 };
   };
 
+  // The one overall "start of the object -> end of the object" span — the
+  // bounding box's own corner-to-corner diagonal, in local (unscaled) size —
+  // scaled up the same way sizeMm above is, so it reads correctly even on a
+  // resized object.
+  const totalSizeMm = localMax.clone().sub(localMin).multiply(root.scale);
+  ends.total = [localMin.clone(), localMax.clone()];
+  texts.total = `${formatMm(totalSizeMm.length())} мм`;
+
   // All three spans share the same centre point, so anchoring every label at
   // its own line's exact midpoint puts all three labels on top of each other
   // in screen space — that's the "solid clump of text" bug. Two independent
@@ -1895,8 +2020,8 @@ function updateAxisLabels() {
   // screen points), and give each axis a different perpendicular offset
   // distance so even a coincidental viewing angle can't restack them.
   const LABEL_ANCHOR_T = 0.68;
-  const LABEL_OFFSET_PX = { x: 14, y: 24, z: 34 };
-  for (const axis of ['x', 'y', 'z']) {
+  const LABEL_OFFSET_PX = { total: 8, x: 18, y: 28, z: 38 };
+  for (const axis of ['total', 'x', 'y', 'z']) {
     const [aLocal, bLocal] = ends[axis];
     const a = toScreen(aLocal), b = toScreen(bLocal);
     const { g, line, text } = dimGroups[axis];
@@ -2735,6 +2860,21 @@ function renderSelectionPanel() {
     info.textContent = `Точок: ${pts.length}, довжина: ${formatMm(totalLen)} мм`;
     selectionPanelEl.appendChild(info);
 
+    const thickWrap = document.createElement('div');
+    thickWrap.className = 'panel-row';
+    const thickInput = document.createElement('input');
+    thickInput.type = 'range'; thickInput.min = '2'; thickInput.max = '40'; thickInput.step = '1';
+    thickInput.value = String(selected.spatialLineRadius || 5);
+    thickInput.className = 'bend-angle-slider';
+    const thickLabel = document.createElement('span');
+    thickLabel.className = 'bend-angle-label';
+    thickLabel.textContent = `⌀${(selected.spatialLineRadius || 5) * 2} мм`;
+    thickInput.addEventListener('input', () => { thickLabel.textContent = `⌀${Number(thickInput.value) * 2} мм`; });
+    thickInput.addEventListener('change', () => setSpatialLineRadius(selected, Number(thickInput.value)));
+    thickWrap.appendChild(thickInput);
+    thickWrap.appendChild(thickLabel);
+    selectionPanelEl.appendChild(thickWrap);
+
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
     hint.textContent = 'Перетворити на:';
@@ -2955,7 +3095,7 @@ function buildPopoverContent(panel) {
   if (panel === 'objects') {
     const h = document.createElement('h3'); h.textContent = 'Додати об’єкт'; popoverEl.appendChild(h);
     const row = document.createElement('div'); row.className = 'panel-row';
-    for (const kind of ['cube', 'cylinder', 'pipe', 'sphere', 'cone', 'paper']) {
+    for (const kind of ['cube', 'cylinder', 'pipe', 'sphere', 'cone', 'stairs', 'paper']) {
       const b = document.createElement('button');
       b.className = 'pbtn' + (placingKind === kind ? ' on' : '');
       b.textContent = KIND_LABELS[kind];
@@ -3495,9 +3635,13 @@ canvas.addEventListener('pointermove', (e) => {
       const delta = dist - pinchStartDist;
       const dir = new THREE.Vector3();
       camera.getWorldDirection(dir);
-      const refDist = forwardHitDistance();
-      camera.position.addScaledVector(dir, delta * refDist * 0.0018);
-      if (mode === 'walk') camera.position.y = EYE_HEIGHT;
+      // smoothedRefDist (kept current every frame in animate()) instead of
+      // a fresh raycast here — see its declaration for why a raw per-event
+      // sample made this gesture feel jerky.
+      camera.position.addScaledVector(dir, delta * smoothedRefDist * 0.0018);
+      // Walk mode's eye height is owned by updateWalkFloorY() (runs every
+      // walk-mode frame in the render loop), not pinned here — same reason
+      // as in updateFreeCamera.
       pinchStartDist = dist;
     }
     return;
@@ -3734,7 +3878,9 @@ function enterWalkMode() {
   hideEl(resetViewBtn);
   showEl(crosshairEl);
   showEl(walkExitBtn);
-  camera.position.y = EYE_HEIGHT;
+  hideEl(spatialLineFabBtn); // edit-only tool — walk mode's pointerdown/move never check spatialLineActive
+  camera.position.y = EYE_HEIGHT; // fallback if nothing is under this X/Z yet
+  updateWalkFloorY(); // snap to whatever's actually underfoot right away (e.g. already standing on a raised floor)
   // Walking tours human-scale space, not mm-level inspection — a fixed,
   // generous pair is simpler and plenty for that.
   camera.near = 10;
@@ -3749,6 +3895,7 @@ function exitWalkMode() {
   showEl(document.getElementById('toolbar'));
   showEl(scaleBarEl);
   showEl(resetViewBtn);
+  showEl(spatialLineFabBtn);
   // edit mode re-fits near/far itself every frame; no repositioning needed —
   // there's no orbit pivot to recentre, the camera just stays put and flies on.
 }
@@ -3770,6 +3917,19 @@ function handleFreeLook(e) {
 
 // refDist is only meaningful (and only computed) in edit mode — walk mode
 // ignores it and always moves at human walking speed.
+// Speed-only smoothing of forwardHitDistance()'s raw raycast — recomputed
+// fresh every time with no memory of the last result, it can jump abruptly
+// (a ray grazing an edge, or losing/regaining a hit as the view turns even
+// slightly). Driving movement speed straight off that raw value is what
+// made both flying (desktop WASD) and pinch-navigating (touch) feel
+// "uneven/imprecise" even though the movement math itself was always
+// correct. Updated once per edit-mode frame in animate(); read from both
+// updateFreeCamera's fly branch and the pinch-navigate pointermove handler
+// so they share one settled value instead of each sampling their own.
+// updateAdaptiveClipping/updateScaleBar deliberately keep using the raw
+// value — getting close to geometry must never be masked by lag.
+let smoothedRefDist = 3000;
+
 function updateFreeCamera(dt, refDist) {
   camera.rotation.set(pitch, yaw, 0, 'YXZ');
 
@@ -3795,13 +3955,39 @@ function updateFreeCamera(dt, refDist) {
     // true fly: forward follows the full look direction, pitch included
     forward = new THREE.Vector3();
     camera.getWorldDirection(forward);
-    speed = Math.max(90, Math.min(11000, refDist * 0.8));
+    // smoothedRefDist (kept current every edit-mode frame in animate(), and
+    // also read directly by the pinch-navigate handler below) is used here
+    // instead of the raw refDist argument — see the comment where it's
+    // updated for why.
+    speed = Math.max(90, Math.min(11000, smoothedRefDist * 0.8));
   }
 
   const move = new THREE.Vector3().addScaledVector(forward, -my).addScaledVector(right, mx);
   if (move.lengthSq() > 0) move.normalize().multiplyScalar(speed * dt);
   camera.position.add(move);
-  if (mode === 'walk') camera.position.y = EYE_HEIGHT;
+  // Walk mode's eye height is no longer pinned to a flat EYE_HEIGHT here —
+  // updateWalkFloorY() (called every walk-mode frame regardless of which
+  // input moved the camera) follows the actual floor/step surface below,
+  // so stairs and raised floors work instead of clipping through them.
+}
+
+// Foundation for walking stairs/steps in first-person mode: a straight-down
+// raycast from above the camera's current X/Z finds whatever surface is
+// actually underfoot (room floor, the ground plane, or a stairs object's
+// step tops) and the eye rides directly on top of it. No smoothing/easing
+// on purpose — each step you physically walk onto should become your floor
+// level immediately, the same way it would climbing real stairs; a
+// lagged/eased follow would instead feel like floating up to it. Called
+// every walk-mode frame regardless of what moved the camera (WASD/arrows
+// via updateFreeCamera, or the two-finger pinch-to-walk gesture), so both
+// input paths get the same floor-following behaviour for free.
+function updateWalkFloorY() {
+  const origin = new THREE.Vector3(camera.position.x, camera.position.y + 2000, camera.position.z);
+  raycaster.set(origin, DOWN_VEC);
+  const hits = raycaster.intersectObjects(raycastTargets, false);
+  // No hit under this exact point (e.g. momentarily off the edge of
+  // everything) — hold the last known height rather than snapping to 0.
+  if (hits.length) camera.position.y = hits[0].point.y + EYE_HEIGHT;
 }
 
 // ---------------------------------------------------------------------------
@@ -3820,7 +4006,7 @@ function serializeObjectRecord(rec, positionOverride) {
     return {
       id: rec.id, kind: rec.kind,
       spatialLinePoints: rec.spatialLinePoints.map((p) => p.toArray()),
-      runLabel: rec.runLabel, runColor: rec.runColor,
+      runLabel: rec.runLabel, runColor: rec.runColor, spatialLineRadius: rec.spatialLineRadius,
       position: (positionOverride || rec.root.position).toArray(),
       quaternion: rec.root.quaternion.toArray(),
       scale: rec.root.scale.toArray(),
@@ -3968,10 +4154,10 @@ function loadProject(data) {
 function buildObjectFromItem(item) {
   if (item.spatialLinePoints) {
     const points = item.spatialLinePoints.map((a) => new THREE.Vector3().fromArray(a));
-    const { group } = buildSpatialLineRunGroup(points, item.kind, item.runColor);
+    const { group } = buildSpatialLineRunGroup(points, item.kind, item.runColor, item.spatialLineRadius);
     group.quaternion.fromArray(item.quaternion);
     if (item.scale) group.scale.fromArray(item.scale);
-    return { root: group, extra: { spatialLinePoints: points, runLabel: item.runLabel, runColor: item.runColor } };
+    return { root: group, extra: { spatialLinePoints: points, runLabel: item.runLabel, runColor: item.runColor, spatialLineRadius: item.spatialLineRadius } };
   }
   if (item.kind === 'window') {
     const group = buildWindowGroup(item.width, item.height, item.thickness, item.frameColor);
@@ -4499,17 +4685,27 @@ function animate() {
   const dt = Math.min(0.05, (now - lastFrame) / 1000);
   lastFrame = now;
 
+  // Kept current every frame regardless of mode — both updateFreeCamera's
+  // fly branch and the pinch-navigate pointermove handler read this one
+  // settled value (walk mode's own dolly-pinch gesture included), rather
+  // than each sampling their own raw, jitter-prone raycast. See the
+  // comment on smoothedRefDist's declaration for the full why.
+  const refDist = forwardHitDistance();
+  const speedSmoothing = 1 - Math.exp(-dt * 6);
+  smoothedRefDist += (refDist - smoothedRefDist) * speedSmoothing;
+
   if (mode === 'edit') {
-    const refDist = forwardHitDistance();
-    updateAdaptiveClipping(refDist);
-    updateScaleBar(refDist);
+    updateAdaptiveClipping(refDist); // raw — must react instantly so near clipping never lags into geometry
+    updateScaleBar(refDist); // raw — a live readout of what's actually ahead, not a movement input
     updateFreeCamera(dt, refDist);
     updateAxisLabels();
     updateHoleLabels();
     updateTileCutLabels();
     updateSpatialLineTypeLabels();
+    updateRoomPartLabels();
   } else if (mode === 'walk') {
     updateFreeCamera(dt, 0);
+    updateWalkFloorY();
   }
   updateMinimap();
   renderer.render(scene, camera);

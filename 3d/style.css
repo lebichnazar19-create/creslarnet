@@ -368,6 +368,19 @@ html, body {
 .dim-text-x { fill: #ff8f8f; }
 .dim-text-y { fill: #8fb4ff; }
 .dim-text-z { fill: #7be09a; }
+.dim-line-total { stroke: #39ff7a; stroke-width: 2.25; }
+.dim-text-total {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 800;
+  fill: #39ff7a;
+  paint-order: stroke;
+  stroke: rgba(20, 18, 26, 0.85);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
 
 /* ---------- hole/cutout diameter callouts ---------- */
 .hole-label .hole-leader { stroke: #f4f2f8; stroke-width: 1.2; opacity: 0.85; }
@@ -409,6 +422,21 @@ html, body {
   stroke-linejoin: round;
   text-anchor: middle;
   dominant-baseline: middle;
+}
+
+/* ---------- room part reference letters (floor/ceiling/walls, A–F) ---------- */
+.room-part-badge {
+  stroke: rgba(20, 18, 26, 0.85);
+  stroke-width: 1.5px;
+}
+.room-part-text {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  fill: #14121a;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
 }
 
 /* ---------- object dimension readout ---------- */
