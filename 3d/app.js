@@ -1170,13 +1170,23 @@ function buildSpatialLineGizmo(size = SPATIAL_LINE_GIZMO_SIZE) {
   }
 
   // Rotation ring (horizontal plane) — aims the custom-angle arrow below.
-  const ringR = size * 0.75, tubeR = size * 0.045;
+  // Radius kept well outside the arrows' own reach (tip at shaftLen+headLen
+  // = 1.2*size) on purpose: the X/negX/Z/negZ arrows also lie flat in this
+  // same horizontal plane, and the ring used to sit at 0.75*size — squarely
+  // along their shafts — so a raycast anywhere past roughly 3/4 of the way
+  // out those four arrows hit the ring's much fatter hit-torus instead of
+  // the arrow itself. That's the actual reason dragging an arrow so often
+  // silently did nothing (or moved the ring/custom-angle arrow instead):
+  // most natural taps along a shaft land well past that 3/4 mark. The Y/
+  // negY arrows never had this problem (they don't lie in the ring's
+  // plane), which is why only some arrows/the ring ever seemed to respond.
+  const ringR = size * 1.5, tubeR = size * 0.03;
   const ringMat = new THREE.MeshBasicMaterial({ color: 0x8338ec, depthTest: false, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
   const ring = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), ringMat);
   ring.rotateX(-Math.PI / 2);
   ring.userData.isHelper = true;
   group.add(ring);
-  const ringHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 4, 8, 48), hitMat);
+  const ringHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 3, 8, 48), hitMat);
   ringHit.rotateX(-Math.PI / 2);
   ringHit.userData.slRing = true;
   ringHit.userData.isHelper = true;
@@ -1227,6 +1237,48 @@ function updateSpatialLineGizmoScale() {
   const distToCam = camera.position.distanceTo(spatialLineGizmo.position);
   const size = Math.max(120, Math.min(900, distToCam * 0.12));
   spatialLineGizmo.scale.setScalar(size / SPATIAL_LINE_GIZMO_SIZE);
+}
+
+// Shortest distance from point (px,py) to the screen-space segment (a->b) —
+// plain 2D geometry, used below to pick which arrow a tap actually landed
+// nearest to.
+function distToSegmentPx(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  let t = lenSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lenSq : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + dx * t, cy = ay + dy * t;
+  return Math.hypot(px - cx, py - cy);
+}
+
+// Which of the 6 arrows (if any) a tap actually landed nearest to — screen-
+// space distance to each arrow's own projected shaft, not a 3D raycast
+// against a fat invisible hit-proxy. The raycast approach broke down for
+// two independent reasons found by simulating it directly: (1) the ring
+// fully encircles the arrows and, viewed from a camera at roughly the same
+// height as the gizmo (the common case — you're usually looking more or
+// less level at the point you just placed), it can be the geometrically
+// CLOSEST hit along a ray that's visually aimed at an arrow's shaft; (2) all
+// six arrows share one origin, so their fattened hit-cylinders genuinely
+// overlap each other near the base, and picking hits[0] (nearest in raw 3D
+// distance) doesn't reliably match which one a tap was actually closest to
+// on screen. Comparing screen-space distances directly sidesteps both —
+// there's no 3D depth order left to get ambiguous.
+function pickSpatialLineArrow(clientX, clientY) {
+  if (!spatialLineGizmo) return null;
+  const reach = SPATIAL_LINE_GIZMO_SIZE * 1.2 * spatialLineGizmo.scale.x; // shaftLen(0.9) + headLen(0.3), current scale
+  const base = projectToScreenPx(spatialLineGizmo.position);
+  let best = null, bestDist = Infinity;
+  for (const axisKey of Object.keys(SL_AXIS_DIRS)) {
+    const tipWorld = spatialLineGizmo.position.clone().addScaledVector(SL_AXIS_DIRS[axisKey], reach);
+    const ndc = tipWorld.clone().project(camera);
+    if (ndc.z < -1 || ndc.z > 1) continue; // tip behind the camera — can't be what was tapped
+    const tip = projectToScreenPx(tipWorld);
+    const d = distToSegmentPx(clientX, clientY, base.x, base.y, tip.x, tip.y);
+    if (d < bestDist) { bestDist = d; best = axisKey; }
+  }
+  const SL_ARROW_HIT_PX = 34; // generous, fingertip-sized tolerance
+  return bestDist <= SL_ARROW_HIT_PX ? best : null;
 }
 
 function attachSpatialLineGizmo(point) {
@@ -3640,18 +3692,26 @@ canvas.addEventListener('pointerdown', (e) => {
       }
     } else if (mode === 'edit' && spatialLineActive && spatialLineGizmo) {
       scene.updateMatrixWorld(true);
-      const hits = rayFromClient(e.clientX, e.clientY).intersectObjects(spatialLineGizmoTargets, false);
-      if (hits.length) {
-        const hitMesh = hits[0].object;
-        if (hitMesh.userData.slRing) beginSpatialLineRingDrag(e.clientX, e.clientY);
-        else beginSpatialLineDrag(hitMesh.userData.slAxis, e.clientX, e.clientY);
+      // Arrows are picked by screen-space distance (pickSpatialLineArrow),
+      // not a 3D raycast — see that function for the two independent ways
+      // raycasting the fat invisible hit-proxies broke down (the encircling
+      // ring reading as the nearest 3D hit from a level camera angle, and
+      // the six arrows' hit-cylinders genuinely overlapping near their
+      // shared origin). The ring itself is still a plain raycast — it's a
+      // single, unambiguous target once an arrow can no longer wrongly
+      // intercept it first.
+      const arrowAxis = pickSpatialLineArrow(e.clientX, e.clientY);
+      const ringHitEntry = arrowAxis ? null : rayFromClient(e.clientX, e.clientY).intersectObjects(spatialLineGizmoTargets, false).find((h) => h.object.userData.slRing);
+      if (arrowAxis) {
+        beginSpatialLineDrag(arrowAxis, e.clientX, e.clientY);
+      } else if (ringHitEntry) {
+        beginSpatialLineRingDrag(e.clientX, e.clientY);
       } else {
         // Missed every arrow/ring — free look, exactly like anywhere else a
         // tap lands on nothing interactive, instead of silently doing
         // nothing (which made single-finger look-around feel completely
         // locked out while this tool was active).
-        lookPointerId = e.pointerId;
-        lastLookX = e.clientX; lastLookY = e.clientY;
+        startLookDrag(e.pointerId, e.clientX, e.clientY);
       }
     } else if (mode === 'edit' && sculptActive && sculptTarget) {
       scene.updateMatrixWorld(true);
@@ -3661,8 +3721,7 @@ canvas.addEventListener('pointerdown', (e) => {
         applySculptAt(hits[0].point);
       }
     } else if (!moveMode && !paperDrawing) {
-      lookPointerId = e.pointerId;
-      lastLookX = e.clientX; lastLookY = e.clientY;
+      startLookDrag(e.pointerId, e.clientX, e.clientY);
     }
   } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !sculptDragging) {
     pinchStartDist = currentPinchDist();
@@ -3721,16 +3780,23 @@ canvas.addEventListener('pointermove', (e) => {
       // continuing the gesture keeps moving rather than saturating at one
       // ratio. Dollies along the ray THROUGH the fingers' own on-screen
       // midpoint, not always straight down the centre of the view — fingers
-      // over on the right side of the screen zoom toward the right, etc.,
-      // instead of the zoom direction being disconnected from where the
-      // pinch actually is.
-      const delta = dist - pinchStartDist;
+      // over on the right side of the screen zoom toward the right, etc.
+      // Moving the camera straight along that fixed ray direction is an
+      // exact zoom toward whatever's there: any point that actually lies on
+      // that ray stays in exactly the same screen direction the whole time,
+      // since only the camera's position changes here, never its
+      // orientation.
+      const delta = dist - pinchStartDist; // CSS px this pointermove tick moved the fingers apart
       const mid = currentPinchMidpoint();
       const dir = mid ? rayFromClient(mid.x, mid.y).ray.direction.clone() : camera.getWorldDirection(new THREE.Vector3());
-      // smoothedRefDist (kept current every frame in animate()) instead of
-      // a fresh raycast here — see its declaration for why a raw per-event
-      // sample made this gesture feel jerky.
-      camera.position.addScaledVector(dir, delta * smoothedRefDist * 0.0018);
+      // Direct 1:1 correspondence between finger-spread distance and dolly
+      // distance — every 1px more/less of pinch spread moves the camera
+      // 1mm along dir, no distance-based scaling. ("мм" here is CSS pixels,
+      // the only unit a pointer event actually reports — true physical
+      // device mm isn't obtainable from the browser without a per-device
+      // DPI calibration the app has no way to know.)
+      const PINCH_MM_PER_PX = 1;
+      camera.position.addScaledVector(dir, delta * PINCH_MM_PER_PX);
       // Walk mode's eye height is owned by updateWalkFloorY() (runs every
       // walk-mode frame in the render loop), not pinned here — same reason
       // as in updateFreeCamera.
@@ -4108,9 +4174,36 @@ function updateOrbitCamera() {
   camera.rotation.set(pitch, yaw, 0, 'YXZ');
 }
 
+// Look-drag delta smoothing state — see handleFreeLook. Reset by
+// startLookDrag whenever a new look-drag gesture begins, so a fresh drag
+// always responds immediately instead of easing in from zero.
+let smoothLookDx = 0, smoothLookDy = 0;
+
+// Starts a look-drag (turning the view by dragging a finger/mouse) — the
+// one place lookPointerId/lastLookX/lastLookY get set, so the delta
+// smoothing below always starts from a clean slate for a new gesture
+// instead of carrying over a stale value from whatever the last drag was
+// doing when it ended.
+function startLookDrag(pointerId, x, y) {
+  lookPointerId = pointerId;
+  lastLookX = x; lastLookY = y;
+  smoothLookDx = 0; smoothLookDy = 0;
+}
+
 function handleFreeLook(e) {
-  const dx = e.clientX - lastLookX, dy = e.clientY - lastLookY;
+  const rawDx = e.clientX - lastLookX, rawDy = e.clientY - lastLookY;
   lastLookX = e.clientX; lastLookY = e.clientY;
+  // Light smoothing on the raw per-event delta, not on yaw/pitch
+  // themselves — individual touch samples can be a little jittery even
+  // during a slow, deliberate swipe, and blending in a bit of the previous
+  // event's delta filters that out. This only smooths between events that
+  // are already happening; it adds no lag on drag start (see
+  // startLookDrag) and no momentum/drift after the finger lifts, so it
+  // can't make the view feel disconnected from the finger, only steadier.
+  const DELTA_SMOOTHING = 0.35;
+  smoothLookDx = smoothLookDx * DELTA_SMOOTHING + rawDx * (1 - DELTA_SMOOTHING);
+  smoothLookDy = smoothLookDy * DELTA_SMOOTHING + rawDy * (1 - DELTA_SMOOTHING);
+  const dx = smoothLookDx, dy = smoothLookDy;
   const sens = 0.002;
   if (autoRotateActive) setAutoRotate(false); // any manual look takes control back
   if (orbitActive) {
@@ -4133,14 +4226,14 @@ function handleFreeLook(e) {
 // Speed-only smoothing of forwardHitDistance()'s raw raycast — recomputed
 // fresh every time with no memory of the last result, it can jump abruptly
 // (a ray grazing an edge, or losing/regaining a hit as the view turns even
-// slightly). Driving movement speed straight off that raw value is what
-// made both flying (desktop WASD) and pinch-navigating (touch) feel
-// "uneven/imprecise" even though the movement math itself was always
-// correct. Updated once per edit-mode frame in animate(); read from both
-// updateFreeCamera's fly branch and the pinch-navigate pointermove handler
-// so they share one settled value instead of each sampling their own.
-// updateAdaptiveClipping/updateScaleBar deliberately keep using the raw
-// value — getting close to geometry must never be masked by lag.
+// slightly). Driving movement speed straight off that raw value made
+// keyboard flying feel "uneven/imprecise" even though the movement math
+// itself was always correct. Updated once per edit-mode frame in animate();
+// read by updateFreeCamera's fly branch (desktop WASD/arrows) — the touch
+// pinch-navigate gesture uses a fixed 1:1 px-to-mm speed instead (see its
+// own comment) so it isn't affected by this. updateAdaptiveClipping/
+// updateScaleBar deliberately keep using the raw value — getting close to
+// geometry must never be masked by lag.
 let smoothedRefDist = 3000;
 
 function updateFreeCamera(dt, refDist) {
@@ -4898,11 +4991,10 @@ function animate() {
   const dt = Math.min(0.05, (now - lastFrame) / 1000);
   lastFrame = now;
 
-  // Kept current every frame regardless of mode — both updateFreeCamera's
-  // fly branch and the pinch-navigate pointermove handler read this one
-  // settled value (walk mode's own dolly-pinch gesture included), rather
-  // than each sampling their own raw, jitter-prone raycast. See the
-  // comment on smoothedRefDist's declaration for the full why.
+  // Kept current every frame regardless of mode — updateFreeCamera's fly
+  // branch (desktop WASD/arrows) reads this one settled value instead of
+  // sampling its own raw, jitter-prone raycast each time. See the comment
+  // on smoothedRefDist's declaration for the full why.
   const refDist = forwardHitDistance();
   const speedSmoothing = 1 - Math.exp(-dt * 6);
   smoothedRefDist += (refDist - smoothedRefDist) * speedSmoothing;
