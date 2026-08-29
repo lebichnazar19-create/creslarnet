@@ -26,6 +26,28 @@ const WINDOW_WIDTH = 1000;
 const WINDOW_HEIGHT = 1200;
 const EYE_HEIGHT = 1650;
 const WALK_SPEED = 3200; // mm / second (≈ a brisk walking pace)
+// A held key or an analog touch "push" only sets a TARGET speed —
+// walkVelForward/walkVelStrafe (see updateFreeCamera's walk branch) ease
+// toward it at this rate instead of snapping straight to full speed or
+// straight to a stop, so starting or stopping reads as a step or two of
+// actually speeding up/slowing down, not a jump-cut in velocity.
+const WALK_ACCEL = 9000; // mm / second² — reaches full walking speed in well under half a second
+let walkVelForward = 0, walkVelStrafe = 0; // mm/s, current eased speed
+// Touch has no keyboard, so the two-finger gesture's own midpoint moving up
+// (forward) or down (back) the screen — while pinch distance drives a pure
+// FOV zoom instead — is its walking-speed input, treated like a real
+// analog stick: distance from where the gesture started, not a running
+// per-tick delta, so it recentres visibly the moment the fingers stop
+// pushing rather than silently drifting.
+let walkTouchForward = 0; // -1..1
+let walkPinchAnchorY = null;
+const WALK_TOUCH_PUSH_RANGE_PX = 90; // full deflection distance for that "stick"
+// Never lets a walking step carry the eye closer than this to a solid
+// surface in front of it — the same way a person's own body stops them at
+// a wall rather than letting their eyes pass through it. A single ray in
+// the exact direction of travel, checked every step: enough for "basic
+// collision" as asked, not a full physics sweep.
+const WALK_COLLIDE_RADIUS = 350; // mm
 const PAPER_COLOR = '#f7f4ec'; // warm paper white, distinct from the neutral default object tint
 
 const KIND_LABELS = {
@@ -3796,7 +3818,17 @@ canvas.addEventListener('pointerdown', (e) => {
     }
   } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !spatialLineMoveDrag && !sculptDragging) {
     pinchStartDist = currentPinchDist();
-    if (orbitActive) {
+    if (mode === 'walk') {
+      // Walking never "zooms toward" anything the way flying does — pinch
+      // distance is a pure optical FOV zoom here (binoculars, not motion),
+      // and is tracked completely separately from walkTouchForward below,
+      // which is what actually moves the body. See updateFreeCamera's walk
+      // branch for how that "push" then gets eased into an actual walking
+      // speed, same as a held W key.
+      const mid = currentPinchMidpoint();
+      walkPinchAnchorY = mid ? mid.y : null;
+      walkTouchForward = 0;
+    } else if (orbitActive) {
       orbitStartRadius = orbitRadius;
       pinchStartScale = null; // orbit mode always keeps `selected` set for its panel — make sure a stale scale from an earlier pinch can't leak into a resize below
     } else {
@@ -3820,7 +3852,27 @@ canvas.addEventListener('pointermove', (e) => {
   }
   if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !spatialLineMoveDrag && !sculptDragging) {
     const dist = currentPinchDist();
-    if (orbitActive) {
+    if (mode === 'walk') {
+      // Pure optical zoom (FOV) from the pinch distance — completely
+      // decoupled from actually moving the body, which is the separate
+      // analog "push" signal right below (fed into updateFreeCamera's walk
+      // branch, the same place a held W key goes, so both ease in and out
+      // through the same acceleration model).
+      if (pinchStartDist > 10) {
+        const delta = dist - pinchStartDist;
+        setFov(camera.fov - delta * 0.15);
+        pinchStartDist = dist;
+      }
+      // The gesture's own midpoint moving up/down the screen, measured
+      // from where the gesture STARTED (not an incremental per-tick
+      // delta) — like a real joystick: push further to walk faster, ease
+      // off and it visibly recentres instead of silently drifting.
+      const mid = currentPinchMidpoint();
+      if (mid && walkPinchAnchorY !== null) {
+        const pushPx = walkPinchAnchorY - mid.y; // fingers sliding up the screen = walking forward
+        walkTouchForward = Math.max(-1, Math.min(1, pushPx / WALK_TOUCH_PUSH_RANGE_PX));
+      }
+    } else if (orbitActive) {
       // Spread apart = closer (smaller radius), pinch together = farther —
       // same direction pinch-zoom already means everywhere else in the app.
       if (pinchStartDist > 10) {
@@ -3868,9 +3920,9 @@ canvas.addEventListener('pointermove', (e) => {
       // DPI calibration the app has no way to know.)
       const PINCH_MM_PER_PX = 1;
       camera.position.addScaledVector(dir, delta * PINCH_MM_PER_PX);
-      // Walk mode's eye height is owned by updateWalkFloorY() (runs every
-      // walk-mode frame in the render loop), not pinned here — same reason
-      // as in updateFreeCamera.
+      // Edit mode only — walk mode's own two-finger gesture is handled
+      // entirely in the branch above (pure FOV zoom + the analog walking
+      // "push", never a body-dolly like this).
       pinchStartDist = dist;
     }
     return;
@@ -3922,7 +3974,13 @@ function endPointer(e) {
   const wasPinching = activePointers.size >= 2 && pinchStartDist > 0;
   const wasGizmoDrag = !!(moveDragGizmo || rotateDragGizmo);
   activePointers.delete(e.pointerId);
-  if (activePointers.size < 2) { pinchStartScale = null; pinchStartDist = 0; }
+  if (activePointers.size < 2) {
+    pinchStartScale = null; pinchStartDist = 0;
+    // Lifting a finger ends the walking "push" too — it eases back down to
+    // a stop through the same acceleration as letting go of W, rather than
+    // the camera instantly freezing mid-stride.
+    walkTouchForward = 0; walkPinchAnchorY = null;
+  }
   if (lookPointerId === e.pointerId) lookPointerId = null;
   if (e.pointerId === primaryPointerId) { moveDragGizmo = null; rotateDragGizmo = null; }
 
@@ -4136,8 +4194,14 @@ function enterWalkMode() {
   showEl(crosshairEl);
   showEl(walkExitBtn);
   hideEl(spatialLineFabBtn); // edit-only tool — walk mode's pointerdown/move never check spatialLineActive
+  // Fresh start every session — nothing carries over from a previous walk
+  // (or from edit mode's own unrelated state) that could otherwise show up
+  // as a stray drift/jerk the moment this one begins.
+  walkFloorY = null;
+  walkVelForward = 0; walkVelStrafe = 0;
+  walkTouchForward = 0; walkPinchAnchorY = null;
   camera.position.y = EYE_HEIGHT; // fallback if nothing is under this X/Z yet
-  updateWalkFloorY(); // snap to whatever's actually underfoot right away (e.g. already standing on a raised floor)
+  updateWalkFloorY(1); // snap to whatever's actually underfoot right away (dt doesn't matter — walkFloorY===null always snaps outright, see its own comment)
   // Walking tours human-scale space, not mm-level inspection — a fixed,
   // generous pair is simpler and plenty for that.
   camera.near = 10;
@@ -4313,45 +4377,82 @@ function handleFreeLook(e) {
 // geometry must never be masked by lag.
 let smoothedRefDist = 3000;
 
+// Never lets a walking step carry the eye closer than WALK_COLLIDE_RADIUS
+// to whatever's in front of it — casts one ray in the exact direction this
+// step is already moving and shortens it if something solid is closer than
+// that clearance would leave. A person's own body stops them at a wall
+// this same way; the camera never even reaches it to "clip through".
+function clampWalkMove(moveVec) {
+  const dist = moveVec.length();
+  if (dist < 1) return moveVec;
+  const dir = moveVec.clone().divideScalar(dist);
+  raycaster.set(camera.position, dir);
+  const hits = raycaster.intersectObjects(raycastTargets, false);
+  if (!hits.length) return moveVec;
+  const clearance = Math.max(0, hits[0].distance - WALK_COLLIDE_RADIUS);
+  return clearance >= dist ? moveVec : moveVec.multiplyScalar(clearance / dist);
+}
+
 function updateFreeCamera(dt, refDist) {
   camera.rotation.set(pitch, yaw, 0, 'YXZ');
 
-  // On touch there is no strafe input any more (pinch only drives forward/
-  // back) — turn to face where you want to go, same as most simple 3D
-  // walkthroughs. Desktop keeps full WASD/arrow freedom.
   let mx = 0, my = 0;
   if (keys.has('KeyW') || keys.has('ArrowUp')) my -= 1;
   if (keys.has('KeyS') || keys.has('ArrowDown')) my += 1;
   if (keys.has('KeyA') || keys.has('ArrowLeft')) mx -= 1;
   if (keys.has('KeyD') || keys.has('ArrowRight')) mx += 1;
+
+  if (mode === 'walk') {
+    // Touch has no keyboard — the two-finger "push" (see its own comment
+    // where it's set) adds to the same forward/back axis W/S already use.
+    my -= walkTouchForward;
+    mx = Math.max(-1, Math.min(1, mx));
+    my = Math.max(-1, Math.min(1, my));
+
+    const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+    const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw)); // flattened — walking on the ground, not climbing by looking up
+
+    // Ease the ACTUAL speed toward whatever the input is currently asking
+    // for, at a capped acceleration, instead of snapping straight to full
+    // speed or straight to a stop — a real step or two of speeding up or
+    // slowing down (including easing all the way down once every input
+    // lets go), the way an actual person starts and stops walking.
+    const targetForward = -my * WALK_SPEED, targetStrafe = mx * WALK_SPEED;
+    const maxStep = WALK_ACCEL * dt;
+    walkVelForward += Math.max(-maxStep, Math.min(maxStep, targetForward - walkVelForward));
+    walkVelStrafe += Math.max(-maxStep, Math.min(maxStep, targetStrafe - walkVelStrafe));
+    if (Math.abs(walkVelForward) < 1) walkVelForward = 0;
+    if (Math.abs(walkVelStrafe) < 1) walkVelStrafe = 0;
+    if (walkVelForward === 0 && walkVelStrafe === 0) return; // fully stopped — nothing to move or collide-check
+
+    const move = clampWalkMove(new THREE.Vector3().addScaledVector(forward, walkVelForward * dt).addScaledVector(right, walkVelStrafe * dt));
+    camera.position.add(move);
+    // Eye height isn't touched here — updateWalkFloorY() (called every
+    // walk-mode frame regardless of what moved the camera) follows the
+    // actual floor/step surface below, so stairs and raised floors work
+    // instead of clipping through them, and a fixed 1650mm-ish eye height
+    // over flat ground falls out of that the same way.
+    return;
+  }
+
+  // Edit mode: true fly, pitch included — a CAD fly-through, not a person,
+  // so it deliberately keeps its own free instant-response feel (including
+  // full WASD/arrow strafe, which touch's pinch-based navigation never
+  // had) rather than the walk-mode human model above.
   mx = Math.max(-1, Math.min(1, mx));
   my = Math.max(-1, Math.min(1, my));
   if (mx === 0 && my === 0) return;
-
   const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
-  let forward, speed;
-  if (mode === 'walk') {
-    // flattened to horizontal — you walk on the ground, you don't climb by looking up
-    forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-    speed = WALK_SPEED;
-  } else {
-    // true fly: forward follows the full look direction, pitch included
-    forward = new THREE.Vector3();
-    camera.getWorldDirection(forward);
-    // smoothedRefDist (kept current every edit-mode frame in animate(), and
-    // also read directly by the pinch-navigate handler below) is used here
-    // instead of the raw refDist argument — see the comment where it's
-    // updated for why.
-    speed = Math.max(90, Math.min(11000, smoothedRefDist * 0.8));
-  }
-
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  // smoothedRefDist (kept current every edit-mode frame in animate(), and
+  // also read directly by the pinch-navigate handler below) is used here
+  // instead of the raw refDist argument — see the comment where it's
+  // updated for why.
+  const speed = Math.max(90, Math.min(11000, smoothedRefDist * 0.8));
   const move = new THREE.Vector3().addScaledVector(forward, -my).addScaledVector(right, mx);
   if (move.lengthSq() > 0) move.normalize().multiplyScalar(speed * dt);
   camera.position.add(move);
-  // Walk mode's eye height is no longer pinned to a flat EYE_HEIGHT here —
-  // updateWalkFloorY() (called every walk-mode frame regardless of which
-  // input moved the camera) follows the actual floor/step surface below,
-  // so stairs and raised floors work instead of clipping through them.
 }
 
 // Foundation for walking stairs/steps in first-person mode: a straight-down
@@ -4364,13 +4465,32 @@ function updateFreeCamera(dt, refDist) {
 // every walk-mode frame regardless of what moved the camera (WASD/arrows
 // via updateFreeCamera, or the two-finger pinch-to-walk gesture), so both
 // input paths get the same floor-following behaviour for free.
-function updateWalkFloorY() {
+// Smoothed floor height this eye actually rides on — see updateWalkFloorY.
+// null means "no reading yet", the only case that snaps outright instead
+// of easing (nothing to ease FROM on the very first frame of a session).
+let walkFloorY = null;
+
+function updateWalkFloorY(dt) {
   const origin = new THREE.Vector3(camera.position.x, camera.position.y + 2000, camera.position.z);
   raycaster.set(origin, DOWN_VEC);
   const hits = raycaster.intersectObjects(raycastTargets, false);
   // No hit under this exact point (e.g. momentarily off the edge of
   // everything) — hold the last known height rather than snapping to 0.
-  if (hits.length) camera.position.y = hits[0].point.y + EYE_HEIGHT;
+  if (!hits.length) return;
+  const targetY = hits[0].point.y;
+  if (walkFloorY === null) {
+    walkFloorY = targetY; // first reading this session — nothing to ease from, so land exactly here
+  } else {
+    // Fast enough to still feel immediate crossing a real stair (the worst
+    // case — a full step's rise over a full step's tread — is well over
+    // 90% caught up within one tread's crossing time), but enough to
+    // smooth away a single noisy/borderline frame (two almost-coplanar
+    // surfaces trading off which one the raycast hits, a doorway threshold
+    // seam) instead of it reading as a jerk.
+    const smoothing = 1 - Math.exp(-dt * 25);
+    walkFloorY += (targetY - walkFloorY) * smoothing;
+  }
+  camera.position.y = walkFloorY + EYE_HEIGHT;
 }
 
 // ---------------------------------------------------------------------------
@@ -5093,7 +5213,7 @@ function animate() {
     updateRoomPartLabels();
   } else if (mode === 'walk') {
     updateFreeCamera(dt, 0);
-    updateWalkFloorY();
+    updateWalkFloorY(dt);
   }
   updateMinimap();
   renderer.render(scene, camera);
