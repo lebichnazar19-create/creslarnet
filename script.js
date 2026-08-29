@@ -1485,6 +1485,208 @@ if ('serviceWorker' in navigator) {
   });
 
   // ---------------------------------------------------------------------
+  // "Камера-вимірювання" — live rear-camera view for on-site work: aim the
+  // phone at a real object (a tile, a wall) while a small inset shows the
+  // current drawing. Tap a spot on the inset to say "the next number goes
+  // here", speak or type the value a real tape measure gave, confirm — a
+  // leader-style dimension label lands there, ready for the next tap. The
+  // camera itself never measures anything (that's the user's own tape
+  // measure) — it's only a live reference so the phone never has to be
+  // lowered or an app switched away from mid-job. The camera failing to
+  // start (permission denied, unsupported browser) doesn't block the rest
+  // of the tool — marking points and numbers still works without it.
+  // ---------------------------------------------------------------------
+  const cmModal = document.getElementById('cameraMeasureModal');
+  const cmVideo = document.getElementById('cmVideo');
+  const cmInsetCanvas = document.getElementById('cmInsetCanvas');
+  const cmCtx = cmInsetCanvas.getContext('2d');
+  const cmInputBar = document.getElementById('cmInputBar');
+  const cmValueInput = document.getElementById('cmValueInput');
+  const cmMicBtn = document.getElementById('cmMicBtn');
+  const cmCameraError = document.getElementById('cmCameraError');
+  const cmCountEl = document.getElementById('cmCount');
+  const cmUndoBtn = document.getElementById('cmUndoBtn');
+
+  let cmStream = null;
+  const cmView = { scale: 1, offsetX: 0, offsetY: 0 }; // the inset's OWN fit-to-page view, independent of the main canvas's
+  let cmPendingMm = null;   // {x,y} on the drawing the next label will land at, or null before a tap
+  let cmAddedIds = [];      // ids of marks added this session, for "Скасувати останній"
+  let cmRecognition = null; // active SpeechRecognition instance, if any
+
+  function cmFitInset() {
+    const rect = cmInsetCanvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    cmInsetCanvas.width = Math.max(1, Math.round(rect.width * dpr));
+    cmInsetCanvas.height = Math.max(1, Math.round(rect.height * dpr));
+    cmCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const margin = 6;
+    const availW = Math.max(20, rect.width - margin * 2), availH = Math.max(20, rect.height - margin * 2);
+    cmView.scale = Math.min(availW / pageW(), availH / pageH());
+    cmView.offsetX = (rect.width - pageW() * cmView.scale) / 2;
+    cmView.offsetY = (rect.height - pageH() * cmView.scale) / 2;
+  }
+
+  function cmClientToMm(clientX, clientY) {
+    const rect = cmInsetCanvas.getBoundingClientRect();
+    const px = { x: clientX - rect.left, y: clientY - rect.top };
+    return { x: (px.x - cmView.offsetX) / cmView.scale, y: (px.y - cmView.offsetY) / cmView.scale };
+  }
+
+  // Draws the current page into the inset at its own fit-to-page scale by
+  // reusing the exact same renderOneShape()/mmToPx()/drawSheetFrame() the
+  // main canvas draws with — briefly pointing the shared `view` at the
+  // inset's own scale/offset, drawing, then restoring it. Safe because this
+  // runs synchronously start to finish; nothing else ever reads `view` in
+  // the gap between the swap and the restore.
+  function cmRenderInset() {
+    const rect = cmInsetCanvas.getBoundingClientRect();
+    const saved = { scale: view.scale, offsetX: view.offsetX, offsetY: view.offsetY };
+    view.scale = cmView.scale; view.offsetX = cmView.offsetX; view.offsetY = cmView.offsetY;
+
+    cmCtx.clearRect(0, 0, rect.width, rect.height);
+    cmCtx.fillStyle = '#f2f1ec';
+    cmCtx.fillRect(0, 0, rect.width, rect.height);
+    const pTL = mmToPx({ x: 0, y: 0 }), pBR = mmToPx({ x: pageW(), y: pageH() });
+    cmCtx.fillStyle = '#ffffff';
+    cmCtx.fillRect(pTL.x, pTL.y, pBR.x - pTL.x, pBR.y - pTL.y);
+    drawSheetFrame(cmCtx, pTL, pBR);
+    for (const s of shapes) renderOneShape(cmCtx, s, false);
+    if (cmPendingMm) {
+      const p = mmToPx(cmPendingMm);
+      cmCtx.beginPath();
+      cmCtx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+      cmCtx.fillStyle = '#e63946';
+      cmCtx.fill();
+    }
+
+    view.scale = saved.scale; view.offsetX = saved.offsetX; view.offsetY = saved.offsetY;
+  }
+
+  function cmUpdateCount() {
+    cmCountEl.textContent = cmAddedIds.length ? `Додано: ${cmAddedIds.length}` : '';
+    cmUndoBtn.classList.toggle('hidden', !cmAddedIds.length);
+  }
+
+  async function openCameraMeasure() {
+    cmModal.classList.remove('hidden');
+    cmCameraError.classList.add('hidden');
+    cmPendingMm = null;
+    cmInputBar.classList.add('hidden');
+    cmAddedIds = [];
+    cmUpdateCount();
+    cmFitInset();
+    cmRenderInset();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      cmCameraError.classList.remove('hidden');
+      return;
+    }
+    try {
+      cmStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      cmVideo.srcObject = cmStream;
+    } catch (err) {
+      cmCameraError.classList.remove('hidden');
+    }
+  }
+
+  function closeCameraMeasure() {
+    if (cmRecognition) { try { cmRecognition.stop(); } catch (err) { /* already stopped */ } cmRecognition = null; }
+    if (cmStream) { cmStream.getTracks().forEach((t) => t.stop()); cmStream = null; }
+    cmVideo.srcObject = null;
+    cmModal.classList.add('hidden');
+    cmPendingMm = null;
+    cmInputBar.classList.add('hidden');
+  }
+
+  function cmCommitMark() {
+    if (!cmPendingMm) return;
+    const raw = cmValueInput.value.trim();
+    if (!raw) { flashHint('Введіть число'); return; }
+    // A plain number gets the same "42 мм" formatting every other
+    // dimension readout in the app uses; anything else the user typed or
+    // dictated (e.g. "42x30", or a raw voice transcript nobody cleaned up)
+    // is used exactly as it stands rather than guessed at.
+    const isPlainNumber = /^-?[\d.,]+$/.test(raw);
+    const num = isPlainNumber ? parseMm(raw) : null;
+    const text = num !== null ? `${formatMm(num)} мм` : raw;
+    const id = nextId++;
+    shapes.push({
+      type: 'leader',
+      x1: cmPendingMm.x, y1: cmPendingMm.y,
+      x2: cmPendingMm.x, y2: cmPendingMm.y - 12,
+      text, color: state.color, lineWidthMm: 0.5, id,
+    });
+    cmAddedIds.push(id);
+    cmPendingMm = null;
+    cmInputBar.classList.add('hidden');
+    cmUpdateCount();
+    cmRenderInset();
+    requestRedraw(); // keeps the main canvas correct for whenever the user gets back to it
+    flashHint(`Додано розмір: ${text}`);
+  }
+
+  document.getElementById('cameraMeasureBtn').addEventListener('click', openCameraMeasure);
+  document.getElementById('cmCloseBtn').addEventListener('click', closeCameraMeasure);
+  cmInsetCanvas.addEventListener('pointerdown', (e) => {
+    cmPendingMm = cmClientToMm(e.clientX, e.clientY);
+    cmValueInput.value = '';
+    cmInputBar.classList.remove('hidden');
+    cmRenderInset();
+    cmValueInput.focus();
+  });
+  document.getElementById('cmAddBtn').addEventListener('click', cmCommitMark);
+  document.getElementById('cmCancelPointBtn').addEventListener('click', () => {
+    cmPendingMm = null;
+    cmInputBar.classList.add('hidden');
+    cmRenderInset();
+  });
+  cmValueInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') cmCommitMark(); });
+  cmUndoBtn.addEventListener('click', () => {
+    if (!cmAddedIds.length) return;
+    const id = cmAddedIds.pop();
+    const idx = shapes.findIndex((s) => s.id === id);
+    if (idx !== -1) { if (selected === shapes[idx]) deselect(); shapes.splice(idx, 1); }
+    cmUpdateCount();
+    cmRenderInset();
+    requestRedraw();
+  });
+  window.addEventListener('resize', () => {
+    if (cmModal.classList.contains('hidden')) return;
+    cmFitInset();
+    cmRenderInset();
+  });
+
+  // Voice input is a progressive enhancement — the mic button only appears
+  // where the browser actually implements it (notably absent or unreliable
+  // on some browsers/iOS versions); the text field above always works
+  // regardless, exactly as asked ("голосом або вручну"). Best-effort only:
+  // this reads back whatever the browser's own speech engine transcribed,
+  // pulls out a number if the transcript already contains clean digits
+  // (many engines auto-format spoken numbers that way), and always leaves
+  // the result in the text field to fix by hand before confirming.
+  const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (SpeechRecognitionCtor) {
+    cmMicBtn.classList.remove('hidden');
+    cmMicBtn.addEventListener('click', () => {
+      if (cmRecognition) { cmRecognition.stop(); return; } // tap again to stop early
+      const rec = new SpeechRecognitionCtor();
+      rec.lang = 'uk-UA';
+      rec.interimResults = false;
+      rec.maxAlternatives = 1;
+      rec.onresult = (ev) => {
+        const transcript = ev.results[0][0].transcript.trim();
+        const m = transcript.match(/-?\d+([.,]\d+)?/);
+        cmValueInput.value = m ? m[0].replace(',', '.') : transcript;
+        cmValueInput.focus();
+      };
+      rec.onerror = () => flashHint('Не вдалося розпізнати голос — введіть число вручну');
+      rec.onend = () => { cmMicBtn.classList.remove('on'); cmRecognition = null; };
+      cmRecognition = rec;
+      cmMicBtn.classList.add('on');
+      try { rec.start(); } catch (err) { cmMicBtn.classList.remove('on'); cmRecognition = null; }
+    });
+  }
+
+  // ---------------------------------------------------------------------
   // Selection + exact-dimension panel
   // ---------------------------------------------------------------------
   const dimPanel = document.getElementById('dimPanel2d');

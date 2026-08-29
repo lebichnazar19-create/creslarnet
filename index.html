@@ -147,6 +147,7 @@
         <button class="action-btn" id="exportBtn">Зберегти як PNG</button>
         <button class="action-btn" id="printBtn">🖨 Друк</button>
         <button class="action-btn" id="scanBtn">📷 Скан малюнка з фото</button>
+        <button class="action-btn" id="cameraMeasureBtn">📏 Камера-вимірювання</button>
         <a href="3d/index.html" class="action-btn mode-link-btn">🧊 3D-режим →</a>
       </div>
     </div>
@@ -197,6 +198,35 @@
         <button id="scanCancelBtn" class="action-btn ghost">Скасувати</button>
         <button id="scanCommitBtn" class="action-btn primary">✓ Зберегти на аркуш</button>
       </div>
+    </div>
+  </div>
+
+  <!-- "Камера-вимірювання" — live rear-camera view as an on-site reference
+       while marking measured dimensions straight onto the drawing, without
+       switching apps or lowering the phone. The camera never measures
+       anything itself (that's a real tape measure, in the user's hands) —
+       it only shows what's in front of the phone; tapping the small plan
+       inset records WHERE a number goes, typed or dictated. -->
+  <div id="cameraMeasureModal" class="cm-modal hidden">
+    <video id="cmVideo" class="cm-video" autoplay playsinline muted></video>
+    <button id="cmCloseBtn" class="scan-close-x cm-close-x" title="Закрити">✕</button>
+    <p id="cmCameraError" class="cm-camera-error hidden">Не вдалося увімкнути камеру. Перевірте дозвіл доступу до камери в браузері.</p>
+
+    <div class="cm-inset-wrap">
+      <p class="cm-inset-hint" id="cmInsetHint">Торкніться на кресленні, де поставити розмір</p>
+      <canvas id="cmInsetCanvas" class="cm-inset-canvas"></canvas>
+    </div>
+
+    <div class="cm-input-bar hidden" id="cmInputBar">
+      <button id="cmMicBtn" class="cm-mic-btn hidden" title="Диктувати число">🎤</button>
+      <input type="text" id="cmValueInput" class="cm-value-input" placeholder="Число, напр. 42" inputmode="decimal">
+      <button id="cmAddBtn" class="action-btn primary cm-add-btn">✓</button>
+      <button id="cmCancelPointBtn" class="action-btn ghost cm-cancel-btn">✕</button>
+    </div>
+
+    <div class="cm-footer">
+      <span id="cmCount" class="cm-count"></span>
+      <button id="cmUndoBtn" class="action-btn ghost cm-undo-btn hidden">⌫ Скасувати останній</button>
     </div>
   </div>
 

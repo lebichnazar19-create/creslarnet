@@ -612,3 +612,132 @@ html, body {
 .scan-modal-actions .ghost {
   background: none;
 }
+
+/* ---------- "Камера-вимірювання" — live camera + tap-to-mark on a plan inset ---------- */
+.cm-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  background: #000;
+  overflow: hidden;
+}
+.cm-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.cm-close-x {
+  position: absolute;
+  top: max(10px, env(safe-area-inset-top));
+  right: 10px;
+  z-index: 2;
+  background: rgba(20, 18, 14, 0.55);
+  color: #fff;
+  border-radius: 999px;
+  width: 34px;
+  height: 34px;
+}
+.cm-camera-error {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 80%;
+  max-width: 340px;
+  text-align: center;
+  color: #fff;
+  background: rgba(20, 18, 14, 0.7);
+  border-radius: 10px;
+  padding: 14px;
+  font-size: 13px;
+}
+.cm-inset-wrap {
+  position: absolute;
+  right: 10px;
+  bottom: max(76px, calc(env(safe-area-inset-bottom) + 66px));
+  width: min(46vw, 260px);
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.cm-inset-hint {
+  margin: 0;
+  padding: 5px 8px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+  background: rgba(242, 241, 236, 0.9);
+  border-bottom: 1px solid var(--border);
+}
+.cm-inset-canvas {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  touch-action: none;
+}
+.cm-input-bar {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: max(10px, env(safe-area-inset-bottom));
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.95);
+  border-radius: 10px;
+  padding: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.cm-mic-btn {
+  flex-shrink: 0;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: #fff;
+  font-size: 16px;
+  cursor: pointer;
+}
+.cm-mic-btn.on {
+  background: #e63946;
+  border-color: #e63946;
+  color: #fff;
+}
+.cm-value-input {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 15px;
+}
+.cm-add-btn, .cm-cancel-btn {
+  flex-shrink: 0;
+  width: 40px;
+  padding: 9px 0;
+  margin-bottom: 0;
+}
+.cm-footer {
+  position: absolute;
+  left: 10px;
+  top: max(10px, env(safe-area-inset-top));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cm-count {
+  color: #fff;
+  background: rgba(20, 18, 14, 0.55);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+}
+.cm-undo-btn {
+  margin-bottom: 0;
+  background: rgba(255, 255, 255, 0.92);
+  padding: 6px 10px;
+  font-size: 12.5px;
+}
