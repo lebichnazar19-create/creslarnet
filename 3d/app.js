@@ -1107,12 +1107,21 @@ function spatialLineCustomDir() {
 // Six unidirectional arrows (not three bidirectional axes — the user aims
 // one arrow at a time, so a separate mesh per direction keeps the hit-test
 // unambiguous) plus a rotation ring and the custom-angle arrow it aims.
-const SPATIAL_LINE_GIZMO_SIZE = 280; // mm — fixed, there's no "selected object" to size against here
-function buildSpatialLineGizmo() {
+// mm — no "selected object" to size against here (unlike buildGizmo's own
+// axisGizmoLocalSize, which sizes off the object it's attached to). Built
+// once at this fixed baseline size; updateSpatialLineGizmoScale() below
+// then rescales the whole group every edit-mode frame to match its actual
+// distance from the camera. Without that, a point placed on a distant wall
+// (or one the camera later pinch-zoomed away from) got a gizmo that was
+// technically there but shrank to a few on-screen pixels — impossible to
+// grab on a touchscreen, which read as "no gizmo, just a small dot" and,
+// downstream, as "can't place a second point" — the drag that's supposed
+// to add it never had a real target to land on.
+const SPATIAL_LINE_GIZMO_SIZE = 280;
+function buildSpatialLineGizmo(size = SPATIAL_LINE_GIZMO_SIZE) {
   const group = new THREE.Group();
   group.userData.isHelper = true;
   const targets = [];
-  const size = SPATIAL_LINE_GIZMO_SIZE;
   const shaftLen = size * 0.9, shaftR = size * 0.05, headLen = size * 0.3, headR = size * 0.13;
   const hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, depthTest: false });
 
@@ -1193,6 +1202,21 @@ function updateSpatialLineCustomArrow() {
   spatialLineGizmoCustomGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), spatialLineCustomDir());
 }
 
+// Constant on-screen size regardless of how far the gizmo's point actually
+// is from the camera right now — same idea as a TransformControls handle
+// in any 3D editor. Scaling the whole group (rather than rebuilding its
+// geometry) is cheap enough to do every frame, so it also stays correctly
+// sized if the camera moves — e.g. pinch-zooming closer to a distant point
+// before dragging one of its arrows, a very natural thing to do. Clamped so
+// a very close point doesn't get an oversized gizmo and a very far one
+// doesn't shrink back to unusable.
+function updateSpatialLineGizmoScale() {
+  if (!spatialLineGizmo) return;
+  const distToCam = camera.position.distanceTo(spatialLineGizmo.position);
+  const size = Math.max(120, Math.min(900, distToCam * 0.12));
+  spatialLineGizmo.scale.setScalar(size / SPATIAL_LINE_GIZMO_SIZE);
+}
+
 function attachSpatialLineGizmo(point) {
   detachSpatialLineGizmo();
   const built = buildSpatialLineGizmo();
@@ -1201,6 +1225,7 @@ function attachSpatialLineGizmo(point) {
   spatialLineGizmoCustomGroup = built.customGroup;
   spatialLineGizmo.position.copy(point);
   scene.add(spatialLineGizmo);
+  updateSpatialLineGizmoScale(); // size it correctly from the very first frame, not just the next one
   updateSpatialLineCustomArrow();
 }
 
@@ -4698,6 +4723,7 @@ function animate() {
     updateAdaptiveClipping(refDist); // raw — must react instantly so near clipping never lags into geometry
     updateScaleBar(refDist); // raw — a live readout of what's actually ahead, not a movement input
     updateFreeCamera(dt, refDist);
+    updateSpatialLineGizmoScale();
     updateAxisLabels();
     updateHoleLabels();
     updateTileCutLabels();
