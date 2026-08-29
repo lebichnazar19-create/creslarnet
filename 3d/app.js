@@ -1250,19 +1250,40 @@ function detachSpatialLineGizmo() {
   spatialLineGizmoCustomGroup = null;
 }
 
-function beginSpatialLineDrag(axisKey, ray) {
+// Screen-space drag, not a 3D ray-vs-axis-line intersection — deliberately.
+// The first point often ends up placed more or less straight ahead of the
+// camera, which puts the arrow pointing toward/away from it (the "Z"/"negz"
+// arrow especially) heavily foreshortened; projecting a 2D finger drag onto
+// a 3D line via closestPointOnLineToRay degrades badly right at that angle
+// (numerically unstable, and can even flip which direction reads as
+// "forward"), which is exactly the failure mode that made dragging feel
+// like it did nothing. Measuring the drag in screen pixels against the same
+// axis also projected to screen pixels can't have either problem — it's
+// plain 2D math the whole way, and "drag the way the arrow visibly points
+// on screen" is always correctly positive by construction.
+function beginSpatialLineDrag(axisKey, clientX, clientY) {
   const axisWorld = axisKey === 'custom' ? spatialLineCustomDir() : SL_AXIS_DIRS[axisKey].clone();
   const basePoint = spatialLineGizmo.position.clone();
-  const startPoint = closestPointOnLineToRay(basePoint, axisWorld, ray.ray.origin, ray.ray.direction);
-  spatialLineDrag = { axisWorld, basePoint, startPoint, candidatePoint: basePoint.clone(), length: 0 };
+  const aScreen = projectToScreenPx(basePoint);
+  const bScreen = projectToScreenPx(basePoint.clone().addScaledVector(axisWorld, 100)); // 100mm probe
+  const dxs = bScreen.x - aScreen.x, dys = bScreen.y - aScreen.y;
+  const screenLen = Math.hypot(dxs, dys);
+  // Arrow pointing almost exactly at/away from the camera projects to
+  // (near) zero screen length — no usable on-screen direction to drag
+  // along; pxPerMm 0 makes every offset below just stay 0 instead of
+  // dividing by ~0.
+  const axisScreenDir = screenLen < 2 ? { x: 0, y: -1 } : { x: dxs / screenLen, y: dys / screenLen };
+  const pxPerMm = screenLen < 2 ? 0 : screenLen / 100;
+  spatialLineDrag = { axisWorld, basePoint, startX: clientX, startY: clientY, axisScreenDir, pxPerMm, candidatePoint: basePoint.clone(), length: 0 };
 }
 
-function updateSpatialLineDrag(ray) {
+function updateSpatialLineDrag(clientX, clientY) {
   const g = spatialLineDrag;
-  const newPoint = closestPointOnLineToRay(g.basePoint, g.axisWorld, ray.ray.origin, ray.ray.direction);
+  const dx = clientX - g.startX, dy = clientY - g.startY;
+  const screenAlong = dx * g.axisScreenDir.x + dy * g.axisScreenDir.y;
   // Only the positive direction along this specific arrow's axis counts —
   // each of the six arrows already only points one way.
-  const offset = Math.max(0, new THREE.Vector3().subVectors(newPoint, g.basePoint).dot(g.axisWorld));
+  const offset = g.pxPerMm > 0 ? Math.max(0, screenAlong / g.pxPerMm) : 0;
   g.candidatePoint = g.basePoint.clone().addScaledVector(g.axisWorld, offset);
   g.length = offset;
   updateSpatialLinePreview();
@@ -3566,6 +3587,15 @@ function currentPinchDist() {
   return pts.length < 2 ? 0 : Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
 }
 
+// Screen-space midpoint between the two active pinch fingers, or null with
+// anything other than exactly two — used to aim the navigation-pinch dolly
+// at wherever the fingers actually are instead of always straight ahead.
+function currentPinchMidpoint() {
+  const pts = [...activePointers.values()];
+  if (pts.length < 2) return null;
+  return { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+}
+
 canvas.addEventListener('pointerdown', (e) => {
   if (autoRotateActive) setAutoRotate(false); // any touch takes control back, even a plain tap with no drag
   activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -3614,7 +3644,7 @@ canvas.addEventListener('pointerdown', (e) => {
       if (hits.length) {
         const hitMesh = hits[0].object;
         if (hitMesh.userData.slRing) beginSpatialLineRingDrag(e.clientX, e.clientY);
-        else beginSpatialLineDrag(hitMesh.userData.slAxis, rayFromClient(e.clientX, e.clientY));
+        else beginSpatialLineDrag(hitMesh.userData.slAxis, e.clientX, e.clientY);
       } else {
         // Missed every arrow/ring — free look, exactly like anywhere else a
         // tap lands on nothing interactive, instead of silently doing
@@ -3689,10 +3719,14 @@ canvas.addEventListener('pointermove', (e) => {
       // navigation pinch (outside any room): spreading fingers apart moves
       // forward, pinching together moves back — tracked incrementally so
       // continuing the gesture keeps moving rather than saturating at one
-      // ratio
+      // ratio. Dollies along the ray THROUGH the fingers' own on-screen
+      // midpoint, not always straight down the centre of the view — fingers
+      // over on the right side of the screen zoom toward the right, etc.,
+      // instead of the zoom direction being disconnected from where the
+      // pinch actually is.
       const delta = dist - pinchStartDist;
-      const dir = new THREE.Vector3();
-      camera.getWorldDirection(dir);
+      const mid = currentPinchMidpoint();
+      const dir = mid ? rayFromClient(mid.x, mid.y).ray.direction.clone() : camera.getWorldDirection(new THREE.Vector3());
       // smoothedRefDist (kept current every frame in animate()) instead of
       // a fresh raycast here — see its declaration for why a raw per-event
       // sample made this gesture feel jerky.
@@ -3726,7 +3760,7 @@ canvas.addEventListener('pointermove', (e) => {
     return;
   }
   if (mode === 'edit' && spatialLineDrag && e.pointerId === primaryPointerId) {
-    updateSpatialLineDrag(rayFromClient(e.clientX, e.clientY));
+    updateSpatialLineDrag(e.clientX, e.clientY);
     return;
   }
   if (mode === 'edit' && spatialLineRingDrag && e.pointerId === primaryPointerId) {
