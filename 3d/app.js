@@ -329,6 +329,18 @@ const ndc = new THREE.Vector2();
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 const DOWN_VEC = new THREE.Vector3(0, -1, 0); // reused by updateWalkFloorY's straight-down raycast
 
+// Fallback landing spot for any "tap to place" flow when the tap doesn't
+// land on anything raycastable — the ground plane is a large but finite
+// 80x80 m slab, not a true infinite plane, so it's possible to be standing
+// outside it (after a lot of flying/walking around) or simply aiming above
+// the horizon. distanceMm defaults to a comfortable "just in front of you"
+// spot, same as "Просторова лінія"'s own first-point fallback.
+function pointInFrontOfCamera(distanceMm = 1500) {
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  return camera.position.clone().addScaledVector(dir, distanceMm);
+}
+
 function rayFromClient(x, y) {
   const rect = renderer.domElement.getBoundingClientRect();
   ndc.x = ((x - rect.left) / rect.width) * 2 - 1;
@@ -1390,6 +1402,19 @@ function renderSpatialLinePill() {
     modePillEl.appendChild(doneBtn);
   }
   showEl(modePillEl);
+}
+
+// Called from endPointer once a genuine tap (not a look-drag) is confirmed
+// with no first point yet — see the pointerdown/endPointer spatialLineActive
+// branches for why this is deferred to tap-release instead of firing
+// straight on pointerdown.
+function placeFirstSpatialLinePoint(clientX, clientY) {
+  scene.updateMatrixWorld(true);
+  const hits = rayFromClient(clientX, clientY).intersectObjects(raycastTargets, false);
+  const point = hits.length ? hits[0].point.clone() : pointInFrontOfCamera();
+  spatialLineDraft = { points: [roundVec(point)] };
+  attachSpatialLineGizmo(point);
+  renderSpatialLinePill();
 }
 
 function cancelSpatialLine() {
@@ -2959,6 +2984,12 @@ function renderSelectionPanel() {
   moveBtn.addEventListener('click', enterMoveMode);
   actions.appendChild(moveBtn);
 
+  const orbitBtn = document.createElement('button');
+  orbitBtn.className = 'pbtn'; orbitBtn.textContent = '🔄 Орбіта';
+  orbitBtn.title = 'Обертати камеру навколо цього об’єкта';
+  orbitBtn.addEventListener('click', () => enterOrbitMode(selected));
+  actions.appendChild(orbitBtn);
+
   if (selected.kind === 'paper') {
     const drawBtn = document.createElement('button');
     drawBtn.className = 'pbtn'; drawBtn.textContent = '✎ Малювати лінії';
@@ -3536,6 +3567,7 @@ function currentPinchDist() {
 }
 
 canvas.addEventListener('pointerdown', (e) => {
+  if (autoRotateActive) setAutoRotate(false); // any touch takes control back, even a plain tap with no drag
   activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
   if (activePointers.size === 1) {
@@ -3576,31 +3608,20 @@ canvas.addEventListener('pointerdown', (e) => {
         const rec = findRecordByMesh(hits[0].object);
         if (rec) beginTileAreaDrag(rec, hits[0].point);
       }
-    } else if (mode === 'edit' && spatialLineActive) {
+    } else if (mode === 'edit' && spatialLineActive && spatialLineGizmo) {
       scene.updateMatrixWorld(true);
-      if (spatialLineGizmo) {
-        const hits = rayFromClient(e.clientX, e.clientY).intersectObjects(spatialLineGizmoTargets, false);
-        if (hits.length) {
-          const hitMesh = hits[0].object;
-          if (hitMesh.userData.slRing) beginSpatialLineRingDrag(e.clientX, e.clientY);
-          else beginSpatialLineDrag(hitMesh.userData.slAxis, rayFromClient(e.clientX, e.clientY));
-        }
+      const hits = rayFromClient(e.clientX, e.clientY).intersectObjects(spatialLineGizmoTargets, false);
+      if (hits.length) {
+        const hitMesh = hits[0].object;
+        if (hitMesh.userData.slRing) beginSpatialLineRingDrag(e.clientX, e.clientY);
+        else beginSpatialLineDrag(hitMesh.userData.slAxis, rayFromClient(e.clientX, e.clientY));
       } else {
-        // First point: land it on whatever's under the tap, or 1.5 m out in
-        // front of the camera if nothing's there — there's no paper/ground
-        // plane requirement here, unlike the wall tool.
-        const hits = rayFromClient(e.clientX, e.clientY).intersectObjects(raycastTargets, false);
-        let point;
-        if (hits.length) {
-          point = hits[0].point.clone();
-        } else {
-          const dir = new THREE.Vector3();
-          camera.getWorldDirection(dir);
-          point = camera.position.clone().addScaledVector(dir, 1500);
-        }
-        spatialLineDraft = { points: [roundVec(point)] };
-        attachSpatialLineGizmo(point);
-        renderSpatialLinePill();
+        // Missed every arrow/ring — free look, exactly like anywhere else a
+        // tap lands on nothing interactive, instead of silently doing
+        // nothing (which made single-finger look-around feel completely
+        // locked out while this tool was active).
+        lookPointerId = e.pointerId;
+        lastLookX = e.clientX; lastLookY = e.clientY;
       }
     } else if (mode === 'edit' && sculptActive && sculptTarget) {
       scene.updateMatrixWorld(true);
@@ -3615,8 +3636,13 @@ canvas.addEventListener('pointerdown', (e) => {
     }
   } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !sculptDragging) {
     pinchStartDist = currentPinchDist();
-    // with something selected, pinch resizes it; otherwise it drives the camera
-    pinchStartScale = selected ? selected.root.scale.clone() : null;
+    if (orbitActive) {
+      orbitStartRadius = orbitRadius;
+      pinchStartScale = null; // orbit mode always keeps `selected` set for its panel — make sure a stale scale from an earlier pinch can't leak into a resize below
+    } else {
+      // with something selected, pinch resizes it; otherwise it drives the camera
+      pinchStartScale = selected ? selected.root.scale.clone() : null;
+    }
     lookPointerId = null; // second finger arrived — hand off from look to pinch
   }
 });
@@ -3634,7 +3660,14 @@ canvas.addEventListener('pointermove', (e) => {
   }
   if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !sculptDragging) {
     const dist = currentPinchDist();
-    if (selected && pinchStartScale) {
+    if (orbitActive) {
+      // Spread apart = closer (smaller radius), pinch together = farther —
+      // same direction pinch-zoom already means everywhere else in the app.
+      if (pinchStartDist > 10) {
+        const ratio = pinchStartDist / dist;
+        orbitRadius = Math.max(100, Math.min(50000, orbitStartRadius * ratio));
+      }
+    } else if (selected && pinchStartScale) {
       if (pinchStartDist > 10) {
         const ratio = Math.max(0.05, dist / pinchStartDist);
         selected.root.scale.copy(pinchStartScale).multiplyScalar(ratio);
@@ -3764,11 +3797,29 @@ function endPointer(e) {
     return;
   }
   if (mode === 'edit' && spatialLineActive) {
-    if (spatialLineDrag && e.pointerId === primaryPointerId) endSpatialLineDrag();
-    if (spatialLineRingDrag && e.pointerId === primaryPointerId) spatialLineRingDrag = null;
+    if (spatialLineDrag && e.pointerId === primaryPointerId) { endSpatialLineDrag(); return; }
+    if (spatialLineRingDrag && e.pointerId === primaryPointerId) { spatialLineRingDrag = null; return; }
+    if (!spatialLineGizmo && e.pointerId === primaryPointerId) {
+      // No first point yet — pointerdown started a look-drag instead of
+      // placing one right away (so a single finger can still freely look
+      // around before committing to a point), so this only places it if
+      // the finger turns out to have made a genuine tap, not a look-drag.
+      const dx = e.clientX - downX, dy = e.clientY - downY;
+      const dt = performance.now() - downTime;
+      if (dx * dx + dy * dy <= 49 && dt <= 600 && e.target === canvas) {
+        placeFirstSpatialLinePoint(e.clientX, e.clientY);
+      }
+    }
     return;
   }
   if (mode === 'edit' && sculptActive) { sculptDragging = false; return; }
+  // Orbiting reuses the plain look-drag pointer (lookPointerId/handleFreeLook)
+  // rather than its own gizmo/hit-test, so — unlike bend/sculpt, which
+  // intercept every tap earlier via their own explicit branches — a tap
+  // here needs its own guard too, otherwise a quick tap-not-drag while
+  // orbiting would fall through to normal tap-to-select below and pick a
+  // different object out from under the (currently hidden) selection panel.
+  if (mode === 'edit' && orbitActive) return;
   if (wasPinching) return; // a pinch finger lifting is never a tap
   if (mode === 'walk') return; // walk mode has no tap-to-place/select
   if (e.pointerId !== primaryPointerId) return;
@@ -3791,23 +3842,23 @@ function handleEditTap(x, y) {
   if (placingKind) {
     const ray = rayFromClient(x, y);
     const hits = ray.intersectObjects(raycastTargets, false);
-    if (hits.length) {
-      addObject(placingKind, hits[0].point);
-    } else {
-      toast('Не вдалося визначити точку розміщення');
-    }
+    // A tap that doesn't land on anything (the ground plane is 80x80 m, not
+    // truly infinite — easy to be standing outside it after a lot of flying
+    // around, or just aiming a bit above the horizon) used to dead-end in
+    // an error toast instead of placing anything — same fallback the
+    // "Просторова лінія" tool already uses for its own first point: land
+    // 1.5 m out along wherever the camera is currently looking.
+    const point = hits.length ? hits[0].point : pointInFrontOfCamera();
+    addObject(placingKind, point);
     placingKind = null;
     return;
   }
   if (placingLibraryEntry) {
     const ray = rayFromClient(x, y);
     const hits = ray.intersectObjects(raycastTargets, false);
-    if (hits.length) {
-      insertMiniObject(placingLibraryEntry.data, hits[0].point);
-      toast(`Розміщено: ${placingLibraryEntry.name}`);
-    } else {
-      toast('Не вдалося визначити точку розміщення');
-    }
+    const point = hits.length ? hits[0].point : pointInFrontOfCamera();
+    insertMiniObject(placingLibraryEntry.data, point);
+    toast(`Розміщено: ${placingLibraryEntry.name}`);
     placingLibraryEntry = null;
     return;
   }
@@ -3840,6 +3891,7 @@ function handleEditTap(x, y) {
 const walkExitBtn = document.getElementById('walkExit');
 const crosshairEl = document.getElementById('crosshair');
 const walkToggleBtn = document.getElementById('walkToggle');
+const autoRotateBtn = document.getElementById('autoRotateToggle');
 const resetViewBtn = document.getElementById('resetViewBtn');
 
 window.addEventListener('keydown', (e) => keys.add(e.code));
@@ -3896,6 +3948,9 @@ spatialLineFabBtn.addEventListener('click', () => {
 
 function enterWalkMode() {
   mode = 'walk';
+  orbitActive = false; // no orbit pivot while walking — deselect() below drops `selected` anyway
+  setAutoRotate(false);
+  hideEl(modePillEl);
   deselect();
   closePopover();
   hideEl(document.getElementById('toolbar'));
@@ -3926,12 +3981,111 @@ function exitWalkMode() {
 }
 
 walkToggleBtn.addEventListener('click', () => { mode === 'walk' ? exitWalkMode() : enterWalkMode(); });
+autoRotateBtn.addEventListener('click', () => setAutoRotate(!autoRotateActive));
 walkExitBtn.addEventListener('click', exitWalkMode);
+
+// ---------------------------------------------------------------------------
+// "Обертання на місці" — standing at the exact spot the camera is already
+// at, spin the view in a full circle on its own (no finger needed), like
+// looking slowly all the way around a room. Position never changes, only
+// yaw — any touch on the canvas hands control straight back to normal free
+// look, same as touching a spinning globe stops it.
+// ---------------------------------------------------------------------------
+let autoRotateActive = false;
+const AUTO_ROTATE_SPEED = 0.35; // rad/s — a full turn in ~18s, slow enough to actually look at things
+
+function setAutoRotate(on) {
+  autoRotateActive = on && mode === 'edit';
+  autoRotateBtn?.classList.toggle('on', autoRotateActive);
+}
+
+// ---------------------------------------------------------------------------
+// "Орбіта" — a dedicated tool (entered from a selected object's own panel)
+// that turns the same single-finger drag into orbiting the camera around
+// that object's centre at a fixed radius, instead of the normal fly-in-
+// place look — a standard CAD-style "orbit" the free-fly camera otherwise
+// has no equivalent of. Two-finger pinch adjusts the orbit radius (zoom in/
+// out around the pivot) instead of its usual resize/navigate meaning while
+// this is active.
+// ---------------------------------------------------------------------------
+let orbitActive = false;
+let orbitTarget = null;
+let orbitPivot = new THREE.Vector3();
+let orbitRadius = 0;
+let orbitStartRadius = 0;
+let orbitAzimuth = 0;
+let orbitPolar = Math.PI / 2;
+
+function enterOrbitMode(record) {
+  scene.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(record.root);
+  if (box.isEmpty()) { toast('Немає геометрії для орбіти'); return; }
+  const pivot = box.getCenter(new THREE.Vector3());
+  const offset = camera.position.clone().sub(pivot);
+  let radius = offset.length();
+  if (radius < 1) { offset.set(0, 0, 1); radius = Math.max(box.getSize(new THREE.Vector3()).length(), 500); }
+
+  orbitActive = true;
+  orbitTarget = record;
+  orbitPivot = pivot;
+  orbitRadius = radius;
+  // Spherical angles derived from the camera's current offset so orbiting
+  // starts exactly where the view already is — no jump to some default
+  // angle the moment the tool turns on.
+  orbitAzimuth = Math.atan2(offset.x, offset.z);
+  orbitPolar = Math.acos(THREE.MathUtils.clamp(offset.y / radius, -1, 1));
+  setAutoRotate(false);
+  hideEl(selectionPanelEl);
+  removeGizmo(); // keep `selected` for the panel, like bend/sculpt — just hide the move/rotate arrows so an orbit-drag doesn't land on them instead
+  renderOrbitPill();
+  toast('Тягніть пальцем — камера обертається навколо об’єкта. Двома пальцями — ближче/далі.');
+}
+
+function exitOrbitMode() {
+  const record = orbitTarget;
+  orbitActive = false;
+  orbitTarget = null;
+  hideEl(modePillEl);
+  // Same reselect-to-rebuild-the-panel pattern as exitBendMode/exitSculptMode.
+  if (record) { deselect(); select(record); }
+}
+
+function renderOrbitPill() {
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = 'Орбіта навколо об’єкта';
+  modePillEl.appendChild(label);
+  const doneBtn = document.createElement('button');
+  doneBtn.textContent = '✓ Готово';
+  doneBtn.addEventListener('click', exitOrbitMode);
+  modePillEl.appendChild(doneBtn);
+  showEl(modePillEl);
+}
+
+function updateOrbitCamera() {
+  if (!orbitActive) return;
+  const sinPolar = Math.sin(orbitPolar);
+  camera.position.set(
+    orbitPivot.x + orbitRadius * sinPolar * Math.sin(orbitAzimuth),
+    orbitPivot.y + orbitRadius * Math.cos(orbitPolar),
+    orbitPivot.z + orbitRadius * sinPolar * Math.cos(orbitAzimuth),
+  );
+  faceDirection(orbitPivot.clone().sub(camera.position).normalize());
+  camera.rotation.set(pitch, yaw, 0, 'YXZ');
+}
 
 function handleFreeLook(e) {
   const dx = e.clientX - lastLookX, dy = e.clientY - lastLookY;
   lastLookX = e.clientX; lastLookY = e.clientY;
   const sens = 0.002;
+  if (autoRotateActive) setAutoRotate(false); // any manual look takes control back
+  if (orbitActive) {
+    // Same drag gesture, driving orbit angles around the pivot instead of
+    // turning in place.
+    orbitAzimuth -= dx * sens;
+    orbitPolar = Math.max(0.05, Math.min(Math.PI - 0.05, orbitPolar - dy * sens));
+    return;
+  }
   yaw -= dx * sens; // unclamped — a full 360° turn, like turning your head/body
   pitch -= dy * sens;
   // Just short of straight up/down (±90°) rather than exactly there — a
@@ -4722,7 +4876,12 @@ function animate() {
   if (mode === 'edit') {
     updateAdaptiveClipping(refDist); // raw — must react instantly so near clipping never lags into geometry
     updateScaleBar(refDist); // raw — a live readout of what's actually ahead, not a movement input
-    updateFreeCamera(dt, refDist);
+    if (orbitActive) {
+      updateOrbitCamera();
+    } else {
+      if (autoRotateActive) yaw += AUTO_ROTATE_SPEED * dt; // position stays put, only the view turns
+      updateFreeCamera(dt, refDist);
+    }
     updateSpatialLineGizmoScale();
     updateAxisLabels();
     updateHoleLabels();

@@ -96,7 +96,7 @@ html, body {
   stroke-linejoin: round;
 }
 
-.tb-btn.active {
+.tb-btn.active, .tb-btn.on {
   background: var(--accent);
   color: #fff;
 }
