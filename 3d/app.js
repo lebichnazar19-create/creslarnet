@@ -1100,6 +1100,7 @@ let spatialLineGizmoTargets = [];     // hit-test meshes tagged userData.slAxis 
 let spatialLineGizmoCustomGroup = null; // the rotating "custom angle" arrow, child of the gizmo
 let spatialLineDrag = null;           // { axisWorld, basePoint, candidatePoint, length } while extending
 let spatialLineRingDrag = null;       // { centerScreen, prevAngle } while aiming the custom arrow
+let spatialLineMoveDrag = null;       // { basePoint, candidatePoint } while free-dragging the gizmo itself
 let spatialLineCustomAngle = 0;       // radians, current custom-arrow angle in the XZ plane
 let spatialLinePreviewMesh = null;    // thin line covering committed + in-progress segments
 
@@ -1168,6 +1169,20 @@ function buildSpatialLineGizmo(size = SPATIAL_LINE_GIZMO_SIZE) {
     targets.push(shaftHit, headHit);
     group.add(arrow);
   }
+
+  // Centre "move" handle — a small, plainly-neutral (not axis-coloured)
+  // dot right at the gizmo's own origin. Dragging it (see
+  // beginSpatialLineMoveDrag) moves the whole gizmo freely to wherever the
+  // finger lands on real scene geometry, live-drawing the segment from the
+  // last committed point to it — an unconstrained alternative to picking
+  // one of the one-way axis arrows. Only drawn/visible, not itself in
+  // `targets`: it's picked in screen space (isNearSpatialLineGizmoCenter),
+  // same reasoning as the arrows.
+  const moveHandleMat = new THREE.MeshBasicMaterial({ color: 0xf4f2f8, depthTest: false, transparent: true, opacity: 0.9 });
+  const moveHandle = new THREE.Mesh(new THREE.SphereGeometry(size * 0.09, 14, 10), moveHandleMat);
+  moveHandle.renderOrder = 999;
+  moveHandle.userData.isHelper = true;
+  group.add(moveHandle);
 
   // Rotation ring (horizontal plane) — aims the custom-angle arrow below.
   // Radius kept well outside the arrows' own reach (tip at shaftLen+headLen
@@ -1281,6 +1296,18 @@ function pickSpatialLineArrow(clientX, clientY) {
   return bestDist <= SL_ARROW_HIT_PX ? best : null;
 }
 
+// Whether a tap landed on the small centre "move" handle — checked first
+// (see the pointerdown wiring), and deliberately a smaller radius than the
+// arrows' own tolerance: every arrow's segment also starts exactly here, so
+// this needs to reliably win only very close to dead-centre, not steal taps
+// that are clearly headed toward a specific arrow instead.
+function isNearSpatialLineGizmoCenter(clientX, clientY) {
+  if (!spatialLineGizmo) return false;
+  const base = projectToScreenPx(spatialLineGizmo.position);
+  const SL_MOVE_HANDLE_HIT_PX = 22;
+  return Math.hypot(clientX - base.x, clientY - base.y) <= SL_MOVE_HANDLE_HIT_PX;
+}
+
 function attachSpatialLineGizmo(point) {
   detachSpatialLineGizmo();
   const built = buildSpatialLineGizmo();
@@ -1354,6 +1381,47 @@ function endSpatialLineDrag() {
   renderSpatialLinePill();
 }
 
+// Free-drag the gizmo itself (its centre move handle) anywhere in 3D space
+// — moving it IS how this draws the next segment, live, rather than a
+// separate action: the gizmo's own position becomes the in-progress
+// candidate point every frame, exactly like dragging one of the axis
+// arrows does, just unconstrained to any single axis. Lands on whatever
+// real surface is under the finger (or 1.5 m ahead of the camera if
+// nothing's there), same rule as placing the very first point.
+function beginSpatialLineMoveDrag() {
+  spatialLineMoveDrag = { basePoint: spatialLineGizmo.position.clone(), candidatePoint: spatialLineGizmo.position.clone() };
+}
+
+function updateSpatialLineMoveDrag(clientX, clientY) {
+  const g = spatialLineMoveDrag;
+  const hits = rayFromClient(clientX, clientY).intersectObjects(raycastTargets, false);
+  const point = hits.length ? hits[0].point.clone() : pointInFrontOfCamera();
+  g.candidatePoint = point;
+  spatialLineGizmo.position.copy(point); // the gizmo itself rides along under the finger
+  updateSpatialLinePreview();
+  updateSpatialLineLengthLabel(g.basePoint, point, g.basePoint.distanceTo(point));
+}
+
+function endSpatialLineMoveDrag() {
+  const g = spatialLineMoveDrag;
+  spatialLineMoveDrag = null;
+  hideSpatialLineLengthLabel();
+  if (!g || g.basePoint.distanceTo(g.candidatePoint) < 10) {
+    // Ignore a near-zero/no-op drag — same threshold as the axis-arrow
+    // drag — but the gizmo itself already visually followed the finger, so
+    // it needs putting back at its base point rather than left wherever
+    // the last raycast happened to land.
+    if (g) spatialLineGizmo.position.copy(g.basePoint);
+    updateSpatialLinePreview();
+    return;
+  }
+  const point = roundVec(g.candidatePoint);
+  spatialLineDraft.points.push(point);
+  attachSpatialLineGizmo(point);
+  updateSpatialLinePreview();
+  renderSpatialLinePill();
+}
+
 // Softly snaps to every 15° (so 45°, 90°… are easy to hit exactly) once
 // within 3° of one, otherwise leaves the angle exactly where dragged.
 function snapAngleRad(rad) {
@@ -1383,6 +1451,7 @@ function updateSpatialLinePreview() {
   if (!spatialLineDraft) return;
   const pts = spatialLineDraft.points.slice();
   if (spatialLineDrag) pts.push(spatialLineDrag.candidatePoint);
+  else if (spatialLineMoveDrag) pts.push(spatialLineMoveDrag.candidatePoint);
   if (pts.length < 2) return;
   const geom = new THREE.BufferGeometry().setFromPoints(pts);
   const mat = new THREE.LineBasicMaterial({ color: 0x8338ec, depthTest: false });
@@ -1431,7 +1500,7 @@ function renderSpatialLinePill() {
   const label = document.createElement('span');
   const n = spatialLineDraft ? spatialLineDraft.points.length : 0;
   label.textContent = spatialLineGizmo
-    ? `Точок: ${n} — тягніть стрілку гізмо або кільце для кута`
+    ? `Точок: ${n} — тягніть центральну ручку вільно, стрілку по осі, або кільце для кута`
     : 'Торкніться, щоб поставити першу точку';
   modePillEl.appendChild(label);
 
@@ -3692,22 +3761,24 @@ canvas.addEventListener('pointerdown', (e) => {
       }
     } else if (mode === 'edit' && spatialLineActive && spatialLineGizmo) {
       scene.updateMatrixWorld(true);
-      // Arrows are picked by screen-space distance (pickSpatialLineArrow),
-      // not a 3D raycast — see that function for the two independent ways
-      // raycasting the fat invisible hit-proxies broke down (the encircling
-      // ring reading as the nearest 3D hit from a level camera angle, and
-      // the six arrows' hit-cylinders genuinely overlapping near their
-      // shared origin). The ring itself is still a plain raycast — it's a
-      // single, unambiguous target once an arrow can no longer wrongly
-      // intercept it first.
-      const arrowAxis = pickSpatialLineArrow(e.clientX, e.clientY);
-      const ringHitEntry = arrowAxis ? null : rayFromClient(e.clientX, e.clientY).intersectObjects(spatialLineGizmoTargets, false).find((h) => h.object.userData.slRing);
-      if (arrowAxis) {
+      // Checked in this order, all by screen-space distance (see each
+      // function's own comment for why not a 3D raycast): the centre move
+      // handle first (a small dedicated zone right at the gizmo's origin —
+      // where every arrow's own segment also starts, so it has to win ties
+      // there on purpose), then the arrows, then the ring by a plain
+      // raycast (a single, unambiguous target once an arrow can no longer
+      // wrongly intercept it first).
+      const nearCenter = isNearSpatialLineGizmoCenter(e.clientX, e.clientY);
+      const arrowAxis = nearCenter ? null : pickSpatialLineArrow(e.clientX, e.clientY);
+      const ringHitEntry = (nearCenter || arrowAxis) ? null : rayFromClient(e.clientX, e.clientY).intersectObjects(spatialLineGizmoTargets, false).find((h) => h.object.userData.slRing);
+      if (nearCenter) {
+        beginSpatialLineMoveDrag();
+      } else if (arrowAxis) {
         beginSpatialLineDrag(arrowAxis, e.clientX, e.clientY);
       } else if (ringHitEntry) {
         beginSpatialLineRingDrag(e.clientX, e.clientY);
       } else {
-        // Missed every arrow/ring — free look, exactly like anywhere else a
+        // Missed every handle — free look, exactly like anywhere else a
         // tap lands on nothing interactive, instead of silently doing
         // nothing (which made single-finger look-around feel completely
         // locked out while this tool was active).
@@ -3723,7 +3794,7 @@ canvas.addEventListener('pointerdown', (e) => {
     } else if (!moveMode && !paperDrawing) {
       startLookDrag(e.pointerId, e.clientX, e.clientY);
     }
-  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !sculptDragging) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !spatialLineMoveDrag && !sculptDragging) {
     pinchStartDist = currentPinchDist();
     if (orbitActive) {
       orbitStartRadius = orbitRadius;
@@ -3747,7 +3818,7 @@ canvas.addEventListener('pointermove', (e) => {
     updateRotateDrag(e.clientX, e.clientY);
     return;
   }
-  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !sculptDragging) {
+  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !spatialLineMoveDrag && !sculptDragging) {
     const dist = currentPinchDist();
     if (orbitActive) {
       // Spread apart = closer (smaller radius), pinch together = farther —
@@ -3833,6 +3904,10 @@ canvas.addEventListener('pointermove', (e) => {
     updateSpatialLineRingDrag(e.clientX, e.clientY);
     return;
   }
+  if (mode === 'edit' && spatialLineMoveDrag && e.pointerId === primaryPointerId) {
+    updateSpatialLineMoveDrag(e.clientX, e.clientY);
+    return;
+  }
   if (mode === 'edit' && sculptDragging && sculptTarget && e.pointerId === primaryPointerId) {
     const hits = rayFromClient(e.clientX, e.clientY).intersectObject(sculptTarget.root, true);
     if (hits.length) applySculptAt(hits[0].point);
@@ -3857,6 +3932,7 @@ function endPointer(e) {
     if (mode === 'edit' && tileToolActive) { tileDrag = null; clearTileAreaPreview(); renderTilePill(); }
     if (mode === 'edit' && spatialLineActive) {
       spatialLineDrag = null; spatialLineRingDrag = null;
+      if (spatialLineMoveDrag) { spatialLineGizmo?.position.copy(spatialLineMoveDrag.basePoint); spatialLineMoveDrag = null; }
       hideSpatialLineLengthLabel();
       updateSpatialLinePreview();
       if (spatialLineGizmo) renderSpatialLinePill();
@@ -3899,6 +3975,7 @@ function endPointer(e) {
   if (mode === 'edit' && spatialLineActive) {
     if (spatialLineDrag && e.pointerId === primaryPointerId) { endSpatialLineDrag(); return; }
     if (spatialLineRingDrag && e.pointerId === primaryPointerId) { spatialLineRingDrag = null; return; }
+    if (spatialLineMoveDrag && e.pointerId === primaryPointerId) { endSpatialLineMoveDrag(); return; }
     if (!spatialLineGizmo && e.pointerId === primaryPointerId) {
       // No first point yet — pointerdown started a look-drag instead of
       // placing one right away (so a single finger can still freely look
