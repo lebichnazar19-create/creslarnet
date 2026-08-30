@@ -2143,6 +2143,7 @@ function select(record) {
   if (selected === record) return;
   deselect();
   selected = record;
+  selectionPanelCollapsed = true; // start collapsed on every new selection — see wireSelectionPanelGrip
   if (record.roomId) activeRoomId = record.roomId;
 
   // A sculpted round object (sphere/cylinder/cone) is no longer actually
@@ -3280,6 +3281,42 @@ const modePillEl = document.getElementById('modePill');
 function hideEl(el) { el.classList.add('hidden'); }
 function showEl(el) { el.classList.remove('hidden'); }
 
+// Starts collapsed on every new selection (see select() resetting this) —
+// full controls are a drag/tap of the grip handle away. Persists across
+// renderSelectionPanel() re-renders of the SAME selection (e.g. after
+// editing a value) so toggling it open doesn't get undone by your own edit.
+let selectionPanelCollapsed = true;
+
+// Wires the drag-or-tap gesture on the panel's grip handle: a small
+// vertical drag (or a plain tap) toggles collapsed/expanded. Not a live
+// finger-follow — a real bottom-sheet drag would need to track and clamp an
+// intermediate height every frame; a threshold-triggered toggle with a CSS
+// transition gets the same "drag it open" feel for far less to get wrong.
+function wireSelectionPanelGrip(grip) {
+  let startY = 0, startTime = 0, dragging = false;
+  grip.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    startY = e.clientY;
+    startTime = performance.now();
+    grip.setPointerCapture(e.pointerId);
+  });
+  grip.addEventListener('pointerup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    const dy = e.clientY - startY;
+    const dt = performance.now() - startTime;
+    if (Math.abs(dy) < 6 && dt < 400) {
+      selectionPanelCollapsed = !selectionPanelCollapsed; // plain tap — toggle
+    } else if (dy < -20) {
+      selectionPanelCollapsed = false; // dragged up — open
+    } else if (dy > 20) {
+      selectionPanelCollapsed = true; // dragged down — close
+    }
+    renderSelectionPanel();
+  });
+  grip.addEventListener('pointercancel', () => { dragging = false; });
+}
+
 // Shared by both the raw "spatialLine" panel branch and the generic
 // fallthrough one (a converted pipe/rebar/wire run still carries its own
 // spatialLinePoints) — see beginSpatialLineAttach().
@@ -3297,29 +3334,44 @@ function renderSelectionPanel() {
   selectionPanelEl.innerHTML = '';
   showEl(selectionPanelEl);
   hideEl(modePillEl);
+  selectionPanelEl.classList.toggle('collapsed', selectionPanelCollapsed);
+
+  const grip = document.createElement('div');
+  grip.className = 'panel-grip';
+  const gripBar = document.createElement('div'); gripBar.className = 'grip-bar';
+  const gripLabel = document.createElement('span');
+  gripLabel.className = 'grip-label';
+  gripLabel.textContent = KIND_LABELS[selected.kind] || selected.kind;
+  grip.append(gripBar, gripLabel);
+  wireSelectionPanelGrip(grip);
+  selectionPanelEl.appendChild(grip);
+
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'panel-body';
+  selectionPanelEl.appendChild(bodyEl);
 
   const closeBtn = document.createElement('button');
   closeBtn.className = 'close-x';
   closeBtn.textContent = '✕';
   closeBtn.addEventListener('click', deselect);
-  selectionPanelEl.appendChild(closeBtn);
+  bodyEl.appendChild(closeBtn);
 
   const title = document.createElement('p');
   title.className = 'panel-title';
   title.textContent = KIND_LABELS[selected.kind] || selected.kind;
-  selectionPanelEl.appendChild(title);
+  bodyEl.appendChild(title);
 
   if (selected.roomId) {
-    selectionPanelEl.appendChild(buildRoomDimsSection(selected.roomId));
+    bodyEl.appendChild(buildRoomDimsSection(selected.roomId));
   }
 
   if (selected.kind === 'ground') {
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
     hint.textContent = 'Поверхня землі — колір і матеріал (за бажанням, наприклад «Трава»).';
-    selectionPanelEl.appendChild(hint);
-    selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
-    selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
+    bodyEl.appendChild(hint);
+    bodyEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
+    bodyEl.appendChild(materialSwatchRow(applyMaterialToSelected));
     return;
   }
 
@@ -3327,12 +3379,12 @@ function renderSelectionPanel() {
     const info = document.createElement('p');
     info.className = 'dim-readout';
     info.textContent = `Довжина: ${formatMm(selected.lineLength)} мм`;
-    selectionPanelEl.appendChild(info);
+    bodyEl.appendChild(info);
 
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
     hint.textContent = 'Перетворити на реальний об’єкт:';
-    selectionPanelEl.appendChild(hint);
+    bodyEl.appendChild(hint);
 
     const convertRow = document.createElement('div');
     convertRow.className = 'panel-row';
@@ -3343,13 +3395,13 @@ function renderSelectionPanel() {
       b.addEventListener('click', () => convertSketchLine(selected, kind));
       convertRow.appendChild(b);
     }
-    selectionPanelEl.appendChild(convertRow);
+    bodyEl.appendChild(convertRow);
 
     const delBtn = document.createElement('button');
     delBtn.className = 'pbtn danger wide';
     delBtn.textContent = '🗑 Видалити лінію';
     delBtn.addEventListener('click', () => removeObject(selected));
-    selectionPanelEl.appendChild(delBtn);
+    bodyEl.appendChild(delBtn);
     return;
   }
 
@@ -3360,7 +3412,7 @@ function renderSelectionPanel() {
     const info = document.createElement('p');
     info.className = 'dim-readout';
     info.textContent = `Точок: ${pts.length}, довжина: ${formatMm(totalLen)} мм`;
-    selectionPanelEl.appendChild(info);
+    bodyEl.appendChild(info);
 
     const thickWrap = document.createElement('div');
     thickWrap.className = 'panel-row';
@@ -3375,12 +3427,12 @@ function renderSelectionPanel() {
     thickInput.addEventListener('change', () => setSpatialLineRadius(selected, Number(thickInput.value)));
     thickWrap.appendChild(thickInput);
     thickWrap.appendChild(thickLabel);
-    selectionPanelEl.appendChild(thickWrap);
+    bodyEl.appendChild(thickWrap);
 
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
     hint.textContent = 'Перетворити на:';
-    selectionPanelEl.appendChild(hint);
+    bodyEl.appendChild(hint);
 
     const convertRow = document.createElement('div');
     convertRow.className = 'panel-row';
@@ -3391,12 +3443,12 @@ function renderSelectionPanel() {
       b.addEventListener('click', () => convertSpatialLine(selected, kind));
       convertRow.appendChild(b);
     }
-    selectionPanelEl.appendChild(convertRow);
+    bodyEl.appendChild(convertRow);
 
     const wireHint = document.createElement('p');
     wireHint.className = 'dim-readout';
     wireHint.textContent = '→ Провід — оберіть колір:';
-    selectionPanelEl.appendChild(wireHint);
+    bodyEl.appendChild(wireHint);
     const wireRow = document.createElement('div');
     wireRow.className = 'panel-row';
     for (const w of WIRE_COLORS) {
@@ -3407,15 +3459,15 @@ function renderSelectionPanel() {
       b.addEventListener('click', () => convertSpatialLine(selected, 'wire', w.color));
       wireRow.appendChild(b);
     }
-    selectionPanelEl.appendChild(wireRow);
+    bodyEl.appendChild(wireRow);
 
-    selectionPanelEl.appendChild(buildSpatialLineAttachButton(selected));
+    bodyEl.appendChild(buildSpatialLineAttachButton(selected));
 
     const delBtn2 = document.createElement('button');
     delBtn2.className = 'pbtn danger wide';
     delBtn2.textContent = '🗑 Видалити лінію';
     delBtn2.addEventListener('click', () => removeObject(selected));
-    selectionPanelEl.appendChild(delBtn2);
+    bodyEl.appendChild(delBtn2);
     return;
   }
 
@@ -3423,12 +3475,12 @@ function renderSelectionPanel() {
   // its own generic size/rotation controls would just fight that on the
   // next resize, so only offer them for objects outside any room.
   if (!selected.roomId) {
-    selectionPanelEl.appendChild(buildSizeSection(selected));
-    selectionPanelEl.appendChild(buildRotationSection(selected));
+    bodyEl.appendChild(buildSizeSection(selected));
+    bodyEl.appendChild(buildRotationSection(selected));
   }
 
-  selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
-  selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
+  bodyEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
+  bodyEl.appendChild(materialSwatchRow(applyMaterialToSelected));
 
   const actions = document.createElement('div');
   actions.className = 'panel-row';
@@ -3490,7 +3542,7 @@ function renderSelectionPanel() {
     const threadLabel = document.createElement('p');
     threadLabel.className = 'dim-readout';
     threadLabel.textContent = 'Різьба на кінці:';
-    selectionPanelEl.appendChild(threadLabel);
+    bodyEl.appendChild(threadLabel);
 
     let threadAtStart = true, threadPitch = 2, threadLen = 20;
 
@@ -3500,7 +3552,7 @@ function renderSelectionPanel() {
     startEndBtn.addEventListener('click', () => { threadAtStart = true; startEndBtn.classList.add('on'); endEndBtn.classList.remove('on'); });
     endEndBtn.addEventListener('click', () => { threadAtStart = false; endEndBtn.classList.add('on'); startEndBtn.classList.remove('on'); });
     endRow.append(startEndBtn, endEndBtn);
-    selectionPanelEl.appendChild(endRow);
+    bodyEl.appendChild(endRow);
 
     function stepperRow(labelText, get, set, step, min) {
       const row = document.createElement('div'); row.className = 'dim-row';
@@ -3515,8 +3567,8 @@ function renderSelectionPanel() {
       row.append(label, minus, val, plus);
       return row;
     }
-    selectionPanelEl.appendChild(stepperRow('Крок різьби', () => threadPitch, (v) => { threadPitch = v; }, 0.5, 0.5));
-    selectionPanelEl.appendChild(stepperRow('Довжина різьби', () => threadLen, (v) => { threadLen = v; }, 5, 5));
+    bodyEl.appendChild(stepperRow('Крок різьби', () => threadPitch, (v) => { threadPitch = v; }, 0.5, 0.5));
+    bodyEl.appendChild(stepperRow('Довжина різьби', () => threadLen, (v) => { threadLen = v; }, 5, 5));
 
     const addThreadBtn = document.createElement('button');
     addThreadBtn.className = 'pbtn wide';
@@ -3525,7 +3577,7 @@ function renderSelectionPanel() {
       addThreadToObject(selected, threadAtStart, threadPitch, threadLen);
       toast('Різьбу додано');
     });
-    selectionPanelEl.appendChild(addThreadBtn);
+    bodyEl.appendChild(addThreadBtn);
   }
 
   if (canExplode(selected)) {
@@ -3541,7 +3593,7 @@ function renderSelectionPanel() {
   delBtn.addEventListener('click', () => removeObject(selected));
   actions.appendChild(delBtn);
 
-  selectionPanelEl.appendChild(actions);
+  bodyEl.appendChild(actions);
 }
 
 function enterMoveMode() {
