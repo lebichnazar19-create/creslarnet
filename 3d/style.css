@@ -121,6 +121,43 @@ html, body {
   box-shadow: 0 12px 32px -10px rgba(0, 0, 0, 0.55);
 }
 
+/* ---------- selection panel as a drag-to-open drawer ----------
+   Bottom-centre is exactly where a just-selected object's own move/rotate
+   gizmo tends to land on screen too (objects are usually somewhere near the
+   middle of the view when you tap them) — the full panel sitting there,
+   solid, made the gizmo behind it completely untouchable the moment
+   anything was selected, with no way to get it out of the way. Now it opens
+   collapsed to just a small grip handle (see select() resetting the state
+   on every new selection) — full controls are one drag/tap of the handle
+   away, and the same gesture collapses it back down when you want the 3D
+   view clear again. */
+.selection-panel { padding: 0; overflow: visible; }
+.panel-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 14px;
+  touch-action: none;
+  cursor: grab;
+}
+.grip-bar { width: 36px; height: 4px; border-radius: 2px; background: var(--hud-line); }
+.grip-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--hud-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.panel-body { display: none; padding: 0 10px 10px; }
+.selection-panel:not(.collapsed) .panel-body {
+  display: block;
+  max-height: 42vh;
+  overflow-y: auto;
+}
+
 .panel h3 {
   margin: 0 0 8px;
   font-size: 11px;
@@ -404,6 +441,18 @@ html, body {
   font-size: 12px;
   font-weight: 700;
   fill: #cbb0ff;
+  paint-order: stroke;
+  stroke: rgba(20, 18, 26, 0.85);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
+.spatial-line-angle-text {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  fill: #ffd60a;
   paint-order: stroke;
   stroke: rgba(20, 18, 26, 0.85);
   stroke-width: 3px;

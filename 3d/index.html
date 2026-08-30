@@ -116,6 +116,12 @@
       <line class="dim-line spatial-line-length-line"></line>
       <text class="dim-text spatial-line-length-text"></text>
     </g>
+    <!-- Turn angle vs. the previous committed segment, from the second
+         segment on — see computeSpatialLineTurnAngle()/updateSpatialLineAngleLabel(),
+         toggled by the "Показати градуси" button in the draft pill. -->
+    <g id="spatialLineAngleGroup" class="dim-group hidden">
+      <text class="dim-text spatial-line-angle-text"></text>
+    </g>
     <!-- One <g class="pipe-run-label"> per converted pipe/wire/rebar run
          from "Просторова лінія" — always on, built in
          updateSpatialLineTypeLabels(). -->

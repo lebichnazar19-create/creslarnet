@@ -1,5 +1,4 @@
 import * as THREE from './vendor/three/three.module.min.js';
-import { RoomEnvironment } from './vendor/three/RoomEnvironment.js';
 import { CSG } from './csg.js';
 import { createMaterial, createPaintMaterial, MATERIAL_LABELS } from './materials.js';
 
@@ -134,9 +133,22 @@ const SKY_COLOR = 0x0d0d0f;
 scene.background = new THREE.Color(SKY_COLOR);
 scene.fog = new THREE.Fog(SKY_COLOR, 26000, 90000);
 
-const pmrem = new THREE.PMREMGenerator(renderer);
-scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-pmrem.dispose();
+// No PMREM/RoomEnvironment image-based lighting — confirmed by actually
+// running this app in a real (headless) browser and capturing the raw
+// WebGL console output: on at least one real GPU/driver,
+// PMREMGenerator.fromScene()'s internal cubemap-blur shader fails to link
+// (WebGLProgram VALIDATE_STATUS false, logged as a plain console warning,
+// not a catchable JS exception — a try/catch around it changes nothing).
+// Every subsequent `useProgram` against that broken program then throws
+// INVALID_OPERATION until the driver gives up and force-loses the WHOLE
+// WebGL context (CONTEXT_LOST_WEBGL) — which is exactly "select an
+// object and nothing ever renders again, not the ground, not the gizmo,
+// nothing": the canvas isn't failing to draw those specific things, the
+// entire context is dead from this one shader at startup. Direct light
+// still shades every material fine (the hemisphere + "sun" below) — this
+// only cost reflection highlights on metal/glass, a purely cosmetic
+// touch not worth risking the whole session's rendering over.
+scene.environment = null;
 
 // Near/far start wide and get tightened every frame by updateAdaptiveClipping()
 // to whatever's actually ahead of the camera — a fixed pair can't cover
@@ -1104,72 +1116,80 @@ function convertSketchLine(record, targetKind) {
 
 // ---------------------------------------------------------------------------
 // "Просторова лінія" — a polyline drawn freely in 3D space (not confined to
-// a paper sheet), point by point, with a small gizmo instead of a flat
-// drag: six one-way arrows (up/down/left/right/forward/back) extend the
-// line along a world axis from wherever it currently ends, and a rotation
-// ring aims a seventh "custom angle" arrow anywhere in the horizontal
-// plane — softly snapping every 15° — for a run that doesn't sit strictly
-// on-axis (a 45° diagonal, say). Finished, it's a `spatialLine` you select
-// and convert into a pipe, an electrical wire (any of the usual wire
-// colours), or rebar — each becomes one multi-segment run with its own
-// colour and a small always-on label naming what it is.
+// a paper sheet), point by point, via a small on-screen gizmo: three
+// bidirectional axis arrows (X/Y/Z) to extend the line along one axis, two
+// rings aiming a free "custom" direction anywhere on a sphere (azimuth +
+// elevation), and a centre handle to draw completely freely. A single tap
+// on open space continues the chain; a double-tap finishes it. Finished,
+// it's a `spatialLine` you select and convert into a pipe, an electrical
+// wire (any of the usual wire colours), or rebar — each becomes one multi-
+// segment run with its own colour and a small always-on label.
+//
+// All interactive state lives in one object, `slTool`, with exactly one
+// active drag at a time (`slTool.drag`, tagged by `.kind`) rather than
+// several independent flags. That's deliberate, not just tidiness: every
+// past bug in this tool's touch handling traced back to a tap-vs-drag check
+// living inside only ONE of several "end this specific drag" functions —
+// whichever kind of drag happened to start never got checked for "was this
+// actually just a tap", most visibly for double-tap-to-finish, whose 2nd
+// tap lands almost exactly on the gizmo the 1st tap just placed — squarely
+// inside the centre handle's own hit zone. One `endSlDrag()` that dispatches
+// by `.kind` and always finishes through the same tap classifier
+// (`slHandleTapRelease`) can't have that class of bug again: there's only
+// one place left for "was this a tap" to be decided, no matter which handle
+// the finger happened to land on first.
 // ---------------------------------------------------------------------------
-let spatialLineActive = false;
-let spatialLineDraft = null;          // { points: [Vector3, ...] } while drawing
-let spatialLineRadius = 5;            // mm — user-adjustable draft thickness, see renderSpatialLinePill
-let spatialLineGizmo = null;          // THREE.Group at the last committed point
-let spatialLineGizmoTargets = [];     // hit-test meshes tagged userData.slAxis or .slRing
-let spatialLineGizmoCustomGroup = null; // the rotating "custom angle" arrow, child of the gizmo
-let spatialLineDrag = null;           // { axisWorld, basePoint, candidatePoint, length } while extending
-let spatialLineRingDrag = null;       // { centerScreen, prevAngle } while aiming the custom arrow
-let spatialLineMoveDrag = null;       // { basePoint, candidatePoint } while free-dragging the gizmo itself
-let spatialLineCustomAngle = 0;       // radians, current custom-arrow angle in the XZ plane
-let spatialLinePreviewMesh = null;    // thin line covering committed + in-progress segments
-
-const SL_AXIS_DIRS = {
-  x: new THREE.Vector3(1, 0, 0), negx: new THREE.Vector3(-1, 0, 0),
-  y: new THREE.Vector3(0, 1, 0), negy: new THREE.Vector3(0, -1, 0),
-  z: new THREE.Vector3(0, 0, 1), negz: new THREE.Vector3(0, 0, -1),
+const slTool = {
+  active: false,
+  draft: null,             // { points: [Vector3, ...] } while drawing
+  radius: 5,               // mm — user-adjustable draft thickness, see renderSpatialLinePill
+  showAngle: false,        // "Показати градуси" toggle — turn-angle readout from the 2nd segment on
+  gizmo: null,             // { group, targets, customGroup, ringT } — see buildSlGizmo/attachSlGizmo
+  customAngle: 0,          // radians, azimuth (around Y) of the free-direction arrow — purple "N" ring
+  customElevation: 0,      // radians, tilt out of horizontal — yellow "T" ring
+  previewMesh: null,       // thin line covering committed + in-progress segments
+  drag: null,              // { kind: 'axis'|'ring'|'center', ... } — exactly one at a time
+  lastTap: { time: 0, x: 0, y: 0 }, // for double-tap detection past the first point
+  attach: { target: null, picking: false }, // "🔗 Прикріпити гізмо" — see beginSlAttach
 };
+
+const SL_AXIS_DIRS = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) };
 
 function roundVec(v) { return new THREE.Vector3(roundMm(v.x), roundMm(v.y), roundMm(v.z)); }
 
-function spatialLineCustomDir() {
-  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), spatialLineCustomAngle);
-  return new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize();
+// Two independent rings drive this: "N" (purple, slTool.customAngle) spins
+// the direction around Y — azimuth; "T" (yellow, slTool.customElevation)
+// then tilts it up/down out of the horizontal plane — elevation, applied
+// around the axis the T ring itself visually sits on (Z rotated by the
+// current azimuth), so tilting always happens in the vertical plane the
+// arrow currently occupies, regardless of which way it's already aimed.
+// Together they give the free-direction arrow a full sphere of directions.
+function slCustomDir() {
+  const azQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), slTool.customAngle);
+  const horiz = new THREE.Vector3(1, 0, 0).applyQuaternion(azQ);
+  const tiltAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(azQ);
+  const elQ = new THREE.Quaternion().setFromAxisAngle(tiltAxis, slTool.customElevation);
+  return horiz.applyQuaternion(elQ).normalize();
 }
 
-// Six unidirectional arrows (not three bidirectional axes — the user aims
-// one arrow at a time, so a separate mesh per direction keeps the hit-test
-// unambiguous) plus a rotation ring and the custom-angle arrow it aims.
-// mm — no "selected object" to size against here (unlike buildGizmo's own
-// axisGizmoLocalSize, which sizes off the object it's attached to). Built
-// once at this fixed baseline size; updateSpatialLineGizmoScale() below
-// then rescales the whole group every edit-mode frame to match its actual
-// distance from the camera. Without that, a point placed on a distant wall
-// (or one the camera later pinch-zoomed away from) got a gizmo that was
-// technically there but shrank to a few on-screen pixels — impossible to
-// grab on a touchscreen, which read as "no gizmo, just a small dot" and,
-// downstream, as "can't place a second point" — the drag that's supposed
-// to add it never had a real target to land on.
-const SPATIAL_LINE_GIZMO_SIZE = 280;
-function buildSpatialLineGizmo(size = SPATIAL_LINE_GIZMO_SIZE) {
+// Three bidirectional arrows (drag either way once grabbed — same
+// convention as the regular object move-gizmo's own arrows) plus two rings
+// aiming a free "custom" direction, and the arrow that direction points.
+// mm, sized once at a fixed baseline; updateSlGizmoScale() then rescales the
+// whole group every edit-mode frame to a constant on-screen size regardless
+// of camera distance — without that, a point placed on a distant wall (or
+// one the camera later zoomed away from) got a gizmo that shrank to a few
+// on-screen pixels, impossible to grab on a touchscreen.
+const SL_GIZMO_SIZE = 280;
+function buildSlGizmo(size = SL_GIZMO_SIZE) {
   const group = new THREE.Group();
   group.userData.isHelper = true;
   const targets = [];
   const shaftLen = size * 0.9, shaftR = size * 0.05, headLen = size * 0.3, headR = size * 0.13;
   const hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, depthTest: false });
 
-  const AXES = [
-    { key: 'x', dir: SL_AXIS_DIRS.x, color: AXIS_COLOR.x },
-    { key: 'negx', dir: SL_AXIS_DIRS.negx, color: AXIS_COLOR.x },
-    { key: 'y', dir: SL_AXIS_DIRS.y, color: AXIS_COLOR.y },
-    { key: 'negy', dir: SL_AXIS_DIRS.negy, color: AXIS_COLOR.y },
-    { key: 'z', dir: SL_AXIS_DIRS.z, color: AXIS_COLOR.z },
-    { key: 'negz', dir: SL_AXIS_DIRS.negz, color: AXIS_COLOR.z },
-  ];
-  for (const axis of AXES) {
-    const mat = new THREE.MeshBasicMaterial({ color: axis.color, depthTest: false, transparent: true, opacity: 0.95 });
+  for (const axisKey of ['x', 'y', 'z']) {
+    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axisKey], depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 });
     const arrow = new THREE.Group();
     const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 10), mat);
     shaft.position.y = shaftLen / 2;
@@ -1178,62 +1198,75 @@ function buildSpatialLineGizmo(size = SPATIAL_LINE_GIZMO_SIZE) {
     head.position.y = shaftLen + headLen / 2;
     head.renderOrder = 999;
     arrow.add(shaft, head);
-    arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis.dir);
+    arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), SL_AXIS_DIRS[axisKey]);
     shaft.userData.isHelper = true; head.userData.isHelper = true;
 
     const shaftHit = new THREE.Mesh(new THREE.CylinderGeometry(shaftR * 3.5, shaftR * 3.5, shaftLen, 8), hitMat);
     shaftHit.position.y = shaftLen / 2;
     const headHit = new THREE.Mesh(new THREE.ConeGeometry(headR * 1.5, headLen * 1.3, 8), hitMat);
     headHit.position.y = shaftLen + headLen / 2;
-    shaftHit.userData.slAxis = axis.key; headHit.userData.slAxis = axis.key;
+    shaftHit.userData.slAxis = axisKey; headHit.userData.slAxis = axisKey;
     shaftHit.userData.isHelper = true; headHit.userData.isHelper = true;
     arrow.add(shaftHit, headHit);
     targets.push(shaftHit, headHit);
     group.add(arrow);
   }
 
-  // Centre "move" handle — a small, plainly-neutral (not axis-coloured)
-  // dot right at the gizmo's own origin. Dragging it (see
-  // beginSpatialLineMoveDrag) moves the whole gizmo freely to wherever the
-  // finger lands on real scene geometry, live-drawing the segment from the
-  // last committed point to it — an unconstrained alternative to picking
-  // one of the one-way axis arrows. Only drawn/visible, not itself in
-  // `targets`: it's picked in screen space (isNearSpatialLineGizmoCenter),
-  // same reasoning as the arrows.
-  const moveHandleMat = new THREE.MeshBasicMaterial({ color: 0xf4f2f8, depthTest: false, transparent: true, opacity: 0.9 });
+  // Centre "move" handle — a small, plainly-neutral (not axis-coloured) dot
+  // right at the gizmo's own origin. Dragging it moves the whole gizmo
+  // freely to wherever the finger lands (see updateSlDrag's 'center' case),
+  // live-drawing the segment from the last committed point to it. Only
+  // drawn/visible, not itself in `targets`: it's picked in screen space
+  // (slPickHandle), same reasoning as the arrows below.
+  const moveHandleMat = new THREE.MeshBasicMaterial({ color: 0xf4f2f8, depthTest: false, depthWrite: false, transparent: true, opacity: 0.9 });
   const moveHandle = new THREE.Mesh(new THREE.SphereGeometry(size * 0.09, 14, 10), moveHandleMat);
   moveHandle.renderOrder = 999;
   moveHandle.userData.isHelper = true;
   group.add(moveHandle);
 
-  // Rotation ring (horizontal plane) — aims the custom-angle arrow below.
-  // Radius kept well outside the arrows' own reach (tip at shaftLen+headLen
-  // = 1.2*size) on purpose: the X/negX/Z/negZ arrows also lie flat in this
-  // same horizontal plane, and the ring used to sit at 0.75*size — squarely
-  // along their shafts — so a raycast anywhere past roughly 3/4 of the way
-  // out those four arrows hit the ring's much fatter hit-torus instead of
-  // the arrow itself. That's the actual reason dragging an arrow so often
-  // silently did nothing (or moved the ring/custom-angle arrow instead):
-  // most natural taps along a shaft land well past that 3/4 mark. The Y/
-  // negY arrows never had this problem (they don't lie in the ring's
-  // plane), which is why only some arrows/the ring ever seemed to respond.
+  // Rotation ring "N" (horizontal plane) — aims the custom-angle arrow's
+  // azimuth. Radius kept well outside the arrows' own reach (tip at
+  // shaftLen+headLen = 1.2*size): a raycast anywhere past roughly 3/4 of the
+  // way out an arrow otherwise tends to hit the ring's fatter hit-torus
+  // instead of the arrow itself, which is why arrow-picking below uses
+  // screen-space distance rather than a 3D raycast at all.
   const ringR = size * 1.5, tubeR = size * 0.03;
-  const ringMat = new THREE.MeshBasicMaterial({ color: 0x8338ec, depthTest: false, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
+  const ringMat = new THREE.MeshBasicMaterial({ color: 0x8338ec, depthTest: false, depthWrite: false, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
   const ring = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), ringMat);
   ring.rotateX(-Math.PI / 2);
   ring.userData.isHelper = true;
   group.add(ring);
-  const ringHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 3, 8, 48), hitMat);
+  const ringHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 4, 8, 48), hitMat);
   ringHit.rotateX(-Math.PI / 2);
   ringHit.userData.slRing = true;
   ringHit.userData.isHelper = true;
   group.add(ringHit);
   targets.push(ringHit);
 
+  // Ring "T" (yellow) — tilts the custom arrow up/down out of the
+  // horizontal plane, giving it a full sphere of directions instead of just
+  // the plane N alone sweeps through. A bare TorusGeometry already lies in
+  // the local XY plane (hole along local Z) — exactly the vertical ring
+  // containing the Y axis, no build-time rotation needed like N's. As N
+  // spins the azimuth, updateSlCustomArrow() spins this ring's own
+  // quaternion by the same amount around Y so it visibly stays the vertical
+  // ring containing whichever way the arrow currently points. ringTHit is a
+  // child of ringT (not a sibling, unlike N's) so it always inherits that
+  // same live rotation for free.
+  const ringMatT = new THREE.MeshBasicMaterial({ color: 0xffd60a, depthTest: false, depthWrite: false, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
+  const ringT = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), ringMatT);
+  ringT.userData.isHelper = true;
+  group.add(ringT);
+  const ringTHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 4, 8, 48), hitMat);
+  ringTHit.userData.slRingT = true;
+  ringTHit.userData.isHelper = true;
+  ringT.add(ringTHit);
+  targets.push(ringTHit);
+
   // Custom-angle arrow (purple) — orientation kept in sync with
-  // spatialLineCustomAngle by updateSpatialLineCustomArrow().
+  // slTool.customAngle/customElevation by updateSlCustomArrow().
   const customGroup = new THREE.Group();
-  const customMat = new THREE.MeshBasicMaterial({ color: 0x8338ec, depthTest: false, transparent: true, opacity: 0.95 });
+  const customMat = new THREE.MeshBasicMaterial({ color: 0x8338ec, depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 });
   const customShaftLen = size * 0.65;
   const customShaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, customShaftLen, 10), customMat);
   customShaft.position.y = customShaftLen / 2;
@@ -1253,31 +1286,47 @@ function buildSpatialLineGizmo(size = SPATIAL_LINE_GIZMO_SIZE) {
   targets.push(customShaftHit, customHeadHit);
   group.add(customGroup);
 
-  return { group, targets, customGroup };
+  return { group, targets, customGroup, ringT };
 }
 
-function updateSpatialLineCustomArrow() {
-  if (!spatialLineGizmoCustomGroup) return;
-  spatialLineGizmoCustomGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), spatialLineCustomDir());
+function updateSlCustomArrow() {
+  if (!slTool.gizmo) return;
+  slTool.gizmo.customGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), slCustomDir());
+  slTool.gizmo.ringT.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), slTool.customAngle);
 }
 
 // Constant on-screen size regardless of how far the gizmo's point actually
-// is from the camera right now — same idea as a TransformControls handle
-// in any 3D editor. Scaling the whole group (rather than rebuilding its
+// is from the camera right now — same idea as a TransformControls handle in
+// any 3D editor. Scaling the whole group (rather than rebuilding its
 // geometry) is cheap enough to do every frame, so it also stays correctly
-// sized if the camera moves — e.g. pinch-zooming closer to a distant point
-// before dragging one of its arrows, a very natural thing to do. Clamped so
-// a very close point doesn't get an oversized gizmo and a very far one
-// doesn't shrink back to unusable.
-function updateSpatialLineGizmoScale() {
-  if (!spatialLineGizmo) return;
-  const distToCam = camera.position.distanceTo(spatialLineGizmo.position);
+// sized if the camera moves. Clamped so a very close point doesn't get an
+// oversized gizmo and a very far one doesn't shrink back to unusable.
+function updateSlGizmoScale() {
+  if (!slTool.gizmo) return;
+  const distToCam = camera.position.distanceTo(slTool.gizmo.group.position);
   const size = Math.max(120, Math.min(900, distToCam * 0.12));
-  spatialLineGizmo.scale.setScalar(size / SPATIAL_LINE_GIZMO_SIZE);
+  slTool.gizmo.group.scale.setScalar(size / SL_GIZMO_SIZE);
+}
+
+function attachSlGizmo(point) {
+  detachSlGizmo();
+  const built = buildSlGizmo();
+  slTool.gizmo = built;
+  slTool.gizmo.group.position.copy(point);
+  scene.add(slTool.gizmo.group);
+  updateSlGizmoScale(); // size it correctly from the very first frame, not just the next one
+  updateSlCustomArrow();
+}
+
+function detachSlGizmo() {
+  if (!slTool.gizmo) return;
+  slTool.gizmo.group.parent?.remove(slTool.gizmo.group);
+  slTool.gizmo.group.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
+  slTool.gizmo = null;
 }
 
 // Shortest distance from point (px,py) to the screen-space segment (a->b) —
-// plain 2D geometry, used below to pick which arrow a tap actually landed
+// plain 2D geometry, used by slPickHandle to find which arrow a tap landed
 // nearest to.
 function distToSegmentPx(px, py, ax, ay, bx, by) {
   const dx = bx - ax, dy = by - ay;
@@ -1288,207 +1337,211 @@ function distToSegmentPx(px, py, ax, ay, bx, by) {
   return Math.hypot(px - cx, py - cy);
 }
 
-// Which of the 6 arrows (if any) a tap actually landed nearest to — screen-
-// space distance to each arrow's own projected shaft, not a 3D raycast
-// against a fat invisible hit-proxy. The raycast approach broke down for
-// two independent reasons found by simulating it directly: (1) the ring
-// fully encircles the arrows and, viewed from a camera at roughly the same
-// height as the gizmo (the common case — you're usually looking more or
-// less level at the point you just placed), it can be the geometrically
-// CLOSEST hit along a ray that's visually aimed at an arrow's shaft; (2) all
-// six arrows share one origin, so their fattened hit-cylinders genuinely
-// overlap each other near the base, and picking hits[0] (nearest in raw 3D
-// distance) doesn't reliably match which one a tap was actually closest to
-// on screen. Comparing screen-space distances directly sidesteps both —
-// there's no 3D depth order left to get ambiguous.
-function pickSpatialLineArrow(clientX, clientY) {
-  if (!spatialLineGizmo) return null;
-  const reach = SPATIAL_LINE_GIZMO_SIZE * 1.2 * spatialLineGizmo.scale.x; // shaftLen(0.9) + headLen(0.3), current scale
-  const base = projectToScreenPx(spatialLineGizmo.position);
-  let best = null, bestDist = Infinity;
+// One function decides what a tap/pointerdown on the gizmo actually landed
+// on — centre handle, an arrow, or a ring — checked in that priority order
+// (a centre-zone hit wins ties, since every arrow's own segment also starts
+// exactly there). Centre and arrows are picked by screen-space distance, not
+// a 3D raycast: simulating the 3D-raycast approach directly showed two
+// independent failure modes — the ring fully encircling the arrows can be
+// the geometrically CLOSEST hit along a ray visually aimed at an arrow's
+// shaft, and all three arrows sharing one origin means their fattened hit-
+// cylinders genuinely overlap near the base, so "nearest 3D hit" doesn't
+// reliably match "nearest on screen". The ring is still a plain 3D raycast
+// (against its own two distinct hit-tori) since by this point an arrow can
+// no longer wrongly intercept it first.
+const SL_CENTER_HIT_PX = 34;  // widened from 22 — a real fingertip covers a lot more than a mouse cursor
+const SL_ARROW_HIT_PX = 46;   // ditto, widened from 34
+function slPickHandle(clientX, clientY) {
+  if (!slTool.gizmo) return null;
+  const base = projectToScreenPx(slTool.gizmo.group.position);
+
+  if (Math.hypot(clientX - base.x, clientY - base.y) <= SL_CENTER_HIT_PX) return { kind: 'center' };
+
+  const reach = SL_GIZMO_SIZE * 1.2 * slTool.gizmo.group.scale.x; // shaftLen(0.9) + headLen(0.3), current scale
+  let bestAxis = null, bestDist = Infinity;
   for (const axisKey of Object.keys(SL_AXIS_DIRS)) {
-    const tipWorld = spatialLineGizmo.position.clone().addScaledVector(SL_AXIS_DIRS[axisKey], reach);
+    const tipWorld = slTool.gizmo.group.position.clone().addScaledVector(SL_AXIS_DIRS[axisKey], reach);
     const ndc = tipWorld.clone().project(camera);
     if (ndc.z < -1 || ndc.z > 1) continue; // tip behind the camera — can't be what was tapped
     const tip = projectToScreenPx(tipWorld);
     const d = distToSegmentPx(clientX, clientY, base.x, base.y, tip.x, tip.y);
-    if (d < bestDist) { bestDist = d; best = axisKey; }
+    if (d < bestDist) { bestDist = d; bestAxis = axisKey; }
   }
-  const SL_ARROW_HIT_PX = 34; // generous, fingertip-sized tolerance
-  return bestDist <= SL_ARROW_HIT_PX ? best : null;
+  if (bestDist <= SL_ARROW_HIT_PX) return { kind: 'axis', axis: bestAxis };
+
+  const ringHitEntry = rayFromClient(clientX, clientY).intersectObjects(slTool.gizmo.targets, false)
+    .find((h) => h.object.userData.slRing || h.object.userData.slRingT);
+  if (ringHitEntry) return { kind: 'ring', axis: ringHitEntry.object.userData.slRingT ? 'elevation' : 'azimuth' };
+
+  return null;
 }
 
-// Whether a tap landed on the small centre "move" handle — checked first
-// (see the pointerdown wiring), and deliberately a smaller radius than the
-// arrows' own tolerance: every arrow's segment also starts exactly here, so
-// this needs to reliably win only very close to dead-centre, not steal taps
-// that are clearly headed toward a specific arrow instead.
-function isNearSpatialLineGizmoCenter(clientX, clientY) {
-  if (!spatialLineGizmo) return false;
-  const base = projectToScreenPx(spatialLineGizmo.position);
-  const SL_MOVE_HANDLE_HIT_PX = 22;
-  return Math.hypot(clientX - base.x, clientY - base.y) <= SL_MOVE_HANDLE_HIT_PX;
-}
-
-function attachSpatialLineGizmo(point) {
-  detachSpatialLineGizmo();
-  const built = buildSpatialLineGizmo();
-  spatialLineGizmo = built.group;
-  spatialLineGizmoTargets = built.targets;
-  spatialLineGizmoCustomGroup = built.customGroup;
-  spatialLineGizmo.position.copy(point);
-  scene.add(spatialLineGizmo);
-  updateSpatialLineGizmoScale(); // size it correctly from the very first frame, not just the next one
-  updateSpatialLineCustomArrow();
-}
-
-function detachSpatialLineGizmo() {
-  if (!spatialLineGizmo) return;
-  spatialLineGizmo.parent?.remove(spatialLineGizmo);
-  spatialLineGizmo.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
-  spatialLineGizmo = null;
-  spatialLineGizmoTargets = [];
-  spatialLineGizmoCustomGroup = null;
-}
-
-// Screen-space drag, not a 3D ray-vs-axis-line intersection — deliberately.
-// The first point often ends up placed more or less straight ahead of the
-// camera, which puts the arrow pointing toward/away from it (the "Z"/"negz"
-// arrow especially) heavily foreshortened; projecting a 2D finger drag onto
-// a 3D line via closestPointOnLineToRay degrades badly right at that angle
-// (numerically unstable, and can even flip which direction reads as
-// "forward"), which is exactly the failure mode that made dragging feel
-// like it did nothing. Measuring the drag in screen pixels against the same
-// axis also projected to screen pixels can't have either problem — it's
-// plain 2D math the whole way, and "drag the way the arrow visibly points
-// on screen" is always correctly positive by construction.
-function beginSpatialLineDrag(axisKey, clientX, clientY) {
-  const axisWorld = axisKey === 'custom' ? spatialLineCustomDir() : SL_AXIS_DIRS[axisKey].clone();
-  const basePoint = spatialLineGizmo.position.clone();
-  const aScreen = projectToScreenPx(basePoint);
-  const bScreen = projectToScreenPx(basePoint.clone().addScaledVector(axisWorld, 100)); // 100mm probe
-  const dxs = bScreen.x - aScreen.x, dys = bScreen.y - aScreen.y;
-  const screenLen = Math.hypot(dxs, dys);
-  // Arrow pointing almost exactly at/away from the camera projects to
-  // (near) zero screen length — no usable on-screen direction to drag
-  // along; pxPerMm 0 makes every offset below just stay 0 instead of
-  // dividing by ~0.
-  const axisScreenDir = screenLen < 2 ? { x: 0, y: -1 } : { x: dxs / screenLen, y: dys / screenLen };
-  const pxPerMm = screenLen < 2 ? 0 : screenLen / 100;
-  spatialLineDrag = { axisWorld, basePoint, startX: clientX, startY: clientY, axisScreenDir, pxPerMm, candidatePoint: basePoint.clone(), length: 0 };
-}
-
-function updateSpatialLineDrag(clientX, clientY) {
-  const g = spatialLineDrag;
-  const dx = clientX - g.startX, dy = clientY - g.startY;
-  const screenAlong = dx * g.axisScreenDir.x + dy * g.axisScreenDir.y;
-  // Only the positive direction along this specific arrow's axis counts —
-  // each of the six arrows already only points one way.
-  const offset = g.pxPerMm > 0 ? Math.max(0, screenAlong / g.pxPerMm) : 0;
-  g.candidatePoint = g.basePoint.clone().addScaledVector(g.axisWorld, offset);
-  g.length = offset;
-  updateSpatialLinePreview();
-  updateSpatialLineLengthLabel(g.basePoint, g.candidatePoint, g.length);
-}
-
-function endSpatialLineDrag() {
-  const g = spatialLineDrag;
-  spatialLineDrag = null;
-  hideSpatialLineLengthLabel();
-  if (!g || g.length < 10) { updateSpatialLinePreview(); return; } // ignore a near-zero/no-op drag
-  const point = roundVec(g.candidatePoint);
-  spatialLineDraft.points.push(point);
-  attachSpatialLineGizmo(point);
-  updateSpatialLinePreview();
-  renderSpatialLinePill();
-}
-
-// Free-drag the gizmo itself (its centre move handle) anywhere in 3D space
-// — moving it IS how this draws the next segment, live, rather than a
-// separate action: the gizmo's own position becomes the in-progress
-// candidate point every frame, exactly like dragging one of the axis
-// arrows does, just unconstrained to any single axis. Lands on whatever
-// real surface is under the finger (or 1.5 m ahead of the camera if
-// nothing's there), same rule as placing the very first point.
-function beginSpatialLineMoveDrag() {
-  spatialLineMoveDrag = { basePoint: spatialLineGizmo.position.clone(), candidatePoint: spatialLineGizmo.position.clone() };
-}
-
-function updateSpatialLineMoveDrag(clientX, clientY) {
-  const g = spatialLineMoveDrag;
-  const hits = rayFromClient(clientX, clientY).intersectObjects(raycastTargets, false);
-  const point = hits.length ? hits[0].point.clone() : pointInFrontOfCamera();
-  g.candidatePoint = point;
-  spatialLineGizmo.position.copy(point); // the gizmo itself rides along under the finger
-  updateSpatialLinePreview();
-  updateSpatialLineLengthLabel(g.basePoint, point, g.basePoint.distanceTo(point));
-}
-
-function endSpatialLineMoveDrag() {
-  const g = spatialLineMoveDrag;
-  spatialLineMoveDrag = null;
-  hideSpatialLineLengthLabel();
-  if (!g || g.basePoint.distanceTo(g.candidatePoint) < 10) {
-    // Ignore a near-zero/no-op drag — same threshold as the axis-arrow
-    // drag — but the gizmo itself already visually followed the finger, so
-    // it needs putting back at its base point rather than left wherever
-    // the last raycast happened to land.
-    if (g) spatialLineGizmo.position.copy(g.basePoint);
-    updateSpatialLinePreview();
+// Starts the one drag `slTool.drag` can hold, tagged by `handle.kind` so
+// updateSlDrag/endSlDrag know how to read and finish it.
+function beginSlDrag(handle, clientX, clientY) {
+  if (handle.kind === 'center') {
+    const p = slTool.gizmo.group.position.clone();
+    slTool.drag = { kind: 'center', basePoint: p, candidatePoint: p.clone() };
     return;
   }
-  const point = roundVec(g.candidatePoint);
-  spatialLineDraft.points.push(point);
-  attachSpatialLineGizmo(point);
-  updateSpatialLinePreview();
-  renderSpatialLinePill();
+  if (handle.kind === 'axis') {
+    // Screen-space drag, not a 3D ray-vs-axis-line intersection —
+    // deliberately. The first point often ends up placed more or less
+    // straight ahead of the camera, which puts an axis pointing toward/away
+    // from it heavily foreshortened; projecting a 2D finger drag onto a 3D
+    // line degrades badly right at that angle (numerically unstable, can
+    // even flip which direction reads as "forward"). Measuring the drag in
+    // screen pixels against the same axis also projected to screen pixels
+    // can't have either problem.
+    const axisWorld = handle.axis === 'custom' ? slCustomDir() : SL_AXIS_DIRS[handle.axis].clone();
+    const basePoint = slTool.gizmo.group.position.clone();
+    const aScreen = projectToScreenPx(basePoint);
+    const bScreen = projectToScreenPx(basePoint.clone().addScaledVector(axisWorld, 100)); // 100mm probe
+    const dxs = bScreen.x - aScreen.x, dys = bScreen.y - aScreen.y;
+    const screenLen = Math.hypot(dxs, dys);
+    // An axis pointing almost exactly at/away from the camera projects to
+    // (near) zero screen length — no usable on-screen direction to drag
+    // along; pxPerMm 0 makes every offset below just stay 0.
+    const axisScreenDir = screenLen < 2 ? { x: 0, y: -1 } : { x: dxs / screenLen, y: dys / screenLen };
+    const pxPerMm = screenLen < 2 ? 0 : screenLen / 100;
+    slTool.drag = {
+      kind: 'axis', axis: handle.axis, axisWorld, basePoint, startX: clientX, startY: clientY,
+      axisScreenDir, pxPerMm, candidatePoint: basePoint.clone(), length: 0,
+    };
+    return;
+  }
+  if (handle.kind === 'ring') {
+    const centerScreen = projectToScreenPx(slTool.gizmo.group.position);
+    slTool.drag = {
+      kind: 'ring', axis: handle.axis, centerScreen,
+      prevAngle: Math.atan2(clientY - centerScreen.y, clientX - centerScreen.x),
+    };
+  }
 }
 
-// Softly snaps to every 15° (so 45°, 90°… are easy to hit exactly) once
-// within 3° of one, otherwise leaves the angle exactly where dragged.
-function snapAngleRad(rad) {
-  const deg = (rad * 180) / Math.PI;
-  const nearest = Math.round(deg / 15) * 15;
-  return Math.abs(deg - nearest) <= 3 ? (nearest * Math.PI) / 180 : rad;
-}
-
-function beginSpatialLineRingDrag(clientX, clientY) {
-  const centerScreen = projectToScreenPx(spatialLineGizmo.position);
-  spatialLineRingDrag = { centerScreen, prevAngle: Math.atan2(clientY - centerScreen.y, clientX - centerScreen.x) };
-}
-
-function updateSpatialLineRingDrag(clientX, clientY) {
-  const g = spatialLineRingDrag;
+function updateSlDrag(clientX, clientY) {
+  const g = slTool.drag;
+  if (g.kind === 'center') {
+    const ray = rayFromClient(clientX, clientY);
+    const hits = ray.intersectObjects(raycastTargets, false);
+    // The centre handle used to read as completely stuck: its no-surface-
+    // hit fallback was the camera's own straight-ahead point, which ignores
+    // clientX/clientY entirely and — with the camera not moving during this
+    // drag — returned the exact same world point every tick regardless of
+    // where the finger went. Any drag that doesn't cross real scene
+    // geometry (the common case: this tool draws lines out in open space,
+    // away from walls/floors) hit that fallback on every tick and the gizmo
+    // visibly never budged. Walking the finger's own ray out to a plane at
+    // the drag's current depth instead still lands on a real surface when
+    // there is one, but otherwise actually tracks the finger through open
+    // space, same as the axis/ring drags do.
+    const point = hits.length ? hits[0].point.clone() : ray.ray.origin.clone().addScaledVector(ray.ray.direction, camera.position.distanceTo(g.candidatePoint) || 1500);
+    g.candidatePoint = point;
+    slTool.gizmo.group.position.copy(point); // the gizmo itself rides along under the finger
+    updateSlPreview();
+    updateSlLengthLabel(g.basePoint, point, g.basePoint.distanceTo(point));
+    updateSlAngleLabel(point);
+    return;
+  }
+  if (g.kind === 'axis') {
+    const dx = clientX - g.startX, dy = clientY - g.startY;
+    const screenAlong = dx * g.axisScreenDir.x + dy * g.axisScreenDir.y;
+    // Bidirectional and unbounded: once grabbed, an arrow stands for its
+    // whole axis — dragging back past the origin is just as valid as
+    // extending forward, same as a real object's move-gizmo axis, and
+    // there's no length cap either.
+    const offset = g.pxPerMm > 0 ? screenAlong / g.pxPerMm : 0;
+    g.candidatePoint = g.basePoint.clone().addScaledVector(g.axisWorld, offset);
+    g.length = offset;
+    updateSlPreview();
+    updateSlLengthLabel(g.basePoint, g.candidatePoint, Math.abs(g.length));
+    updateSlAngleLabel(g.candidatePoint);
+    return;
+  }
+  // ring
   const angle = Math.atan2(clientY - g.centerScreen.y, clientX - g.centerScreen.x);
   let step = angle - g.prevAngle;
   if (step > Math.PI) step -= Math.PI * 2;
   if (step < -Math.PI) step += Math.PI * 2;
   g.prevAngle = angle;
-  spatialLineCustomAngle = snapAngleRad(spatialLineCustomAngle + step * ROTATE_DRAG_SENSITIVITY);
-  updateSpatialLineCustomArrow();
+  if (g.axis === 'elevation') {
+    // Clamped just short of straight up/down, same reasoning as the free-
+    // look camera's own pitch clamp — dead-on vertical makes azimuth ill-
+    // defined and the arrow would jitter trying to track it.
+    const next = snapAngleRad(slTool.customElevation + step * ROTATE_DRAG_SENSITIVITY);
+    slTool.customElevation = Math.max(-1.5, Math.min(1.5, next));
+  } else {
+    slTool.customAngle = snapAngleRad(slTool.customAngle + step * ROTATE_DRAG_SENSITIVITY);
+  }
+  updateSlCustomArrow();
 }
 
-function updateSpatialLinePreview() {
-  clearSpatialLinePreview();
-  if (!spatialLineDraft) return;
-  const pts = spatialLineDraft.points.slice();
-  if (spatialLineDrag) pts.push(spatialLineDrag.candidatePoint);
-  else if (spatialLineMoveDrag) pts.push(spatialLineMoveDrag.candidatePoint);
+// The one place every drag ends, regardless of `.kind` — this is exactly
+// what fixes the "double-tap silently eaten" class of bug: no matter which
+// handle a short, barely-moved release happened to grab, it always reaches
+// slHandleTapRelease before returning.
+function endSlDrag(clientX, clientY) {
+  const g = slTool.drag;
+  slTool.drag = null;
+  hideSlLengthLabel();
+  hideSlAngleLabel();
+  if (!g) { updateSlPreview(); return; }
+
+  let committedPoint = null;
+  if (g.kind === 'center') {
+    if (g.basePoint.distanceTo(g.candidatePoint) >= 10) committedPoint = g.candidatePoint;
+    else slTool.gizmo.group.position.copy(g.basePoint); // near-zero drag — put it back, don't leave it wherever the last raycast landed
+  } else if (g.kind === 'axis') {
+    if (Math.abs(g.length) >= 10) committedPoint = g.candidatePoint;
+  }
+  // ring drags never commit a point — only ever a tap-or-not check, below.
+
+  if (committedPoint) {
+    const point = roundVec(committedPoint);
+    slTool.draft.points.push(point);
+    attachSlGizmo(point);
+    updateSlPreview();
+    renderSpatialLinePill();
+    return;
+  }
+
+  updateSlPreview();
+  if (g.kind === 'ring') {
+    // A ring has no "distance dragged" of its own to fall back on (it's a
+    // rotation, not a translation) — a genuine rotation must NOT also try
+    // to place a point or finish the line on release, so this checks the
+    // whole gesture's raw screen movement (from the original pointerdown)
+    // instead: only a barely-moved, quick release counts as a tap here.
+    const dx = clientX - downX, dy = clientY - downY;
+    const dt = performance.now() - downTime;
+    if (dx * dx + dy * dy <= 49 && dt <= 600) slHandleTapRelease(clientX, clientY);
+    return;
+  }
+  // 'center'/'axis' near-zero drag — already effectively a tap by its own
+  // (world-space) distance check above.
+  slHandleTapRelease(clientX, clientY);
+}
+
+function updateSlPreview() {
+  clearSlPreview();
+  if (!slTool.draft) return;
+  const pts = slTool.draft.points.slice();
+  if (slTool.drag) pts.push(slTool.drag.candidatePoint);
   if (pts.length < 2) return;
   const geom = new THREE.BufferGeometry().setFromPoints(pts);
-  const mat = new THREE.LineBasicMaterial({ color: 0x8338ec, depthTest: false });
+  const mat = new THREE.LineBasicMaterial({ color: 0x8338ec, depthTest: false, depthWrite: false, transparent: true });
   const line = new THREE.Line(geom, mat);
   line.renderOrder = 998;
   scene.add(line);
-  spatialLinePreviewMesh = line;
+  slTool.previewMesh = line;
 }
 
-function clearSpatialLinePreview() {
-  if (!spatialLinePreviewMesh) return;
-  spatialLinePreviewMesh.parent?.remove(spatialLinePreviewMesh);
-  spatialLinePreviewMesh.geometry.dispose();
-  spatialLinePreviewMesh.material.dispose();
-  spatialLinePreviewMesh = null;
+function clearSlPreview() {
+  if (!slTool.previewMesh) return;
+  slTool.previewMesh.parent?.remove(slTool.previewMesh);
+  slTool.previewMesh.geometry.dispose();
+  slTool.previewMesh.material.dispose();
+  slTool.previewMesh = null;
 }
 
 // Same NDC->pixel projection as the axis-rotate gizmo (projectToScreenPx)
@@ -1503,9 +1556,9 @@ const spatialLineLengthGroupEl = document.getElementById('spatialLineLengthGroup
 const spatialLineLengthLineEl = spatialLineLengthGroupEl.querySelector('.spatial-line-length-line');
 const spatialLineLengthTextEl = spatialLineLengthGroupEl.querySelector('.spatial-line-length-text');
 
-function updateSpatialLineLengthLabel(aWorld, bWorld, lengthMm) {
+function updateSlLengthLabel(aWorld, bWorld, lengthMm) {
   const a = slProjectToScreen(aWorld), b = slProjectToScreen(bWorld);
-  if (a.behind || b.behind) { hideSpatialLineLengthLabel(); return; }
+  if (a.behind || b.behind) { hideSlLengthLabel(); return; }
   spatialLineLengthLineEl.setAttribute('x1', a.x); spatialLineLengthLineEl.setAttribute('y1', a.y);
   spatialLineLengthLineEl.setAttribute('x2', b.x); spatialLineLengthLineEl.setAttribute('y2', b.y);
   spatialLineLengthTextEl.setAttribute('x', (a.x + b.x) / 2);
@@ -1513,16 +1566,54 @@ function updateSpatialLineLengthLabel(aWorld, bWorld, lengthMm) {
   spatialLineLengthTextEl.textContent = `${formatMm(lengthMm, 0)} мм`;
   spatialLineLengthGroupEl.classList.remove('hidden');
 }
-function hideSpatialLineLengthLabel() {
+function hideSlLengthLabel() {
   spatialLineLengthGroupEl.classList.add('hidden');
+}
+
+// Angle between the in-progress segment and the one before it — only
+// meaningful from the second segment on, so `null` whenever there isn't a
+// prior committed segment yet. Side ('право'/'ліво') is measured looking
+// straight down (bird's-eye, +Y up): a positive Y component of prevDir×curDir
+// means the new segment bends to the right of the previous one, negative
+// bends left, near-zero continues straight.
+function computeSlTurnAngle(candidatePoint) {
+  if (!slTool.draft || slTool.draft.points.length < 2) return null;
+  const pts = slTool.draft.points;
+  const prevA = pts[pts.length - 2], prevB = pts[pts.length - 1];
+  const prevDir = new THREE.Vector3().subVectors(prevB, prevA);
+  const curDir = new THREE.Vector3().subVectors(candidatePoint, prevB);
+  if (prevDir.lengthSq() < 1 || curDir.lengthSq() < 1) return null;
+  prevDir.normalize(); curDir.normalize();
+  const angleDeg = THREE.MathUtils.radToDeg(Math.acos(THREE.MathUtils.clamp(prevDir.dot(curDir), -1, 1)));
+  const cross = new THREE.Vector3().crossVectors(prevDir, curDir);
+  const side = cross.y > 1e-4 ? 'право' : cross.y < -1e-4 ? 'ліво' : 'прямо';
+  return { angleDeg, side, at: prevB };
+}
+
+const spatialLineAngleGroupEl = document.getElementById('spatialLineAngleGroup');
+const spatialLineAngleTextEl = spatialLineAngleGroupEl.querySelector('.spatial-line-angle-text');
+
+function updateSlAngleLabel(candidatePoint) {
+  if (!slTool.showAngle) { hideSlAngleLabel(); return; }
+  const info = computeSlTurnAngle(candidatePoint);
+  if (!info) { hideSlAngleLabel(); return; }
+  const p = slProjectToScreen(info.at);
+  if (p.behind) { hideSlAngleLabel(); return; }
+  spatialLineAngleTextEl.setAttribute('x', p.x);
+  spatialLineAngleTextEl.setAttribute('y', p.y - 30);
+  spatialLineAngleTextEl.textContent = `${info.angleDeg.toFixed(0)}° · ${info.side}`;
+  spatialLineAngleGroupEl.classList.remove('hidden');
+}
+function hideSlAngleLabel() {
+  spatialLineAngleGroupEl.classList.add('hidden');
 }
 
 function renderSpatialLinePill() {
   modePillEl.innerHTML = '';
   const label = document.createElement('span');
-  const n = spatialLineDraft ? spatialLineDraft.points.length : 0;
-  label.textContent = spatialLineGizmo
-    ? `Точок: ${n} — тягніть центральну ручку вільно, стрілку по осі, або кільце для кута`
+  const n = slTool.draft ? slTool.draft.points.length : 0;
+  label.textContent = slTool.gizmo
+    ? `Точок: ${n} — тягніть ручку/стрілку/кільце, або торкніться вільного місця для нової точки (двічі — завершити)`
     : 'Торкніться, щоб поставити першу точку';
   modePillEl.appendChild(label);
 
@@ -1530,28 +1621,41 @@ function renderSpatialLinePill() {
   // pipe/rebar/wire keeps its own fixed profile from SPATIAL_LINE_RUN_DEFS.
   const thickInput = document.createElement('input');
   thickInput.type = 'range'; thickInput.min = '2'; thickInput.max = '40'; thickInput.step = '1';
-  thickInput.value = String(spatialLineRadius);
+  thickInput.value = String(slTool.radius);
   thickInput.className = 'bend-angle-slider';
   const thickLabel = document.createElement('span');
   thickLabel.className = 'bend-angle-label';
-  thickLabel.textContent = `⌀${spatialLineRadius * 2} мм`;
+  thickLabel.textContent = `⌀${slTool.radius * 2} мм`;
   thickInput.addEventListener('input', () => {
-    spatialLineRadius = Number(thickInput.value);
-    thickLabel.textContent = `⌀${spatialLineRadius * 2} мм`;
+    slTool.radius = Number(thickInput.value);
+    thickLabel.textContent = `⌀${slTool.radius * 2} мм`;
   });
   modePillEl.appendChild(thickInput);
   modePillEl.appendChild(thickLabel);
 
-  if (spatialLineDraft && spatialLineDraft.points.length > 1) {
+  if (slTool.draft && slTool.draft.points.length > 1) {
     const undoBtn = document.createElement('button');
     undoBtn.textContent = '⌫ Точка';
     undoBtn.addEventListener('click', () => {
-      spatialLineDraft.points.pop();
-      attachSpatialLineGizmo(spatialLineDraft.points[spatialLineDraft.points.length - 1]);
-      updateSpatialLinePreview();
+      slTool.draft.points.pop();
+      attachSlGizmo(slTool.draft.points[slTool.draft.points.length - 1]);
+      updateSlPreview();
       renderSpatialLinePill();
     });
     modePillEl.appendChild(undoBtn);
+
+    // Turn-angle readout only makes sense from the 2nd segment on — see
+    // computeSlTurnAngle(); the toggle itself is always available here so
+    // it's ready the moment a 2nd segment starts.
+    const angleBtn = document.createElement('button');
+    angleBtn.textContent = slTool.showAngle ? '📐 Приховати градуси' : '📐 Показати градуси';
+    if (slTool.showAngle) angleBtn.classList.add('on');
+    angleBtn.addEventListener('click', () => {
+      slTool.showAngle = !slTool.showAngle;
+      if (!slTool.showAngle) hideSlAngleLabel();
+      renderSpatialLinePill();
+    });
+    modePillEl.appendChild(angleBtn);
   }
 
   const cancelBtn = document.createElement('button');
@@ -1559,7 +1663,7 @@ function renderSpatialLinePill() {
   cancelBtn.addEventListener('click', cancelSpatialLine);
   modePillEl.appendChild(cancelBtn);
 
-  if (spatialLineDraft && spatialLineDraft.points.length >= 2) {
+  if (slTool.draft && slTool.draft.points.length >= 2) {
     const doneBtn = document.createElement('button');
     doneBtn.textContent = '✓ Завершити';
     doneBtn.addEventListener('click', finishSpatialLine);
@@ -1569,26 +1673,58 @@ function renderSpatialLinePill() {
 }
 
 // Called from endPointer once a genuine tap (not a look-drag) is confirmed
-// with no first point yet — see the pointerdown/endPointer spatialLineActive
-// branches for why this is deferred to tap-release instead of firing
-// straight on pointerdown.
+// with no first point yet — see the pointerdown/endPointer wiring for why
+// this is deferred to tap-release instead of firing straight on pointerdown.
 function placeFirstSpatialLinePoint(clientX, clientY) {
   scene.updateMatrixWorld(true);
   const hits = rayFromClient(clientX, clientY).intersectObjects(raycastTargets, false);
   const point = hits.length ? hits[0].point.clone() : pointInFrontOfCamera();
-  spatialLineDraft = { points: [roundVec(point)] };
-  attachSpatialLineGizmo(point);
+  slTool.draft = { points: [roundVec(point)] };
+  attachSlGizmo(point);
+  renderSpatialLinePill();
+}
+
+// Single tap vs. double tap, from the second point on — the one place every
+// "this release turned out to be a tap, not a drag" path ends up (see the
+// big comment at the top of this file for why that unification is the
+// actual fix, not just cleanup).
+function slHandleTapRelease(clientX, clientY) {
+  const now = performance.now();
+  const sdx = clientX - slTool.lastTap.x, sdy = clientY - slTool.lastTap.y;
+  const isDoubleTap = slTool.lastTap.time > 0 && (now - slTool.lastTap.time) <= 350 && (sdx * sdx + sdy * sdy) <= 900;
+  if (isDoubleTap) {
+    slTool.lastTap.time = 0;
+    if (slTool.draft && slTool.draft.points.length >= 2) finishSpatialLine();
+  } else {
+    slTool.lastTap = { time: now, x: clientX, y: clientY };
+    addSpatialLinePointAtTap(clientX, clientY);
+  }
+}
+
+// Called from endPointer on a genuine tap that misses every gizmo handle
+// once the chain is already started — same landing rule as the first point
+// (real geometry under the tap, else 1.5 m ahead of the camera), and it
+// simply continues the same draft: push the point, re-attach the gizmo
+// there, exactly like committing a drag.
+function addSpatialLinePointAtTap(clientX, clientY) {
+  scene.updateMatrixWorld(true);
+  const hits = rayFromClient(clientX, clientY).intersectObjects(raycastTargets, false);
+  const point = roundVec(hits.length ? hits[0].point : pointInFrontOfCamera());
+  slTool.draft.points.push(point);
+  attachSlGizmo(point);
+  updateSlPreview();
   renderSpatialLinePill();
 }
 
 function cancelSpatialLine() {
-  spatialLineActive = false;
-  spatialLineDraft = null;
-  spatialLineDrag = null;
-  spatialLineRingDrag = null;
-  detachSpatialLineGizmo();
-  clearSpatialLinePreview();
-  hideSpatialLineLengthLabel();
+  slTool.active = false;
+  slTool.draft = null;
+  slTool.drag = null;
+  slTool.lastTap.time = 0; // don't let a stray tap right after cancelling misread as a double-tap on the next line
+  detachSlGizmo();
+  clearSlPreview();
+  hideSlLengthLabel();
+  hideSlAngleLabel();
   hideEl(modePillEl);
   document.getElementById('spatialLineFab')?.classList.remove('on');
 }
@@ -1644,17 +1780,19 @@ function buildSpatialLineRunGroup(points, kind, color, radius = 5) {
 }
 
 function finishSpatialLine() {
-  if (!spatialLineDraft || spatialLineDraft.points.length < 2) { cancelSpatialLine(); return; }
-  const points = spatialLineDraft.points;
-  const { group, totalLen } = buildSpatialLineRunGroup(points, 'spatialLine', null, spatialLineRadius);
+  if (!slTool.draft || slTool.draft.points.length < 2) { cancelSpatialLine(); return; }
+  const points = slTool.draft.points;
+  const { group, totalLen } = buildSpatialLineRunGroup(points, 'spatialLine', null, slTool.radius);
   if (!group.children.length) { toast('Лінія замала для збереження'); cancelSpatialLine(); return; }
 
-  const record = registerObject('spatialLine', group, { spatialLinePoints: points.map((p) => p.clone()), spatialLineRadius });
-  spatialLineActive = false;
-  spatialLineDraft = null;
-  detachSpatialLineGizmo();
-  clearSpatialLinePreview();
-  hideSpatialLineLengthLabel();
+  const record = registerObject('spatialLine', group, { spatialLinePoints: points.map((p) => p.clone()), spatialLineRadius: slTool.radius });
+  slTool.active = false;
+  slTool.draft = null;
+  slTool.lastTap.time = 0;
+  detachSlGizmo();
+  clearSlPreview();
+  hideSlLengthLabel();
+  hideSlAngleLabel();
   hideEl(modePillEl);
   document.getElementById('spatialLineFab')?.classList.remove('on');
   select(record);
@@ -1671,8 +1809,61 @@ function setSpatialLineRadius(record, radiusMm) {
   removeObject(record);
   const { group } = buildSpatialLineRunGroup(points, 'spatialLine', null, radiusMm);
   const newRecord = registerObject('spatialLine', group, { spatialLinePoints: points.map((p) => p.clone()), spatialLineRadius: radiusMm });
-  spatialLineRadius = radiusMm;
+  slTool.radius = radiusMm;
   select(newRecord);
+}
+
+// Closest point to `point` lying anywhere along the polyline `points`
+// describes (clamped per segment, not an infinite-line projection) — used
+// to snap a tapped "attach" location onto the run's actual centerline
+// instead of wherever the raycast happened to land on the tube's surface
+// (offset outward by its radius) or slightly off either end.
+function closestPointOnPolyline(points, point) {
+  let best = null, bestDistSq = Infinity;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    const ab = new THREE.Vector3().subVectors(b, a);
+    const lenSq = ab.lengthSq();
+    let t = lenSq > 0 ? new THREE.Vector3().subVectors(point, a).dot(ab) / lenSq : 0;
+    t = Math.max(0, Math.min(1, t));
+    const cand = a.clone().addScaledVector(ab, t);
+    const d = cand.distanceToSquared(point);
+    if (d < bestDistSq) { bestDistSq = d; best = cand; }
+  }
+  return best;
+}
+
+// "🔗 Прикріпити гізмо" — starts a brand-new "Просторова лінія" chain from
+// a point picked anywhere along an already-finished run (its own endpoint,
+// or any point along its middle — e.g. dropping a ladder rung between two
+// long rails without editing either rail's own points). The new chain is
+// a wholly separate object that merely starts exactly on the old one's
+// path; it never splits or otherwise touches the old run's own points.
+function beginSpatialLineAttach(record) {
+  if (!record.spatialLinePoints || record.spatialLinePoints.length < 2) return;
+  slTool.attach.target = record;
+  slTool.attach.picking = true;
+  deselect();
+  toast('Торкніться точки на лінії, щоб прикріпити гізмо');
+}
+
+// Consumes the pick that beginSpatialLineAttach set up — called from the
+// very top of handleEditTap, before any of the normal tap handling, so it
+// wins over everything else while active.
+function trySpatialLineAttachTap(x, y) {
+  const record = slTool.attach.target;
+  slTool.attach.picking = false;
+  slTool.attach.target = null;
+  if (!record || !objects.includes(record)) { toast('Цю лінію вже видалено'); return; }
+  const hits = rayFromClient(x, y).intersectObject(record.root, true);
+  if (!hits.length) { toast('Торкніться саме на лінії'); return; }
+  const point = roundVec(closestPointOnPolyline(record.spatialLinePoints, hits[0].point) || hits[0].point);
+  slTool.active = true;
+  slTool.draft = { points: [point] };
+  document.getElementById('spatialLineFab')?.classList.add('on');
+  attachSlGizmo(point);
+  renderSpatialLinePill();
+  toast('Гізмо прикріплено — продовжуйте малювати');
 }
 
 function convertSpatialLine(record, targetKind, color) {
@@ -1881,6 +2072,7 @@ function select(record) {
   if (selected === record) return;
   deselect();
   selected = record;
+  selectionPanelCollapsed = true; // start collapsed on every new selection — see wireSelectionPanelGrip
   if (record.roomId) activeRoomId = record.roomId;
 
   // A sculpted round object (sphere/cylinder/cone) is no longer actually
@@ -1911,6 +2103,20 @@ function select(record) {
     // honest shape for an assembly, same as a window.
     outlineHelper = new THREE.BoxHelper(record.root, 0x8338ec);
     scene.add(outlineHelper);
+  }
+  // Always draw the outline on top, ignoring (and not writing into) the
+  // depth buffer — same overlay treatment as the move/rotate gizmo below,
+  // and for the same reason: a plain depth-tested outline sitting exactly
+  // on the object's own silhouette is a textbook z-fighting setup (outline
+  // and surface at the identical depth), and on at least one real device
+  // that's shown up as the outline simply never winning that fight —
+  // selecting an object showed no outline and no gizmo at all, even though
+  // the object itself rendered fine.
+  if (outlineHelper) {
+    outlineHelper.material.depthTest = false;
+    outlineHelper.material.depthWrite = false;
+    outlineHelper.material.transparent = true;
+    outlineHelper.renderOrder = 999;
   }
 
   if (record.kind !== 'ground' && record.kind !== 'sketchLine') {
@@ -2026,7 +2232,7 @@ function buildGizmo(record) {
   const hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, depthTest: false });
   const AXES = ['x', 'y', 'z'];
   for (const axis of AXES) {
-    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, transparent: true, opacity: 0.95 });
+    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 });
     const arrow = new THREE.Group();
     const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 10), mat);
     shaft.position.y = shaftLen / 2;
@@ -2061,7 +2267,7 @@ function buildGizmo(record) {
   // --- rotate rings ---
   const ringR = size * 0.85, tubeR = size * 0.03;
   for (const axis of AXES) {
-    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
+    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, depthWrite: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
     const torus = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), mat);
     torus.renderOrder = 998;
     if (axis === 'y') torus.rotateX(-Math.PI / 2);   // normal -> +Y (lies flat, spins around vertical)
@@ -3004,34 +3210,97 @@ const modePillEl = document.getElementById('modePill');
 function hideEl(el) { el.classList.add('hidden'); }
 function showEl(el) { el.classList.remove('hidden'); }
 
+// Starts collapsed on every new selection (see select() resetting this) —
+// full controls are a drag/tap of the grip handle away. Persists across
+// renderSelectionPanel() re-renders of the SAME selection (e.g. after
+// editing a value) so toggling it open doesn't get undone by your own edit.
+let selectionPanelCollapsed = true;
+
+// Wires the drag-or-tap gesture on the panel's grip handle: a small
+// vertical drag (or a plain tap) toggles collapsed/expanded. Not a live
+// finger-follow — a real bottom-sheet drag would need to track and clamp an
+// intermediate height every frame; a threshold-triggered toggle with a CSS
+// transition gets the same "drag it open" feel for far less to get wrong.
+function wireSelectionPanelGrip(grip) {
+  let startY = 0, startTime = 0, dragging = false;
+  grip.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    startY = e.clientY;
+    startTime = performance.now();
+    grip.setPointerCapture(e.pointerId);
+  });
+  grip.addEventListener('pointerup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    const dy = e.clientY - startY;
+    const dt = performance.now() - startTime;
+    if (Math.abs(dy) < 6 && dt < 400) {
+      selectionPanelCollapsed = !selectionPanelCollapsed; // plain tap — toggle
+    } else if (dy < -20) {
+      selectionPanelCollapsed = false; // dragged up — open
+    } else if (dy > 20) {
+      selectionPanelCollapsed = true; // dragged down — close
+    }
+    renderSelectionPanel();
+  });
+  grip.addEventListener('pointercancel', () => { dragging = false; });
+}
+
+// Shared by both the raw "spatialLine" panel branch and the generic
+// fallthrough one (a converted pipe/rebar/wire run still carries its own
+// spatialLinePoints) — see beginSpatialLineAttach().
+function buildSpatialLineAttachButton(record) {
+  const b = document.createElement('button');
+  b.className = 'pbtn';
+  b.textContent = '🔗 Прикріпити гізмо';
+  b.title = 'Почати нову лінію з точки на цій — з кінця або будь-де посередині';
+  b.addEventListener('click', () => beginSpatialLineAttach(record));
+  return b;
+}
+
 function renderSelectionPanel() {
   if (!selected) { hideEl(selectionPanelEl); return; }
   selectionPanelEl.innerHTML = '';
   showEl(selectionPanelEl);
   hideEl(modePillEl);
+  selectionPanelEl.classList.toggle('collapsed', selectionPanelCollapsed);
+
+  const grip = document.createElement('div');
+  grip.className = 'panel-grip';
+  const gripBar = document.createElement('div'); gripBar.className = 'grip-bar';
+  const gripLabel = document.createElement('span');
+  gripLabel.className = 'grip-label';
+  gripLabel.textContent = KIND_LABELS[selected.kind] || selected.kind;
+  grip.append(gripBar, gripLabel);
+  wireSelectionPanelGrip(grip);
+  selectionPanelEl.appendChild(grip);
+
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'panel-body';
+  selectionPanelEl.appendChild(bodyEl);
 
   const closeBtn = document.createElement('button');
   closeBtn.className = 'close-x';
   closeBtn.textContent = '✕';
   closeBtn.addEventListener('click', deselect);
-  selectionPanelEl.appendChild(closeBtn);
+  bodyEl.appendChild(closeBtn);
 
   const title = document.createElement('p');
   title.className = 'panel-title';
   title.textContent = KIND_LABELS[selected.kind] || selected.kind;
-  selectionPanelEl.appendChild(title);
+  bodyEl.appendChild(title);
 
   if (selected.roomId) {
-    selectionPanelEl.appendChild(buildRoomDimsSection(selected.roomId));
+    bodyEl.appendChild(buildRoomDimsSection(selected.roomId));
   }
 
   if (selected.kind === 'ground') {
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
     hint.textContent = 'Поверхня землі — колір і матеріал (за бажанням, наприклад «Трава»).';
-    selectionPanelEl.appendChild(hint);
-    selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
-    selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
+    bodyEl.appendChild(hint);
+    bodyEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
+    bodyEl.appendChild(materialSwatchRow(applyMaterialToSelected));
     return;
   }
 
@@ -3039,12 +3308,12 @@ function renderSelectionPanel() {
     const info = document.createElement('p');
     info.className = 'dim-readout';
     info.textContent = `Довжина: ${formatMm(selected.lineLength)} мм`;
-    selectionPanelEl.appendChild(info);
+    bodyEl.appendChild(info);
 
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
     hint.textContent = 'Перетворити на реальний об’єкт:';
-    selectionPanelEl.appendChild(hint);
+    bodyEl.appendChild(hint);
 
     const convertRow = document.createElement('div');
     convertRow.className = 'panel-row';
@@ -3055,13 +3324,13 @@ function renderSelectionPanel() {
       b.addEventListener('click', () => convertSketchLine(selected, kind));
       convertRow.appendChild(b);
     }
-    selectionPanelEl.appendChild(convertRow);
+    bodyEl.appendChild(convertRow);
 
     const delBtn = document.createElement('button');
     delBtn.className = 'pbtn danger wide';
     delBtn.textContent = '🗑 Видалити лінію';
     delBtn.addEventListener('click', () => removeObject(selected));
-    selectionPanelEl.appendChild(delBtn);
+    bodyEl.appendChild(delBtn);
     return;
   }
 
@@ -3072,7 +3341,7 @@ function renderSelectionPanel() {
     const info = document.createElement('p');
     info.className = 'dim-readout';
     info.textContent = `Точок: ${pts.length}, довжина: ${formatMm(totalLen)} мм`;
-    selectionPanelEl.appendChild(info);
+    bodyEl.appendChild(info);
 
     const thickWrap = document.createElement('div');
     thickWrap.className = 'panel-row';
@@ -3087,12 +3356,12 @@ function renderSelectionPanel() {
     thickInput.addEventListener('change', () => setSpatialLineRadius(selected, Number(thickInput.value)));
     thickWrap.appendChild(thickInput);
     thickWrap.appendChild(thickLabel);
-    selectionPanelEl.appendChild(thickWrap);
+    bodyEl.appendChild(thickWrap);
 
     const hint = document.createElement('p');
     hint.className = 'dim-readout';
     hint.textContent = 'Перетворити на:';
-    selectionPanelEl.appendChild(hint);
+    bodyEl.appendChild(hint);
 
     const convertRow = document.createElement('div');
     convertRow.className = 'panel-row';
@@ -3103,12 +3372,12 @@ function renderSelectionPanel() {
       b.addEventListener('click', () => convertSpatialLine(selected, kind));
       convertRow.appendChild(b);
     }
-    selectionPanelEl.appendChild(convertRow);
+    bodyEl.appendChild(convertRow);
 
     const wireHint = document.createElement('p');
     wireHint.className = 'dim-readout';
     wireHint.textContent = '→ Провід — оберіть колір:';
-    selectionPanelEl.appendChild(wireHint);
+    bodyEl.appendChild(wireHint);
     const wireRow = document.createElement('div');
     wireRow.className = 'panel-row';
     for (const w of WIRE_COLORS) {
@@ -3119,13 +3388,15 @@ function renderSelectionPanel() {
       b.addEventListener('click', () => convertSpatialLine(selected, 'wire', w.color));
       wireRow.appendChild(b);
     }
-    selectionPanelEl.appendChild(wireRow);
+    bodyEl.appendChild(wireRow);
+
+    bodyEl.appendChild(buildSpatialLineAttachButton(selected));
 
     const delBtn2 = document.createElement('button');
     delBtn2.className = 'pbtn danger wide';
     delBtn2.textContent = '🗑 Видалити лінію';
     delBtn2.addEventListener('click', () => removeObject(selected));
-    selectionPanelEl.appendChild(delBtn2);
+    bodyEl.appendChild(delBtn2);
     return;
   }
 
@@ -3133,12 +3404,12 @@ function renderSelectionPanel() {
   // its own generic size/rotation controls would just fight that on the
   // next resize, so only offer them for objects outside any room.
   if (!selected.roomId) {
-    selectionPanelEl.appendChild(buildSizeSection(selected));
-    selectionPanelEl.appendChild(buildRotationSection(selected));
+    bodyEl.appendChild(buildSizeSection(selected));
+    bodyEl.appendChild(buildRotationSection(selected));
   }
 
-  selectionPanelEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
-  selectionPanelEl.appendChild(materialSwatchRow(applyMaterialToSelected));
+  bodyEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
+  bodyEl.appendChild(materialSwatchRow(applyMaterialToSelected));
 
   const actions = document.createElement('div');
   actions.className = 'panel-row';
@@ -3153,6 +3424,13 @@ function renderSelectionPanel() {
   orbitBtn.title = 'Обертати камеру навколо цього об’єкта';
   orbitBtn.addEventListener('click', () => enterOrbitMode(selected));
   actions.appendChild(orbitBtn);
+
+  // A pipe/rebar/wire converted from a "Просторова лінія" run keeps its
+  // own points — offer the same re-attach entry point as the raw draft
+  // (whose own panel branch already returned above and adds this itself).
+  if (selected.spatialLinePoints && selected.spatialLinePoints.length >= 2) {
+    actions.appendChild(buildSpatialLineAttachButton(selected));
+  }
 
   if (selected.kind === 'paper') {
     const drawBtn = document.createElement('button');
@@ -3193,7 +3471,7 @@ function renderSelectionPanel() {
     const threadLabel = document.createElement('p');
     threadLabel.className = 'dim-readout';
     threadLabel.textContent = 'Різьба на кінці:';
-    selectionPanelEl.appendChild(threadLabel);
+    bodyEl.appendChild(threadLabel);
 
     let threadAtStart = true, threadPitch = 2, threadLen = 20;
 
@@ -3203,7 +3481,7 @@ function renderSelectionPanel() {
     startEndBtn.addEventListener('click', () => { threadAtStart = true; startEndBtn.classList.add('on'); endEndBtn.classList.remove('on'); });
     endEndBtn.addEventListener('click', () => { threadAtStart = false; endEndBtn.classList.add('on'); startEndBtn.classList.remove('on'); });
     endRow.append(startEndBtn, endEndBtn);
-    selectionPanelEl.appendChild(endRow);
+    bodyEl.appendChild(endRow);
 
     function stepperRow(labelText, get, set, step, min) {
       const row = document.createElement('div'); row.className = 'dim-row';
@@ -3218,8 +3496,8 @@ function renderSelectionPanel() {
       row.append(label, minus, val, plus);
       return row;
     }
-    selectionPanelEl.appendChild(stepperRow('Крок різьби', () => threadPitch, (v) => { threadPitch = v; }, 0.5, 0.5));
-    selectionPanelEl.appendChild(stepperRow('Довжина різьби', () => threadLen, (v) => { threadLen = v; }, 5, 5));
+    bodyEl.appendChild(stepperRow('Крок різьби', () => threadPitch, (v) => { threadPitch = v; }, 0.5, 0.5));
+    bodyEl.appendChild(stepperRow('Довжина різьби', () => threadLen, (v) => { threadLen = v; }, 5, 5));
 
     const addThreadBtn = document.createElement('button');
     addThreadBtn.className = 'pbtn wide';
@@ -3228,7 +3506,7 @@ function renderSelectionPanel() {
       addThreadToObject(selected, threadAtStart, threadPitch, threadLen);
       toast('Різьбу додано');
     });
-    selectionPanelEl.appendChild(addThreadBtn);
+    bodyEl.appendChild(addThreadBtn);
   }
 
   if (canExplode(selected)) {
@@ -3244,7 +3522,7 @@ function renderSelectionPanel() {
   delBtn.addEventListener('click', () => removeObject(selected));
   actions.appendChild(delBtn);
 
-  selectionPanelEl.appendChild(actions);
+  bodyEl.appendChild(actions);
 }
 
 function enterMoveMode() {
@@ -3781,24 +4059,13 @@ canvas.addEventListener('pointerdown', (e) => {
         const rec = findRecordByMesh(hits[0].object);
         if (rec) beginTileAreaDrag(rec, hits[0].point);
       }
-    } else if (mode === 'edit' && spatialLineActive && spatialLineGizmo) {
+    } else if (mode === 'edit' && slTool.active && slTool.gizmo) {
       scene.updateMatrixWorld(true);
-      // Checked in this order, all by screen-space distance (see each
-      // function's own comment for why not a 3D raycast): the centre move
-      // handle first (a small dedicated zone right at the gizmo's origin —
-      // where every arrow's own segment also starts, so it has to win ties
-      // there on purpose), then the arrows, then the ring by a plain
-      // raycast (a single, unambiguous target once an arrow can no longer
-      // wrongly intercept it first).
-      const nearCenter = isNearSpatialLineGizmoCenter(e.clientX, e.clientY);
-      const arrowAxis = nearCenter ? null : pickSpatialLineArrow(e.clientX, e.clientY);
-      const ringHitEntry = (nearCenter || arrowAxis) ? null : rayFromClient(e.clientX, e.clientY).intersectObjects(spatialLineGizmoTargets, false).find((h) => h.object.userData.slRing);
-      if (nearCenter) {
-        beginSpatialLineMoveDrag();
-      } else if (arrowAxis) {
-        beginSpatialLineDrag(arrowAxis, e.clientX, e.clientY);
-      } else if (ringHitEntry) {
-        beginSpatialLineRingDrag(e.clientX, e.clientY);
+      // slPickHandle checks centre/arrows/ring in that priority order — see
+      // its own comment for why (screen-space distance, not a 3D raycast).
+      const handle = slPickHandle(e.clientX, e.clientY);
+      if (handle) {
+        beginSlDrag(handle, e.clientX, e.clientY);
       } else {
         // Missed every handle — free look, exactly like anywhere else a
         // tap lands on nothing interactive, instead of silently doing
@@ -3816,7 +4083,7 @@ canvas.addEventListener('pointerdown', (e) => {
     } else if (!moveMode && !paperDrawing) {
       startLookDrag(e.pointerId, e.clientX, e.clientY);
     }
-  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !spatialLineMoveDrag && !sculptDragging) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging) {
     pinchStartDist = currentPinchDist();
     if (mode === 'walk') {
       // Walking never "zooms toward" anything the way flying does — pinch
@@ -3850,7 +4117,7 @@ canvas.addEventListener('pointermove', (e) => {
     updateRotateDrag(e.clientX, e.clientY);
     return;
   }
-  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !spatialLineDrag && !spatialLineRingDrag && !spatialLineMoveDrag && !sculptDragging) {
+  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging) {
     const dist = currentPinchDist();
     if (mode === 'walk') {
       // Pure optical zoom (FOV) from the pinch distance — completely
@@ -3948,16 +4215,8 @@ canvas.addEventListener('pointermove', (e) => {
     if (hits.length) updateTileAreaDrag(hits[0].point);
     return;
   }
-  if (mode === 'edit' && spatialLineDrag && e.pointerId === primaryPointerId) {
-    updateSpatialLineDrag(e.clientX, e.clientY);
-    return;
-  }
-  if (mode === 'edit' && spatialLineRingDrag && e.pointerId === primaryPointerId) {
-    updateSpatialLineRingDrag(e.clientX, e.clientY);
-    return;
-  }
-  if (mode === 'edit' && spatialLineMoveDrag && e.pointerId === primaryPointerId) {
-    updateSpatialLineMoveDrag(e.clientX, e.clientY);
+  if (mode === 'edit' && slTool.drag && e.pointerId === primaryPointerId) {
+    updateSlDrag(e.clientX, e.clientY);
     return;
   }
   if (mode === 'edit' && sculptDragging && sculptTarget && e.pointerId === primaryPointerId) {
@@ -3988,12 +4247,13 @@ function endPointer(e) {
     if (mode === 'edit' && moveMode) moveDragging = false;
     if (mode === 'edit' && paperDrawing) { paperDrawDragging = false; drawStartWorld = null; clearPreviewLine(); }
     if (mode === 'edit' && tileToolActive) { tileDrag = null; clearTileAreaPreview(); renderTilePill(); }
-    if (mode === 'edit' && spatialLineActive) {
-      spatialLineDrag = null; spatialLineRingDrag = null;
-      if (spatialLineMoveDrag) { spatialLineGizmo?.position.copy(spatialLineMoveDrag.basePoint); spatialLineMoveDrag = null; }
-      hideSpatialLineLengthLabel();
-      updateSpatialLinePreview();
-      if (spatialLineGizmo) renderSpatialLinePill();
+    if (mode === 'edit' && slTool.active) {
+      if (slTool.drag && slTool.drag.kind === 'center' && slTool.gizmo) slTool.gizmo.group.position.copy(slTool.drag.basePoint);
+      slTool.drag = null;
+      hideSlLengthLabel();
+      hideSlAngleLabel();
+      updateSlPreview();
+      if (slTool.gizmo) renderSpatialLinePill();
     }
     if (mode === 'edit' && sculptActive) sculptDragging = false;
     return;
@@ -4030,11 +4290,9 @@ function endPointer(e) {
     }
     return;
   }
-  if (mode === 'edit' && spatialLineActive) {
-    if (spatialLineDrag && e.pointerId === primaryPointerId) { endSpatialLineDrag(); return; }
-    if (spatialLineRingDrag && e.pointerId === primaryPointerId) { spatialLineRingDrag = null; return; }
-    if (spatialLineMoveDrag && e.pointerId === primaryPointerId) { endSpatialLineMoveDrag(); return; }
-    if (!spatialLineGizmo && e.pointerId === primaryPointerId) {
+  if (mode === 'edit' && slTool.active) {
+    if (slTool.drag && e.pointerId === primaryPointerId) { endSlDrag(e.clientX, e.clientY); return; }
+    if (!slTool.gizmo && e.pointerId === primaryPointerId) {
       // No first point yet — pointerdown started a look-drag instead of
       // placing one right away (so a single finger can still freely look
       // around before committing to a point), so this only places it if
@@ -4043,6 +4301,18 @@ function endPointer(e) {
       const dt = performance.now() - downTime;
       if (dx * dx + dy * dy <= 49 && dt <= 600 && e.target === canvas) {
         placeFirstSpatialLinePoint(e.clientX, e.clientY);
+      }
+      return;
+    }
+    if (slTool.gizmo && e.pointerId === primaryPointerId) {
+      // Gizmo already exists and none of its handles caught this pointer
+      // (pointerdown fell through to a look-drag instead) — a genuine tap
+      // here, away from the gizmo, continues the chain: see
+      // slHandleTapRelease for single-vs-double-tap.
+      const dx = e.clientX - downX, dy = e.clientY - downY;
+      const dt = performance.now() - downTime;
+      if (dx * dx + dy * dy <= 49 && dt <= 600 && e.target === canvas) {
+        slHandleTapRelease(e.clientX, e.clientY);
       }
     }
     return;
@@ -4073,6 +4343,8 @@ function handleEditTap(x, y) {
   // A mesh's matrixWorld only refreshes on render; force it here so a tap
   // arriving in the same tick as an object add/move never raycasts stale.
   scene.updateMatrixWorld(true);
+
+  if (slTool.attach.picking) { trySpatialLineAttachTap(x, y); return; }
 
   if (placingKind) {
     const ray = rayFromClient(x, y);
@@ -4169,12 +4441,12 @@ wireZoomButton(document.getElementById('zoomOutBtn'), -1); // dolly backward —
 // scrollable bottom toolbar) — one tap starts it, tap again to cancel.
 const spatialLineFabBtn = document.getElementById('spatialLineFab');
 spatialLineFabBtn.addEventListener('click', () => {
-  if (spatialLineActive) {
+  if (slTool.active) {
     cancelSpatialLine();
     spatialLineFabBtn.classList.remove('on');
     return;
   }
-  spatialLineActive = true;
+  slTool.active = true;
   deselect();
   spatialLineFabBtn.classList.add('on');
   renderSpatialLinePill();
@@ -4193,7 +4465,7 @@ function enterWalkMode() {
   hideEl(resetViewBtn);
   showEl(crosshairEl);
   showEl(walkExitBtn);
-  hideEl(spatialLineFabBtn); // edit-only tool — walk mode's pointerdown/move never check spatialLineActive
+  hideEl(spatialLineFabBtn); // edit-only tool — walk mode's pointerdown/move never check slTool.active
   // Fresh start every session — nothing carries over from a previous walk
   // (or from edit mode's own unrelated state) that could otherwise show up
   // as a stray drift/jerk the moment this one begins.
@@ -5205,7 +5477,7 @@ function animate() {
       if (autoRotateActive) yaw += AUTO_ROTATE_SPEED * dt; // position stays put, only the view turns
       updateFreeCamera(dt, refDist);
     }
-    updateSpatialLineGizmoScale();
+    updateSlGizmoScale();
     updateAxisLabels();
     updateHoleLabels();
     updateTileCutLabels();
@@ -5238,6 +5510,10 @@ window.__creslarnet3d = {
   handleEditTap,
   get tileArea() { return tileArea; },
   commitTileArea, cancelTileArea,
+  // "Просторова лінія" internals — same introspection purpose as the rest
+  // of this hook, read-only. slTool itself is exposed directly (not spread
+  // into individual getters) since it's already the single source of truth.
+  slTool,
   // fly the camera to look at a world point from a fixed relative offset —
   // handy for debugging/testing since there's no orbit pivot to aim any more
   lookAt(pos, distance = 3000) {
