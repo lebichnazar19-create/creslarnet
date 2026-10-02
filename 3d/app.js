@@ -55,7 +55,7 @@ const KIND_LABELS = {
   rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт', ground: 'Земля',
   compound: 'Складений об’єкт', roomFloor: 'Підлога кімнати', roomCeiling: 'Стеля кімнати',
   tile: 'Плитка', tileGrout: 'Шов (фуга)', spatialLine: 'Жила', wire: 'Провід',
-  stairs: 'Сходи', wheel: 'Колесо', belt: 'Пас', chain: 'Ланцюг',
+  stairs: 'Сходи', wheel: 'Колесо', belt: 'Пас', chain: 'Ланцюг', clay: 'Глина',
 };
 
 // Standard-ish electrical wire colours — brown/blue/green-yellow (EU phase/
@@ -2444,7 +2444,8 @@ function select(record) {
     outlineHelper = new THREE.LineSegments(roundOutline, new THREE.LineBasicMaterial({ color: 0x8338ec }));
     outlineHelper.update = () => {};
     record.root.add(outlineHelper);
-  } else if (record.root.isMesh) {
+  } else if (record.root.isMesh && record.kind !== 'clay') {
+    // (clay: tens of thousands of grid points — a plain box below, not an edge search through all of them)
     // Hugs the object's own silhouette (sharp for a cube/wall/beam) —
     // geometry edges beyond a small angle threshold, added as a child so it
     // tracks transform for free.
@@ -3593,7 +3594,7 @@ const VERTEX_PICK_TIGHT_PX = 10; // ...when a move/rotate arrow is under the sam
 const VERTEX_MIN_SCREEN_PX = 90; // an object smaller than this on screen hides its dots — too crowded to pick, and they'd bury the arrows
 const VERTEX_FALLOFF = 0.35;    // influence radius as a fraction of the object's own diagonal (a cube's nearest other corner is 0.58 away — untouched)
 const POINT_UNDO_MAX = 8;
-const NO_VERTEX_EDIT_KINDS = new Set(['ground', 'paper', 'sketchLine', 'tile', 'tileGrout', 'belt', 'chain']);
+const NO_VERTEX_EDIT_KINDS = new Set(['ground', 'paper', 'sketchLine', 'tile', 'tileGrout', 'belt', 'chain', 'clay']);
 let vertexHandles = null; // { record, points, handles: [Vector3 local], radius }
 let vertexDrag = null;    // { index, plane, startLocal, before, weights, handleStart, handleWeights, moved }
 
@@ -3852,7 +3853,7 @@ function finishGeometryEdit(record, recomputeNormals) {
 
 // ----- own points on the surface + "Вирізати" -----
 const CONTOUR_CIRCLE_POINTS = 24;
-const NO_CONTOUR_KINDS = new Set(['ground', 'paper', 'sketchLine', 'belt', 'chain']);
+const NO_CONTOUR_KINDS = new Set(['ground', 'paper', 'sketchLine', 'belt', 'chain', 'clay']);
 let contour = null; // { record, points: [{ local, normal }], circleArmed, choosing, dots, loop }
 let contourCircleRadius = 100; // mm
 
@@ -4570,6 +4571,672 @@ function linkPickTap(clientX, clientY) {
 }
 
 // ---------------------------------------------------------------------------
+// "Глина" — a mass you stick onto a surface (a wall, a floor, another
+// object) and then work with tools:
+//   Ліпити      — drag over the surface: mass builds up under the finger;
+//   Притиснути  — pressing flattens it: it gets lower and spreads wider
+//                 (the mass pushed down goes out to the sides, none is lost);
+//   Різати      — two points: the mass is cut off along the line through
+//                 them (the smaller part falls away); "Ламана" lets the cut
+//                 follow a polyline of several points instead;
+//   Ніж         — a triangular knife of a set size: drag, a V-groove stays;
+//   Шпатель     — a notched trowel of a set size: drag, parallel grooves stay.
+//
+// A lump of clay is a heightfield: a square grid lying in the surface's own
+// plane (local XY, +Z out of the surface), each grid point holding how
+// thick the clay is there. That is what makes every tool above a simple,
+// exact operation on numbers — and why a grid point with no clay costs
+// nothing to draw: only cells that actually hold clay get triangles.
+// ---------------------------------------------------------------------------
+const CLAY_CELLS = 256;                 // cells per side
+const CLAY_CELL_MM = 2.5;               // → a 640 × 640 mm patch; a 10 mm groove is 4 cells wide
+const CLAY_N = CLAY_CELLS + 1;          // grid points per side
+const CLAY_HALF = (CLAY_CELLS * CLAY_CELL_MM) / 2;
+const CLAY_EPS = 0.05;                  // thinner than this counts as bare surface
+const CLAY_FILM_MM = 0.6;               // what a trowel leaves between its ridges
+const CLAY_TROWEL_RIDGES = 6;
+const CLAY_COLOR = '#b8693d';
+const CLAY_UNDO_MAX = 6;
+const CLAY_TOOLS = [
+  { key: 'look', label: '👁 Огляд', hint: 'Огляд: палець крутить камеру, глина не змінюється' },
+  { key: 'add', label: '🟤 Ліпити', hint: 'Ведіть пальцем по поверхні — наліплюється маса' },
+  { key: 'press', label: '✋ Притиснути', hint: 'Натискайте або ведіть по глині — вона розплющується' },
+  { key: 'cut', label: '✂ Різати', hint: '' },
+  { key: 'knife', label: '🔺 Ніж', hint: 'Ведіть по глині — трикутний ніж лишає рівчик' },
+  { key: 'trowel', label: '▥ Шпатель', hint: 'Ведіть по глині — зубчастий шпатель лишає рівчики' },
+];
+const clayTool = {
+  active: false,
+  tool: 'add',
+  blobSize: 80,      // mm — diameter of the "Ліпити"/"Притиснути" touch
+  toolSize: 10,      // mm — knife width / trowel tooth size
+  polyline: false,   // "Різати": several points instead of two
+  stroke: null,      // { patch, h0, last, zRef } while a finger is working the clay
+  cut: null,         // { patch, points: [{x,y}], line, dots } while placing cut points
+  undo: [],          // [{ patch, h }] — heights before each stroke/cut
+};
+
+const clayGridX = (i) => (i - CLAY_CELLS / 2) * CLAY_CELL_MM;
+const clayGridI = (x) => x / CLAY_CELL_MM + CLAY_CELLS / 2;
+
+// Bilinear thickness at local (x, y) mm in a height grid; 0 outside the patch.
+function clayHeightIn(h, x, y) {
+  const fi = clayGridI(x), fj = clayGridI(y);
+  if (fi < 0 || fj < 0 || fi > CLAY_CELLS || fj > CLAY_CELLS) return 0;
+  const i = Math.min(CLAY_CELLS - 1, Math.floor(fi)), j = Math.min(CLAY_CELLS - 1, Math.floor(fj));
+  const tx = fi - i, ty = fj - j, a = j * CLAY_N + i;
+  return (h[a] * (1 - tx) + h[a + 1] * tx) * (1 - ty) + (h[a + CLAY_N] * (1 - tx) + h[a + CLAY_N + 1] * tx) * ty;
+}
+function clayHeightAt(clay, x, y) { return clayHeightIn(clay.h, x, y); }
+
+const _clayInv = new THREE.Matrix4();
+// A ray against the clay's SURFACE, by stepping along the ray over the
+// heightfield — not three's default "test every triangle", which for a
+// well-covered patch is ~130 000 triangles on every look-distance probe,
+// i.e. every single frame. Only where there's actually clay: a ray through
+// a bare part of the patch carries on to the wall behind it.
+function clayRaycast(mesh, raycaster, intersects) {
+  const clay = mesh.userData.clay;
+  if (!clay || clay.maxH <= CLAY_EPS) return;
+  const bb = mesh.geometry.boundingBox;
+  _clayInv.copy(mesh.matrixWorld).invert();
+  const o = raycaster.ray.origin.clone().applyMatrix4(_clayInv);
+  const d = raycaster.ray.origin.clone().add(raycaster.ray.direction).applyMatrix4(_clayInv).sub(o); // local travel per world unit — so t stays a world distance
+  let t0 = Math.max(0, raycaster.near), t1 = raycaster.far;
+  for (const [k, lo, hi] of [['x', bb.min.x, bb.max.x], ['y', bb.min.y, bb.max.y], ['z', 0, clay.maxH]]) {
+    if (Math.abs(d[k]) < 1e-9) { if (o[k] < lo || o[k] > hi) return; continue; }
+    const ta = (lo - o[k]) / d[k], tb = (hi - o[k]) / d[k];
+    t0 = Math.max(t0, Math.min(ta, tb));
+    t1 = Math.min(t1, Math.max(ta, tb));
+  }
+  if (!(t1 >= t0)) return;
+  const steps = Math.min(900, Math.max(1, Math.ceil(((t1 - t0) * Math.hypot(d.x, d.y)) / (CLAY_CELL_MM * 0.75))));
+  let prevT = t0, prevGap = null, hitT = null;
+  for (let s = 0; s <= steps; s++) {
+    const t = t0 + ((t1 - t0) * s) / steps;
+    const x = o.x + d.x * t, y = o.y + d.y * t;
+    const hh = clayHeightAt(clay, x, y);
+    const gap = o.z + d.z * t - hh; // > 0: the ray is still above the clay here
+    if (gap <= 1e-6 && hh > CLAY_EPS) {
+      hitT = prevGap !== null && prevGap > 0 ? prevT + (t - prevT) * (prevGap / (prevGap - gap)) : t;
+      break;
+    }
+    prevT = t; prevGap = gap;
+  }
+  if (hitT === null) return;
+  const local = new THREE.Vector3(o.x + d.x * hitT, o.y + d.y * hitT, 0);
+  local.z = clayHeightAt(clay, local.x, local.y);
+  const e = CLAY_CELL_MM;
+  const normal = new THREE.Vector3(
+    -(clayHeightAt(clay, local.x + e, local.y) - clayHeightAt(clay, local.x - e, local.y)) / (2 * e),
+    -(clayHeightAt(clay, local.x, local.y + e) - clayHeightAt(clay, local.x, local.y - e)) / (2 * e),
+    1,
+  ).normalize();
+  const point = local.applyMatrix4(mesh.matrixWorld);
+  const distance = raycaster.ray.origin.distanceTo(point);
+  if (distance < raycaster.near || distance > raycaster.far) return;
+  intersects.push({ distance, point, object: mesh, face: { normal }, faceIndex: 0 });
+}
+
+function buildClayMesh(heights, material) {
+  const N = CLAY_N;
+  const pos = new Float32Array(N * N * 3), nor = new Float32Array(N * N * 3), uv = new Float32Array(N * N * 2);
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const idx = j * N + i;
+      pos[idx * 3] = clayGridX(i); pos[idx * 3 + 1] = clayGridX(j);
+      nor[idx * 3 + 2] = 1;
+      uv[idx * 2] = clayGridX(i) / 400; uv[idx * 2 + 1] = clayGridX(j) / 400;
+    }
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geom.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  geom.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  // One index buffer at full capacity for the patch's whole life (only its
+  // first `drawRange.count` entries are live) — swapping in a new buffer on
+  // every change would leave the old one behind on the GPU each time.
+  geom.setIndex(new THREE.BufferAttribute(new Uint32Array(CLAY_CELLS * CLAY_CELLS * 6), 1));
+  geom.setDrawRange(0, 0);
+  geom.boundingBox = new THREE.Box3();
+  geom.boundingSphere = new THREE.Sphere();
+  // Bounds are kept by refreshClayShape (the box of where clay actually is,
+  // not of the whole mostly-empty grid) — three's own recompute would undo that.
+  geom.computeBoundingBox = () => {};
+  geom.computeBoundingSphere = () => {};
+  const mesh = new THREE.Mesh(geom, material);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.userData.clay = { h: heights, maxH: 0 };
+  mesh.raycast = (raycaster, intersects) => clayRaycast(mesh, raycaster, intersects);
+  return mesh;
+}
+
+// Pushes the grid rows/columns [i0..i1] × [j0..j1] of the height array into
+// the mesh (positions + normals), then re-lists which cells get triangles.
+function refreshClayShape(record, i0 = 0, j0 = 0, i1 = CLAY_N - 1, j1 = CLAY_N - 1) {
+  const N = CLAY_N, clay = record.clay, h = clay.h, geom = record.root.geometry;
+  const pos = geom.attributes.position, nor = geom.attributes.normal;
+  i0 = Math.max(0, Math.floor(i0) - 1); j0 = Math.max(0, Math.floor(j0) - 1);
+  i1 = Math.min(N - 1, Math.ceil(i1) + 1); j1 = Math.min(N - 1, Math.ceil(j1) + 1);
+  if (i1 >= i0 && j1 >= j0) {
+    const pa = pos.array, na = nor.array, inv = 1 / (2 * CLAY_CELL_MM);
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        const idx = j * N + i, k = idx * 3;
+        pa[k + 2] = h[idx];
+        const nx = -(h[idx + (i < N - 1 ? 1 : 0)] - h[idx - (i > 0 ? 1 : 0)]) * inv;
+        const ny = -(h[idx + (j < N - 1 ? N : 0)] - h[idx - (j > 0 ? N : 0)]) * inv;
+        const len = Math.hypot(nx, ny, 1);
+        na[k] = nx / len; na[k + 1] = ny / len; na[k + 2] = 1 / len;
+      }
+    }
+    for (const a of [pos, nor]) {
+      if (a.addUpdateRange) a.addUpdateRange(j0 * N * 3, (j1 - j0 + 1) * N * 3); // upload just the touched rows
+      a.needsUpdate = true;
+    }
+  }
+  const ia = geom.index.array;
+  let n = 0, maxH = 0, bi0 = N, bj0 = N, bi1 = -1, bj1 = -1;
+  for (let j = 0; j < CLAY_CELLS; j++) {
+    for (let i = 0; i < CLAY_CELLS; i++) {
+      const a = j * N + i;
+      const m = Math.max(h[a], h[a + 1], h[a + N], h[a + N + 1]);
+      if (m <= CLAY_EPS) continue;
+      ia[n++] = a; ia[n++] = a + 1; ia[n++] = a + N + 1;
+      ia[n++] = a; ia[n++] = a + N + 1; ia[n++] = a + N;
+      if (m > maxH) maxH = m;
+      if (i < bi0) bi0 = i;
+      if (j < bj0) bj0 = j;
+      if (i + 1 > bi1) bi1 = i + 1;
+      if (j + 1 > bj1) bj1 = j + 1;
+    }
+  }
+  geom.setDrawRange(0, n);
+  if (geom.index.addUpdateRange) geom.index.addUpdateRange(0, n);
+  geom.index.needsUpdate = true;
+  clay.maxH = maxH;
+  if (bi1 < 0) geom.boundingBox.min.set(0, 0, 0), geom.boundingBox.max.set(0, 0, 0);
+  else geom.boundingBox.min.set(clayGridX(bi0), clayGridX(bj0), 0), geom.boundingBox.max.set(clayGridX(bi1), clayGridX(bj1), maxH);
+  geom.boundingBox.getBoundingSphere(geom.boundingSphere);
+}
+
+// A fresh, empty patch lying on a surface: centred where it was touched,
+// facing out along the surface normal, its local X kept horizontal.
+function createClayPatch(point, normal) {
+  const mesh = buildClayMesh(new Float32Array(CLAY_N * CLAY_N), createPaintMaterial(CLAY_COLOR));
+  const z = normal.clone().normalize();
+  const x = Math.abs(z.y) > 0.95 ? new THREE.Vector3(1, 0, 0).addScaledVector(z, -z.x).normalize() : new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), z).normalize();
+  const y = new THREE.Vector3().crossVectors(z, x);
+  mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+  mesh.position.copy(point).addScaledVector(z, 0.2); // a hair off the surface — never fighting it for the same depth
+  const record = registerObject('clay', mesh, { clay: mesh.userData.clay });
+  mesh.updateMatrixWorld(true);
+  return record;
+}
+
+// The existing patch whose footprint (and plane) a world point lies in, if any.
+function clayPatchAtWorld(point) {
+  for (const rec of objects) {
+    if (rec.kind !== 'clay') continue;
+    const p = rec.root.worldToLocal(point.clone());
+    if (Math.abs(p.x) <= CLAY_HALF && Math.abs(p.y) <= CLAY_HALF && p.z > -4 && p.z < rec.clay.maxH + 30) return rec;
+  }
+  return null;
+}
+
+// ----- the tools, as operations on the height grid (all sizes in mm, all
+// positions in the patch's own local XY). Each returns the grid rectangle
+// it touched: [i0, j0, i1, j1]. -----
+function clayRect(x0, y0, x1, y1, pad) {
+  return [
+    Math.max(0, Math.floor(clayGridI(Math.min(x0, x1) - pad))), Math.max(0, Math.floor(clayGridI(Math.min(y0, y1) - pad))),
+    Math.min(CLAY_N - 1, Math.ceil(clayGridI(Math.max(x0, x1) + pad))), Math.min(CLAY_N - 1, Math.ceil(clayGridI(Math.max(y0, y1) + pad))),
+  ];
+}
+
+// Stick a lump on: a smooth dome of the given radius and peak height.
+function clayAddLump(clay, x, y, radius, amount) {
+  const r = clayRect(x, y, x, y, radius), h = clay.h;
+  for (let j = r[1]; j <= r[3]; j++) {
+    for (let i = r[0]; i <= r[2]; i++) {
+      const q = ((clayGridX(i) - x) ** 2 + (clayGridX(j) - y) ** 2) / (radius * radius);
+      if (q >= 1) continue;
+      h[j * CLAY_N + i] += amount * (1 - q) * (1 - q);
+    }
+  }
+  return r;
+}
+
+// Press: under the touch the clay gets lower; exactly what was pushed down
+// is spread over a ring around the touch, so the lump ends up flatter AND
+// wider, with the same amount of clay in it.
+function clayPress(clay, x, y, radius, strength) {
+  const outer = radius * 1.7, r = clayRect(x, y, x, y, outer), h = clay.h;
+  let removed = 0, ringWeight = 0;
+  for (let j = r[1]; j <= r[3]; j++) {
+    for (let i = r[0]; i <= r[2]; i++) {
+      const dist = Math.hypot(clayGridX(i) - x, clayGridX(j) - y), idx = j * CLAY_N + i;
+      if (dist < radius) {
+        const q = (dist / radius) * (dist / radius);
+        const dh = h[idx] * strength * (1 - q) * (1 - q);
+        h[idx] -= dh;
+        removed += dh;
+      } else if (dist < outer) {
+        ringWeight += 1 - (dist - radius) / (outer - radius);
+      }
+    }
+  }
+  if (removed <= 0 || ringWeight <= 0) return r;
+  const per = removed / ringWeight;
+  for (let j = r[1]; j <= r[3]; j++) {
+    for (let i = r[0]; i <= r[2]; i++) {
+      const dist = Math.hypot(clayGridX(i) - x, clayGridX(j) - y);
+      if (dist >= radius && dist < outer) h[j * CLAY_N + i] += per * (1 - (dist - radius) / (outer - radius));
+    }
+  }
+  return r;
+}
+
+// Triangular knife dragged from a to b: a V-groove `size` wide and as deep
+// as an equilateral tooth. Depth is taken from the surface as it was when
+// the stroke began (h0), so the overlapping pieces of one stroke don't dig
+// the same spot deeper and deeper.
+function clayKnife(clay, h0, ax, ay, bx, by, size) {
+  const half = size / 2, depth = size * 0.866, r = clayRect(ax, ay, bx, by, half), h = clay.h;
+  const dx = bx - ax, dy = by - ay, lenSq = dx * dx + dy * dy;
+  for (let j = r[1]; j <= r[3]; j++) {
+    for (let i = r[0]; i <= r[2]; i++) {
+      const px = clayGridX(i), py = clayGridX(j);
+      const t = lenSq > 1e-9 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq)) : 0;
+      const dist = Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+      if (dist >= half) continue;
+      const idx = j * CLAY_N + i, limit = Math.max(0, h0[idx] - depth * (1 - dist / half));
+      if (limit < h[idx]) h[idx] = limit;
+    }
+  }
+  return r;
+}
+
+// Notched trowel dragged from a to b, held square to the direction of
+// travel: under each notch a ridge `size` wide and at most `size` tall
+// stays; between the notches the blade scrapes down to a thin film.
+function clayTrowel(clay, ax, ay, bx, by, size) {
+  const half = (size * (CLAY_TROWEL_RIDGES * 2 - 1)) / 2, h = clay.h;
+  const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy);
+  if (len < 1e-6) return null; // no direction yet — nothing to scrape along
+  const ux = dx / len, uy = dy / len, r = clayRect(ax, ay, bx, by, half);
+  for (let j = r[1]; j <= r[3]; j++) {
+    for (let i = r[0]; i <= r[2]; i++) {
+      const px = clayGridX(i) - ax, py = clayGridX(j) - ay;
+      const along = px * ux + py * uy;
+      if (along < 0 || along > len) continue;
+      const across = ux * py - uy * px;
+      if (Math.abs(across) > half) continue;
+      const limit = Math.floor((across + half) / size) % 2 === 0 ? size : CLAY_FILM_MM;
+      const idx = j * CLAY_N + i;
+      if (h[idx] > limit) h[idx] = limit;
+    }
+  }
+  return r;
+}
+
+// Which side of the cut line a point is on (+1 / −1). The line is the
+// polyline through `pts`, carried on straight to infinity past both ends.
+function claySideOfLine(pts, px, py) {
+  let best = Infinity, side = 1;
+  for (let k = 0; k < pts.length - 1; k++) {
+    const a = pts[k], b = pts[k + 1], dx = b.x - a.x, dy = b.y - a.y, lenSq = dx * dx + dy * dy;
+    if (lenSq < 1e-9) continue;
+    let t = ((px - a.x) * dx + (py - a.y) * dy) / lenSq;
+    if (k > 0) t = Math.max(0, t);
+    if (k < pts.length - 2) t = Math.min(1, t);
+    const dist = Math.hypot(px - (a.x + dx * t), py - (a.y + dy * t));
+    if (dist < best) { best = dist; side = dx * (py - a.y) - dy * (px - a.x) >= 0 ? 1 : -1; }
+  }
+  return side;
+}
+
+// Cut along the line: whichever side holds LESS clay is the offcut and
+// falls away. Returns the volume removed (mm³), 0 if the line misses the
+// clay altogether.
+function clayCutAlong(clay, pts) {
+  const h = clay.h, sides = new Int8Array(h.length);
+  let volPlus = 0, volMinus = 0;
+  for (let j = 0; j < CLAY_N; j++) {
+    for (let i = 0; i < CLAY_N; i++) {
+      const idx = j * CLAY_N + i;
+      if (h[idx] <= CLAY_EPS) continue;
+      const s = claySideOfLine(pts, clayGridX(i), clayGridX(j));
+      sides[idx] = s;
+      if (s > 0) volPlus += h[idx]; else volMinus += h[idx];
+    }
+  }
+  const drop = volPlus <= volMinus ? 1 : -1, removed = Math.min(volPlus, volMinus);
+  if (removed <= 0) return 0;
+  for (let idx = 0; idx < h.length; idx++) if (sides[idx] === drop) h[idx] = 0;
+  return removed * CLAY_CELL_MM * CLAY_CELL_MM;
+}
+
+// ----- working the clay with a finger -----
+function pushClayUndo(patch) {
+  clayTool.undo.push({ patch, h: Float32Array.from(patch.clay.h) });
+  while (clayTool.undo.length > CLAY_UNDO_MAX) clayTool.undo.shift();
+  return clayTool.undo[clayTool.undo.length - 1].h;
+}
+
+function clayUndo() {
+  const entry = clayTool.undo.pop();
+  if (!entry) return;
+  if (objects.includes(entry.patch)) {
+    entry.patch.clay.h.set(entry.h);
+    refreshClayShape(entry.patch);
+  }
+  renderClayPill();
+}
+
+// Where the finger's ray meets the patch, in the patch's own XY (mm) — on
+// the plane at the clay's thickness under the finger rather than at the
+// bare surface, so on a thick lump the tool works where the finger visibly
+// is, not somewhere behind it. "Thickness" here is the surface as it was
+// when the stroke began (h0), not as the stroke is reshaping it: measured
+// against the live surface, a knife sinking into its own groove (or a lump
+// growing under the finger) would keep shifting the very point being
+// worked, and the line would creep sideways.
+function clayPointerXY(stroke, clientX, clientY) {
+  const ray = rayFromClient(clientX, clientY).ray, root = stroke.patch.root;
+  _clayInv.copy(root.matrixWorld).invert();
+  const o = ray.origin.clone().applyMatrix4(_clayInv);
+  const d = ray.origin.clone().add(ray.direction).applyMatrix4(_clayInv).sub(o);
+  if (Math.abs(d.z) < 1e-9) return null;
+  const t = (stroke.zRef - o.z) / d.z;
+  if (t <= 0) return null;
+  const x = o.x + d.x * t, y = o.y + d.y * t;
+  stroke.zRef = clayHeightIn(stroke.h0, x, y);
+  return { x, y };
+}
+
+// A finger going down in clay mode. true = it's working clay now; false =
+// nothing to work on there (the caller falls back to an ordinary look-drag).
+function beginClayStroke(clientX, clientY) {
+  scene.updateMatrixWorld(true);
+  const hits = rayFromClient(clientX, clientY).intersectObjects(raycastTargets, false);
+  if (!hits.length) return false;
+  const hit = hits[0], hitRec = findRecordByMesh(hit.object);
+  let patch = hitRec && hitRec.kind === 'clay' ? hitRec : null;
+  if (!patch) {
+    if (clayTool.tool !== 'add' || !hit.face) return false; // every other tool works clay that's already there
+    patch = clayPatchAtWorld(hit.point)
+      || createClayPatch(hit.point, hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize());
+  }
+  const local = patch.root.worldToLocal(hit.point.clone());
+  clayTool.stroke = { patch, h0: pushClayUndo(patch), last: null, zRef: Math.max(0, local.z) };
+  updateClayStroke(clientX, clientY);
+  renderClayPill();
+  return true;
+}
+
+function updateClayStroke(clientX, clientY) {
+  const s = clayTool.stroke, clay = s.patch.clay;
+  const p = clayPointerXY(s, clientX, clientY);
+  if (!p) return;
+  const first = !s.last, a = s.last || p;
+  let rect = null;
+  const grow = (r) => { if (r) rect = rect ? [Math.min(rect[0], r[0]), Math.min(rect[1], r[1]), Math.max(rect[2], r[2]), Math.max(rect[3], r[3])] : r; };
+  const radius = clayTool.blobSize / 2;
+  if (clayTool.tool === 'add' || clayTool.tool === 'press') {
+    // One touch = one full dab; while dragging, lighter dabs laid at even
+    // spacing along the path (not one per pointer event — event rate
+    // differs from phone to phone and would change how much gets added).
+    const spacing = radius * 0.35, dist = Math.hypot(p.x - a.x, p.y - a.y);
+    const dab = (x, y, full) => grow(clayTool.tool === 'add'
+      ? clayAddLump(clay, x, y, radius, radius * (full ? 0.4 : 0.13))
+      : clayPress(clay, x, y, radius, full ? 0.35 : 0.12));
+    if (first) {
+      dab(p.x, p.y, true);
+      s.carry = 0;
+    } else {
+      let travelled = s.carry + dist, at = spacing - s.carry;
+      while (travelled >= spacing && dist > 0) {
+        const t = at / dist;
+        dab(a.x + (p.x - a.x) * t, a.y + (p.y - a.y) * t, false);
+        at += spacing;
+        travelled -= spacing;
+      }
+      s.carry = travelled;
+    }
+  } else if (clayTool.tool === 'knife') {
+    grow(clayKnife(clay, s.h0, a.x, a.y, p.x, p.y, clayTool.toolSize));
+  } else if (clayTool.tool === 'trowel') {
+    grow(clayTrowel(clay, a.x, a.y, p.x, p.y, clayTool.toolSize));
+  }
+  s.last = p;
+  if (rect) refreshClayShape(s.patch, rect[0], rect[1], rect[2], rect[3]);
+}
+
+function endClayStroke() {
+  clayTool.stroke = null;
+}
+
+// ----- "Різати": points on the clay, then the cut -----
+function clearClayCutPreview() {
+  const c = clayTool.cut;
+  if (!c) return;
+  for (const key of ['line', 'dots']) {
+    const o = c[key];
+    if (!o) continue;
+    o.parent?.remove(o);
+    o.geometry.dispose();
+    o.material.dispose();
+    c[key] = null;
+  }
+}
+
+function refreshClayCutPreview() {
+  clearClayCutPreview();
+  const c = clayTool.cut;
+  if (!c || !c.points.length) return;
+  const z = c.patch.clay.maxH + 1.5;
+  const pts = c.points.map((p) => new THREE.Vector3(p.x, p.y, z));
+  const dots = new THREE.Points(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.PointsMaterial({ color: 0x39ff7a, size: 11, sizeAttenuation: false, depthTest: false, depthWrite: false, transparent: true }),
+  );
+  dots.renderOrder = 1001; dots.frustumCulled = false; dots.raycast = () => {}; dots.userData.isHelper = true;
+  c.patch.root.add(dots);
+  c.dots = dots;
+  if (pts.length >= 2) {
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x39ff7a, depthTest: false, depthWrite: false, transparent: true }));
+    line.renderOrder = 1000; line.frustumCulled = false; line.raycast = () => {}; line.userData.isHelper = true;
+    c.patch.root.add(line);
+    c.line = line;
+  }
+}
+
+function resetClayCut() {
+  clearClayCutPreview();
+  clayTool.cut = null;
+}
+
+function clayCutTap(clientX, clientY) {
+  scene.updateMatrixWorld(true);
+  const hits = rayFromClient(clientX, clientY).intersectObjects(raycastTargets, false);
+  if (!hits.length) { toast('Торкніться глини або поверхні поруч із нею'); return; }
+  const hitRec = findRecordByMesh(hits[0].object);
+  const patch = (clayTool.cut && clayTool.cut.patch) || (hitRec && hitRec.kind === 'clay' ? hitRec : clayPatchAtWorld(hits[0].point));
+  if (!patch) { toast('Тут немає глини — торкніться її або поверхні поруч із нею'); return; }
+  if (!clayTool.cut) clayTool.cut = { patch, points: [], line: null, dots: null };
+  // The second point may well land on the bare wall past the clay's edge —
+  // what matters is where the finger's ray crosses the patch's own plane.
+  const ray = rayFromClient(clientX, clientY).ray;
+  _clayInv.copy(patch.root.matrixWorld).invert();
+  const o = ray.origin.clone().applyMatrix4(_clayInv), d = ray.origin.clone().add(ray.direction).applyMatrix4(_clayInv).sub(o);
+  if (Math.abs(d.z) < 1e-9) return;
+  const t = -o.z / d.z;
+  if (t <= 0) return;
+  clayTool.cut.points.push({ x: o.x + d.x * t, y: o.y + d.y * t });
+  if (!clayTool.polyline && clayTool.cut.points.length >= 2) { applyClayCut(); return; }
+  refreshClayCutPreview();
+  renderClayPill();
+}
+
+function applyClayCut() {
+  const c = clayTool.cut;
+  if (!c || c.points.length < 2) return;
+  const before = pushClayUndo(c.patch);
+  const removed = clayCutAlong(c.patch.clay, c.points);
+  if (removed > 0) {
+    refreshClayShape(c.patch);
+    toast('Масу відтято по лінії — менша частина відпала');
+  } else {
+    c.patch.clay.h.set(before);
+    clayTool.undo.pop();
+    toast('Лінія не розділяє масу — по один бік від неї глини немає');
+  }
+  resetClayCut();
+  renderClayPill();
+}
+
+// ----- mode on/off + the pill -----
+const clayToggleBtn = document.getElementById('clayToggle');
+
+function enterClayMode() {
+  if (mode !== 'edit') return;
+  if (wallDrawing || tileToolActive || groupSelectMode) { toast('Спершу завершіть поточний інструмент'); return; }
+  if (slTool.active) cancelSpatialLine();
+  placingKind = null;
+  placingLibraryEntry = null;
+  windowToolActive = false;
+  deselect();
+  closePopover();
+  clayTool.active = true;
+  clayTool.stroke = null;
+  clayToggleBtn.classList.add('on');
+  renderClayPill();
+  toast('Глина: ведіть пальцем по стіні чи іншій поверхні, щоб наліпити масу', 3200);
+}
+
+function exitClayMode() {
+  if (!clayTool.active) return;
+  clayTool.active = false;
+  clayTool.stroke = null;
+  resetClayCut();
+  clayTool.undo = [];
+  // a patch that ended up with no clay on it at all (everything undone, cut or scraped away) isn't an object worth keeping
+  objects.filter((r) => r.kind === 'clay' && r.clay.maxH <= CLAY_EPS).forEach(removeObject);
+  clayToggleBtn.classList.remove('on');
+  hideEl(modePillEl);
+}
+
+function setClayTool(key) {
+  clayTool.tool = key;
+  resetClayCut();
+  renderClayPill();
+}
+
+function renderClayPill() {
+  modePillEl.innerHTML = '';
+  const def = CLAY_TOOLS.find((t) => t.key === clayTool.tool);
+  const label = document.createElement('span');
+  const nCut = clayTool.cut ? clayTool.cut.points.length : 0;
+  label.textContent = clayTool.tool !== 'cut' ? def.hint
+    : clayTool.polyline ? `Ставте точки ламаної на глині (${nCut}) і натисніть «Відрізати»`
+      : nCut === 1 ? 'Тепер друга точка — маса відтинається по лінії'
+        : 'Дві точки — маса відтинається по лінії між ними';
+  modePillEl.appendChild(label);
+
+  const tools = document.createElement('div');
+  tools.className = 'panel-row clay-tools';
+  for (const t of CLAY_TOOLS) {
+    const b = document.createElement('button');
+    b.textContent = t.label;
+    if (t.key === clayTool.tool) b.className = 'on';
+    b.addEventListener('click', () => setClayTool(t.key));
+    tools.appendChild(b);
+  }
+  modePillEl.appendChild(tools);
+
+  const add = (text, onClick, cls) => {
+    const b = document.createElement('button');
+    b.textContent = text;
+    if (cls) b.className = cls;
+    b.addEventListener('click', onClick);
+    modePillEl.appendChild(b);
+    return b;
+  };
+  if (clayTool.tool === 'add' || clayTool.tool === 'press') {
+    modePillEl.appendChild(pillNumberField('Розмір дотику', clayTool.blobSize, 'мм', { min: 10, max: 300 }, (v) => { clayTool.blobSize = v; }));
+  } else if (clayTool.tool === 'knife' || clayTool.tool === 'trowel') {
+    modePillEl.appendChild(pillNumberField(clayTool.tool === 'knife' ? 'Ширина ножа' : 'Зубець', clayTool.toolSize, 'мм', { min: 2.5, max: 60, step: 0.5 }, (v) => { clayTool.toolSize = v; }));
+  } else if (clayTool.tool === 'cut') {
+    add(clayTool.polyline ? 'Ламана: так' : 'Ламана: ні', () => { clayTool.polyline = !clayTool.polyline; resetClayCut(); renderClayPill(); }, clayTool.polyline ? 'on' : 'ghost');
+    if (nCut) add('⌫ Точка', () => { clayTool.cut.points.pop(); if (!clayTool.cut.points.length) resetClayCut(); else refreshClayCutPreview(); renderClayPill(); });
+    if (clayTool.polyline && nCut >= 2) add('✂ Відрізати', applyClayCut);
+  }
+  if (clayTool.undo.length) add('↶ Крок', clayUndo, 'ghost');
+  add('✓ Готово', exitClayMode);
+  showEl(modePillEl);
+}
+
+clayToggleBtn.addEventListener('click', () => { clayTool.active ? exitClayMode() : enterClayMode(); });
+
+// ----- save / load: only the rectangle that actually holds clay, heights
+// rounded to 0.05 mm, as base64 -----
+function serializeClay(rec, positionOverride) {
+  const h = rec.clay.h, N = CLAY_N;
+  let i0 = N, j0 = N, i1 = -1, j1 = -1;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) if (h[j * N + i] > CLAY_EPS) { if (i < i0) i0 = i; if (i > i1) i1 = i; if (j < j0) j0 = j; if (j > j1) j1 = j; }
+  const w = Math.max(0, i1 - i0 + 1), hh = Math.max(0, j1 - j0 + 1);
+  const q = new Uint16Array(w * hh);
+  for (let j = 0; j < hh; j++) for (let i = 0; i < w; i++) q[j * w + i] = Math.min(65535, Math.round(Math.max(0, h[(j0 + j) * N + i0 + i]) * 20));
+  const bytes = new Uint8Array(q.buffer);
+  let bin = '';
+  for (let k = 0; k < bytes.length; k += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(k, k + 0x8000));
+  const m = rec.root.material;
+  return {
+    id: rec.id, kind: 'clay',
+    clay: { cells: CLAY_CELLS, cell: CLAY_CELL_MM, rect: [w ? i0 : 0, hh ? j0 : 0, w, hh], data: btoa(bin) },
+    material: { type: m.userData.creslarnetType, color: m.userData.creslarnetColor },
+    position: (positionOverride || rec.root.position).toArray(),
+    quaternion: rec.root.quaternion.toArray(),
+    scale: rec.root.scale.toArray(),
+  };
+}
+
+function buildClayFromItem(item) {
+  const heights = new Float32Array(CLAY_N * CLAY_N);
+  const c = item.clay || {};
+  const [i0, j0, w, hh] = c.rect || [0, 0, 0, 0];
+  if (w && hh && c.data) {
+    const bin = atob(c.data), bytes = new Uint8Array(bin.length);
+    for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+    const q = new Uint16Array(bytes.buffer);
+    // Saved with the same grid → straight copy; a different grid (another version's cell size) → each saved point goes to the nearest point of today's grid.
+    const sameGrid = c.cells === CLAY_CELLS && c.cell === CLAY_CELL_MM;
+    for (let j = 0; j < hh; j++) {
+      for (let i = 0; i < w; i++) {
+        let gi = i0 + i, gj = j0 + j;
+        if (!sameGrid) {
+          gi = Math.round(clayGridI((i0 + i - c.cells / 2) * c.cell));
+          gj = Math.round(clayGridI((j0 + j - c.cells / 2) * c.cell));
+          if (gi < 0 || gj < 0 || gi >= CLAY_N || gj >= CLAY_N) continue;
+        }
+        heights[gj * CLAY_N + gi] = q[j * w + i] / 20;
+      }
+    }
+  }
+  const mat = item.material && item.material.type && item.material.type !== 'paint'
+    ? createMaterial(item.material.type, item.material.color, scene.environment)
+    : createPaintMaterial((item.material && item.material.color) || CLAY_COLOR);
+  const mesh = buildClayMesh(heights, mat);
+  mesh.quaternion.fromArray(item.quaternion);
+  if (item.scale) mesh.scale.fromArray(item.scale);
+  const extra = { clay: mesh.userData.clay };
+  refreshClayShape({ root: mesh, clay: mesh.userData.clay });
+  return { root: mesh, extra };
+}
+
+// ---------------------------------------------------------------------------
 // Selection panel rendering
 // ---------------------------------------------------------------------------
 const selectionPanelEl = document.getElementById('selectionPanel');
@@ -4880,7 +5547,15 @@ function renderSelectionPanel() {
     actions.appendChild(undoShapeBtn);
   }
 
-  if (selected.root.isMesh) {
+  if (selected.kind === 'clay') {
+    const clayBtn = document.createElement('button');
+    clayBtn.className = 'pbtn'; clayBtn.textContent = '🟤 Ліпити далі';
+    clayBtn.title = 'Відкрити інструменти глини: ліпити, притиснути, різати, ніж, шпатель';
+    clayBtn.addEventListener('click', enterClayMode);
+    actions.appendChild(clayBtn);
+  }
+
+  if (selected.root.isMesh && selected.kind !== 'clay') {
     const holeBtn = document.createElement('button');
     holeBtn.className = 'pbtn'; holeBtn.textContent = '◎ Отвір';
     holeBtn.addEventListener('click', enterHoleMode);
@@ -4901,7 +5576,7 @@ function renderSelectionPanel() {
     actions.appendChild(bendBtn);
   }
 
-  if (selected.root.isMesh) {
+  if (selected.root.isMesh && selected.kind !== 'clay') {
     const sculptBtn = document.createElement('button');
     sculptBtn.className = 'pbtn'; sculptBtn.textContent = '🖐 Скульптинг';
     sculptBtn.addEventListener('click', () => enterSculptMode(selected));
@@ -5022,6 +5697,7 @@ function closePopover() {
 
 function openPopover(panel, btn) {
   const wasOpenForSameBtn = !popoverEl.classList.contains('hidden') && btn.classList.contains('active');
+  exitClayMode(); // a toolbar panel means another tool is about to take over
   closePopover();
   if (wasOpenForSameBtn) return;
   btn.classList.add('active');
@@ -5524,6 +6200,12 @@ canvas.addEventListener('pointerdown', (e) => {
         // locked out while this tool was active).
         startLookDrag(e.pointerId, e.clientX, e.clientY);
       }
+    } else if (mode === 'edit' && clayTool.active) {
+      // "Огляд" and "Різати" (which works by taps) leave the finger to the
+      // camera; the other tools take it if there's something to work on
+      // under it, and otherwise it's a look-drag as well.
+      const works = clayTool.tool !== 'look' && clayTool.tool !== 'cut' && beginClayStroke(e.clientX, e.clientY);
+      if (!works) startLookDrag(e.pointerId, e.clientX, e.clientY);
     } else if (mode === 'edit' && sculptActive && sculptTarget) {
       scene.updateMatrixWorld(true);
       const hits = rayFromClient(e.clientX, e.clientY).intersectObject(sculptTarget.root, true);
@@ -5535,7 +6217,7 @@ canvas.addEventListener('pointerdown', (e) => {
       startLookDrag(e.pointerId, e.clientX, e.clientY);
       armLongPress(e.clientX, e.clientY); // held still on the selected object → "Властивості"
     }
-  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag && !clayTool.stroke) {
     pinchStartDist = currentPinchDist();
     if (mode === 'walk') {
       // Walking never "zooms toward" anything the way flying does — pinch
@@ -5574,7 +6256,11 @@ canvas.addEventListener('pointermove', (e) => {
     updateVertexDrag(e.clientX, e.clientY);
     return;
   }
-  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag) {
+  if (clayTool.stroke && e.pointerId === primaryPointerId) {
+    updateClayStroke(e.clientX, e.clientY);
+    return;
+  }
+  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag && !clayTool.stroke) {
     const dist = currentPinchDist();
     if (mode === 'walk') {
       // Pure optical zoom (FOV) from the pinch distance — completely
@@ -5701,6 +6387,7 @@ function endPointer(e) {
   if (lookPointerId === e.pointerId) lookPointerId = null;
   if (e.pointerId === primaryPointerId) { moveDragGizmo = null; rotateDragGizmo = null; }
   if (vertexDrag && e.pointerId === primaryPointerId) { endVertexDrag(e.type === 'pointercancel'); return; } // a vertex drag is never a tap
+  if (clayTool.stroke && e.pointerId === primaryPointerId) { endClayStroke(); renderClayPill(); return; } // nor is a stroke on clay
 
   if (e.type === 'pointercancel') {
     if (mode === 'edit' && moveMode) moveDragging = false;
@@ -5797,6 +6484,11 @@ function handleEditTap(x, y) {
   // arriving in the same tick as an object add/move never raycasts stale.
   scene.updateMatrixWorld(true);
 
+  if (clayTool.active) {
+    // In clay mode a tap never selects/places anything — it's either a cut point or nothing.
+    if (clayTool.tool === 'cut') clayCutTap(x, y);
+    return;
+  }
   if (slTool.attach.picking) { trySpatialLineAttachTap(x, y); return; }
   if (linkPick) { linkPickTap(x, y); return; }
 
@@ -5963,6 +6655,7 @@ setFov(preferredFov);
 // scrollable bottom toolbar) — one tap starts it, tap again to cancel.
 const spatialLineFabBtn = document.getElementById('spatialLineFab');
 spatialLineFabBtn.addEventListener('click', () => {
+  exitClayMode();
   if (slTool.active) {
     cancelSpatialLine();
     spatialLineFabBtn.classList.remove('on');
@@ -5976,6 +6669,7 @@ spatialLineFabBtn.addEventListener('click', () => {
 });
 
 function enterWalkMode() {
+  exitClayMode();
   mode = 'walk';
   orbitActive = false; // no orbit pivot while walking — deselect() below drops `selected` anyway
   setAutoRotate(false);
@@ -6299,7 +6993,7 @@ function serializeObjectRecord(rec, positionOverride) {
     // from them (updateLinks) rather than stored.
     return { id: rec.id, kind: rec.kind, linkA: rec.linkA, linkB: rec.linkB, position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1] };
   }
-  const out = serializeObjectRecordCore(rec, positionOverride);
+  const out = rec.kind === 'clay' ? serializeClay(rec, positionOverride) : serializeObjectRecordCore(rec, positionOverride);
   if (rec.spin) out.spin = { ...rec.spin };
   if (rec.wheel) out.wheel = { ...rec.wheel };
   return out;
@@ -6493,7 +7187,7 @@ function buildObjectFromItem(item) {
     // Empty for now — strung between its wheels by updateLinks once they exist.
     return { root: new THREE.Mesh(new THREE.BufferGeometry(), linkMaterial(item.kind)), extra: { linkA: item.linkA, linkB: item.linkB, linkPhase: 0, linkSig: '' } };
   }
-  const built = buildObjectFromItemCore(item);
+  const built = item.kind === 'clay' ? buildClayFromItem(item) : buildObjectFromItemCore(item);
   if (item.spin) built.extra.spin = { ...item.spin };
   if (item.wheel) built.extra.wheel = { ...item.wheel };
   return built;
@@ -6656,6 +7350,7 @@ function toggleGroupMember(x, y) {
   if (!hits.length) return;
   const rec = findRecordByMesh(hits[0].object);
   if (!rec || rec.kind === 'ground') return;
+  if (rec.kind === 'clay' || isLinkKind(rec.kind)) { toast(`${KIND_LABELS[rec.kind]} не можна додати до групи`); return; }
   if (groupSelection.has(rec)) {
     groupSelection.delete(rec);
     const helper = groupOutlineHelpers.get(rec);
@@ -7100,6 +7795,7 @@ window.__creslarnet3d = {
   get contour() { return contour; },
   enterContourMode, exitContourMode, cutByContour, undoPointEdit, deselect,
   updateSpins, updateLinks, createLink, setWheelSize, openPropsPanel, removeObject,
+  clayTool, enterClayMode, exitClayMode, setClayTool, clayHeightAt, clayUndo, refreshClayShape,
   get gizmo() { return gizmo; },
   // "Просторова лінія" internals — same introspection purpose as the rest
   // of this hook, read-only. slTool itself is exposed directly (not spread
