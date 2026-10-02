@@ -2473,7 +2473,13 @@ function buildRoundOutlineGeometry(kind) {
 
 let outlineHelper = null;
 function select(record) {
-  if (selected === record) return;
+  if (selected === record) {
+    // Tapping the object that's already selected must still leave it with
+    // its gizmo: if the arrows aren't there (and no tool has deliberately
+    // put them away — see gizmoDeliberatelyHidden), they're put back.
+    ensureObjectGizmo(record);
+    return;
+  }
   deselect();
   selected = record;
   selectionPanelCollapsed = true; // start collapsed on every new selection — see wireSelectionPanelGrip
@@ -2525,17 +2531,57 @@ function select(record) {
     outlineHelper.renderOrder = 999;
   }
 
-  if (record.kind !== 'ground' && record.kind !== 'sketchLine' && !isLinkKind(record.kind)) {
+  ensureObjectGizmo(record);
+
+  closePopover();
+  renderSelectionPanel();
+}
+
+function hasObjectGizmo(record) {
+  return record.kind !== 'ground' && record.kind !== 'sketchLine' && !isLinkKind(record.kind);
+}
+
+// The tools that take the arrows away on purpose while they work on the
+// selected object (the arrows would sit right where the finger needs to be).
+function gizmoDeliberatelyHidden() {
+  return bendActive || sculptActive || orbitActive || !!contour;
+}
+
+// Makes sure the selected object has its move/rotate gizmo (and vertex
+// dots) — builds them if they aren't there. Safe to call any time.
+function ensureObjectGizmo(record) {
+  if (!record || record !== selected || !hasObjectGizmo(record) || gizmoDeliberatelyHidden()) return;
+  if (!gizmo || gizmo.parent !== record.root) {
+    if (gizmo) removeGizmo();
     const built = buildGizmo(record);
     gizmo = built.group;
     gizmoMoveTargets = built.moveTargets;
     gizmoRotateTargets = built.rotateTargets;
-    record.root.add(gizmo); // child — tracks position/rotation/scale for free
+    record.root.add(gizmo); // child — tracks position/rotation for free
   }
-  attachVertexHandles(record); // draggable vertex dots — only for the kinds canVertexEdit allows
+  gizmo.visible = true;
+  record.root.updateWorldMatrix(true, false);
+  updateObjectGizmoScale(); // right size from the very first frame — and for a touch that arrives before one
+  if (!vertexHandles || vertexHandles.record !== record) attachVertexHandles(record); // draggable vertex dots — only for the kinds canVertexEdit allows
+}
 
-  closePopover();
-  renderSelectionPanel();
+// The gizmo's size ON SCREEN in CSS pixels (arrows reach 1.18× this, the
+// rings sit at 0.85×) — the same for every object, at any distance and any
+// field of view. It used to be 0.6 of the object's own size, in the
+// object's own space: a 1 m cube seen from ten metres with the field of
+// view opened to 100–120° had arrows of 15–20 px — to all intents the
+// gizmo "wasn't there", and no amount of tapping the cube could bring it
+// back, because it was there all along, just too small to see or touch.
+const OBJECT_GIZMO_PX = 78;
+function updateObjectGizmoScale() {
+  if (!gizmo || !selected) return;
+  const root = selected.root;
+  const k = (worldPerPixelAt(root.getWorldPosition(new THREE.Vector3())) * OBJECT_GIZMO_PX) / gizmo.userData.gizmoSize;
+  // The gizmo is a child of the object, so the object's own scale (per
+  // axis — objects get resized unevenly) is divided back out: the arrows
+  // stay equal and unstretched however the object has been resized.
+  const s = root.scale;
+  gizmo.scale.set(k / (Math.abs(s.x) || 1), k / (Math.abs(s.y) || 1), k / (Math.abs(s.z) || 1));
 }
 
 function deselect() {
@@ -6353,7 +6399,7 @@ canvas.addEventListener('pointerdown', (e) => {
         applySculptAt(hits[0].point);
       }
     } else if (!moveMode && !paperDrawing) {
-      touchDebug('сцена', selected && gizmo ? 'нічого (поворот камери)' : 'гізмо на екрані немає (поворот камери)');
+      touchDebug('сцена', selected && gizmo ? 'нічого (поворот камери)' : selected ? 'у виділеного об’єкта гізмо немає (поворот камери)' : 'нічого не виділено (поворот камери)');
       startLookDrag(e.pointerId, e.clientX, e.clientY);
       armLongPress(e.clientX, e.clientY); // held still on the selected object → "Властивості"
     }
@@ -8080,6 +8126,7 @@ function animate() {
     }
     layoutFlyUi();
     updateSlGizmoScale();
+    updateObjectGizmoScale();
     updateSlOverlay();
     updateVertexHandleVisibility();
     updateAxisLabels();
@@ -8136,7 +8183,7 @@ window.__creslarnet3d = {
     camera.position.copy(target).add(offset);
     faceDirection(new THREE.Vector3().subVectors(target, camera.position).normalize());
   },
-  pickObjectGizmo, slPickHandle,
+  pickObjectGizmo, slPickHandle, removeGizmo, openPopover,
   // put the camera at one point looking at another (tests/debugging)
   lookFrom(from, target) {
     camera.position.set(from.x, from.y, from.z);
