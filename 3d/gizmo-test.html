@@ -77,8 +77,44 @@
     font-weight: 600;
   }
   #modes button.on { background: #8338ec; color: #fff; }
-  #modes button.plain { background: transparent; color: #b3aec0; }
+  #modes button.plain { background: transparent; color: #b3aec0; padding-left: 9px; padding-right: 9px; }
+  #reportBox {
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    top: 22%;
+    height: 46%;
+    z-index: 9;
+    background: #111;
+    color: #39ff7a;
+    border: 1px solid #39ff7a;
+    border-radius: 8px;
+    font: 11px/1.35 ui-monospace, monospace;
+    padding: 8px;
+  }
 </style>
+<script>
+  // Runs before anything else, as a plain (non-module) script, so that even
+  // if the page's real script never starts — the browser can't do import
+  // maps, a file didn't load, a script threw — the reason is written on the
+  // screen instead of the page just sitting there doing nothing.
+  window.__errors = [];
+  window.__showError = function (text) {
+    window.__errors.push(String(text));
+    var el = document.getElementById('debug');
+    if (el && !window.__gizmoTest) el.textContent = 'ПОМИЛКА: ' + window.__errors.join('\n');
+  };
+  window.addEventListener('error', function (e) {
+    var where = e.filename ? ' @ ' + String(e.filename).split('/').pop() + ':' + e.lineno : (e.target && e.target.src ? ' @ ' + e.target.src : '');
+    window.__showError((e.message || 'не завантажився файл') + where);
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    window.__showError('promise: ' + ((e.reason && e.reason.message) || e.reason));
+  });
+  setTimeout(function () {
+    if (!window.__gizmoTest) window.__showError('скрипт сторінки не запустився за 6 с — браузер не підтримує import map або не завантажив файли three.js');
+  }, 6000);
+</script>
 <script type="importmap">
 {
   "imports": {
@@ -95,7 +131,11 @@
     <button data-mode="rotate">Обертання</button>
     <button data-mode="scale">Масштаб</button>
     <button id="reset" class="plain">Скинути</button>
+    <button id="report" class="plain">📋 Звіт</button>
   </div>
+  <!-- Shown only if copying to the clipboard isn't allowed: the report as
+       text to select and copy by hand. -->
+  <textarea id="reportBox" readonly hidden></textarea>
 
 <script type="module">
 import * as THREE from 'three';
@@ -205,14 +245,89 @@ document.getElementById('reset').addEventListener('click', () => {
 // preventDefault / stopPropagation or touches the scene.
 let lastEvent = '—', eventCount = 0, lastNote = '';
 const touchStart = cube.position.clone(); // where the cube was when the current/last drag began
-function note(text) { lastNote = text; }
-for (const type of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'lostpointercapture']) {
+const history = [];        // the last events, one line each — for the report
+const counts = {};         // how many of each event type reached the canvas
+const t0 = performance.now();
+function record(line) {
+  history.push(`${((performance.now() - t0) / 1000).toFixed(2)}s ${line}`);
+  if (history.length > 40) history.shift();
+}
+function note(text) { lastNote = text; record(text); }
+let movesSinceDown = 0;
+for (const type of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'lostpointercapture', 'gotpointercapture']) {
   canvas.addEventListener(type, (e) => {
     eventCount++;
+    counts[type] = (counts[type] || 0) + 1;
     lastEvent = `${type} (${e.pointerType || '?'}, палець ${e.pointerId})`;
-    if (type === 'pointerdown') touchStart.copy(cube.position);
+    if (type === 'pointerdown') { touchStart.copy(cube.position); movesSinceDown = 0; }
+    // every event goes in the history except the flood of moves: of those, the first three after a touch-down and then every 15th
+    if (type === 'pointermove' && ++movesSinceDown > 3 && movesSinceDown % 15) return;
+    record(`${type} ${e.pointerType || '?'}#${e.pointerId} btn=${e.button} xy=${Math.round(e.clientX)},${Math.round(e.clientY)}`);
+    // What the gizmo made of it is only known once ITS handler has run, and
+    // this listener runs first — so look again once the event is fully
+    // dealt with (a timeout, not a microtask: microtasks run between two
+    // listeners of the same event, i.e. still before the gizmo's).
+    if (type !== 'pointermove') setTimeout(() => record(`  → вісь ${gizmo.axis || 'жодна'}, тягне ${gizmo.dragging ? 'так' : 'ні'}, куб ${mm(cube.position.x)} ${mm(cube.position.y)} ${mm(cube.position.z)}`), 0);
   }, true);
 }
+// A touch the canvas never got (something else was on top of it) shows up here only.
+window.addEventListener('pointerdown', (e) => {
+  if (e.target !== canvas) record(`pointerdown НЕ на полотні: <${(e.target.tagName || '?').toLowerCase()}${e.target.id ? '#' + e.target.id : ''}>`);
+}, true);
+
+// Everything worth knowing about this device and what just happened, as text.
+function buildReport() {
+  let gpu = '?';
+  try {
+    const gl = renderer.getContext(), ext = gl.getExtension('WEBGL_debug_renderer_info');
+    gpu = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  } catch (err) { gpu = `(${err.message})`; }
+  const r = canvas.getBoundingClientRect();
+  return [
+    'ЗВІТ ТЕСТУ ГІЗМО',
+    `браузер: ${navigator.userAgent}`,
+    `екран: ${window.innerWidth}×${window.innerHeight} css px, dpr ${window.devicePixelRatio}, полотно ${Math.round(r.width)}×${Math.round(r.height)} @ ${Math.round(r.left)},${Math.round(r.top)}, буфер ${canvas.width}×${canvas.height}`,
+    `three r${THREE.REVISION}, GPU: ${gpu}`,
+    `touch-action: ${window.getComputedStyle ? window.getComputedStyle(canvas).touchAction : canvas.style.touchAction}, maxTouchPoints ${navigator.maxTouchPoints}`,
+    `режим: ${gizmo.mode}, вісь: ${gizmo.axis || 'жодна'}, тягне: ${gizmo.dragging}, камера ввімкнена: ${orbit.enabled}`,
+    `куб: ${mm(cube.position.x)} ${mm(cube.position.y)} ${mm(cube.position.z)} мм, поворот ${deg(cube.rotation.x)} ${deg(cube.rotation.y)} ${deg(cube.rotation.z)}°, масштаб ${cube.scale.x.toFixed(2)} ${cube.scale.y.toFixed(2)} ${cube.scale.z.toFixed(2)}`,
+    `подій на полотні: ${Object.keys(counts).map((k) => `${k} ${counts[k]}`).join(', ') || 'жодної'}`,
+    `помилки: ${window.__errors.length ? window.__errors.join(' | ') : 'немає'}`,
+    'останні події:',
+    ...history,
+  ].join('\n');
+}
+
+// "📋 Звіт": the report to the clipboard, ready to paste into a message.
+const reportBox = document.getElementById('reportBox');
+const reportBtn = document.getElementById('report');
+reportBtn.addEventListener('click', async () => {
+  const text = buildReport();
+  if (!reportBox.hidden) { reportBox.hidden = true; return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    reportBtn.textContent = '✓ Скопійовано';
+    setTimeout(() => { reportBtn.textContent = '📋 Звіт'; }, 1800);
+  } catch (err) {
+    reportBox.value = text; // clipboard not allowed here — show it to be copied by hand
+    reportBox.hidden = false;
+    reportBox.focus();
+    reportBox.select();
+  }
+});
+
+// Opened from this phone's own local server (127.0.0.1) rather than from the
+// public site, the page also sends the report back to that server after
+// every touch — so whoever is debugging sees what the phone saw without
+// anything having to be copied at all. On the public site this does nothing.
+const LOCAL = ['127.0.0.1', 'localhost'].includes(window.location.hostname);
+function sendReport(why) {
+  if (!LOCAL) return;
+  fetch('/log', { method: 'POST', keepalive: true, body: `--- ${why} ---\n${buildReport()}\n` }).catch(() => {});
+}
+canvas.addEventListener('pointerup', () => setTimeout(() => sendReport('після дотику'), 60));
+canvas.addEventListener('pointercancel', () => setTimeout(() => sendReport('після pointercancel'), 60));
+setTimeout(() => sendReport('сторінку відкрито'), 800);
 
 const mm = (v) => (Math.round(v * 10) / 10).toString().replace('.', ',');
 const deg = (r) => Math.round(THREE.MathUtils.radToDeg(r));
@@ -224,7 +339,8 @@ function renderDebug() {
     `вісь: ${axis} · тягне: ${gizmo.dragging ? 'так' : 'ні'} · режим: ${MODE_NAMES[gizmo.mode]}${lastNote ? ` · ${lastNote}` : ''}\n` +
     `куб, мм:  X ${mm(p.x)}  Y ${mm(p.y)}  Z ${mm(p.z)}\n` +
     `зсув від дотику, мм:  X ${mm(p.x - touchStart.x)}  Y ${mm(p.y - touchStart.y)}  Z ${mm(p.z - touchStart.z)}\n` +
-    `поворот °: ${deg(r.x)} ${deg(r.y)} ${deg(r.z)} · масштаб: ${s.x.toFixed(2)} ${s.y.toFixed(2)} ${s.z.toFixed(2)}`;
+    `поворот °: ${deg(r.x)} ${deg(r.y)} ${deg(r.z)} · масштаб: ${s.x.toFixed(2)} ${s.y.toFixed(2)} ${s.z.toFixed(2)}` +
+    (window.__errors.length ? `\nПОМИЛКА: ${window.__errors.join(' | ')}` : '');
 }
 
 // ---- frame loop -----------------------------------------------------------------
@@ -244,7 +360,7 @@ function frame() {
 frame();
 
 // For checking from the browser console / automated checks.
-window.__gizmoTest = { THREE, scene, camera, cube, gizmo, orbit, renderDebug, CUBE_START };
+window.__gizmoTest = { THREE, scene, camera, cube, gizmo, orbit, renderDebug, buildReport, CUBE_START };
 </script>
 </body>
 </html>
