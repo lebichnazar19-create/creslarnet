@@ -1387,17 +1387,33 @@ function updateSlCustomArrow() {
   slTool.gizmo.ringT.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), slTool.customAngle);
 }
 
-// Constant on-screen size regardless of how far the gizmo's point actually
-// is from the camera right now — same idea as a TransformControls handle in
-// any 3D editor. Scaling the whole group (rather than rebuilding its
-// geometry) is cheap enough to do every frame, so it also stays correctly
-// sized if the camera moves. Clamped so a very close point doesn't get an
-// oversized gizmo and a very far one doesn't shrink back to unusable.
+// How many millimetres of the world one CSS pixel covers at a given point —
+// from the point's depth along the view AND the current field of view AND
+// the viewport's real height. This is what "the same size on screen" has to
+// be computed from: distance alone isn't enough, since widening the field
+// of view (the "Кут огляду" slider goes to 120°) shrinks everything on
+// screen by up to 3× at the very same distance.
+function worldPerPixelAt(point) {
+  const forward = camera.getWorldDirection(new THREE.Vector3());
+  let depth = point.clone().sub(camera.position).dot(forward);
+  if (!(depth > 1)) depth = Math.max(1, camera.position.distanceTo(point));
+  const viewH = renderer.domElement.clientHeight || window.innerHeight || 1;
+  return (2 * depth * Math.tan((camera.fov * Math.PI) / 360)) / viewH;
+}
+
+// The gizmo's size ON SCREEN, in CSS pixels (its X/Y/Z arrows reach 1.2×
+// this, the rings 1.5×) — sized for a fingertip, and the same at any
+// distance, any field of view, any screen. It used to be sized from
+// distance alone and capped at 900 mm: seen from ten metres away, or with
+// the field of view opened up, an arrow shrank to ~20 px, entirely inside
+// the centre ball's own touch zone — so a touch on an arrow was read as a
+// touch on the ball, the "arrow does nothing" bug.
+const SL_GIZMO_PX = 80;
+// Scaling the whole group (rather than rebuilding its geometry) is cheap
+// enough to do every frame, so it stays right as the camera moves.
 function updateSlGizmoScale() {
   if (!slTool.gizmo) return;
-  const distToCam = camera.position.distanceTo(slTool.gizmo.group.position);
-  const size = Math.max(120, Math.min(900, distToCam * 0.12));
-  slTool.gizmo.group.scale.setScalar(size / SL_GIZMO_SIZE);
+  slTool.gizmo.group.scale.setScalar((worldPerPixelAt(slTool.gizmo.group.position) * SL_GIZMO_PX) / SL_GIZMO_SIZE);
 }
 
 // Puts the gizmo at `point` — built once per drawing session and then just
@@ -1549,14 +1565,22 @@ function beginSlDrag(handle, clientX, clientY) {
     // The axis as it appears on screen right now: a 2D direction and how
     // many pixels a millimetre along it covers, measured at the grab point.
     const aScreen = projectToScreenPx(grabPoint);
-    const bScreen = projectToScreenPx(grabPoint.clone().addScaledVector(axisWorld, 100)); // 100mm probe
+    // A probe step along the axis that would cover ~60 px if the axis lay
+    // square to the view — so what's being measured is how much the axis is
+    // foreshortened, never how far away the gizmo happens to be. (This used
+    // to be a fixed 100 mm step with "under 2 px = unusable": from far off,
+    // or with a wide field of view, 100 mm IS under 2 px for every axis,
+    // and the arrows silently went dead.)
+    const probeMm = worldPerPixelAt(grabPoint) * 60;
+    const bScreen = projectToScreenPx(grabPoint.clone().addScaledVector(axisWorld, probeMm));
     const dxs = bScreen.x - aScreen.x, dys = bScreen.y - aScreen.y;
     const screenLen = Math.hypot(dxs, dys);
-    // An axis pointing almost exactly at/away from the camera projects to
-    // (near) zero screen length — no usable on-screen direction to drag
-    // along; pxPerMm 0 makes every offset below just stay put.
-    const axisScreenDir = screenLen < 2 ? { x: 0, y: -1 } : { x: dxs / screenLen, y: dys / screenLen };
-    const pxPerMm = screenLen < 2 ? 0 : screenLen / 100;
+    // An axis pointing almost exactly at/away from the camera has no usable
+    // on-screen direction to drag along; pxPerMm 0 makes every offset below
+    // just stay put.
+    const usable = screenLen >= 6;
+    const axisScreenDir = usable ? { x: dxs / screenLen, y: dys / screenLen } : { x: 0, y: -1 };
+    const pxPerMm = usable ? screenLen / probeMm : 0;
     // Whether the exact ray-vs-axis solve is usable for this drag at all
     // (see updateSlDrag) is decided once, here, so one gesture never hops
     // between two ways of measuring half-way through.
@@ -1632,6 +1656,7 @@ function updateSlDrag(clientX, clientY) {
     }
     offset = Math.round(offset); // whole millimetres
     g.length = offset;
+    touchDebugProgress(g.pxPerMm > 0 ? `відрізок ${offset} мм` : 'вісь дивиться в камеру — руху немає');
     const point = g.basePoint.clone().addScaledVector(g.axisWorld, offset);
     const snap = slCloseSnapPoint(point);
     g.candidatePoint = snap || point;
@@ -2712,6 +2737,7 @@ function updateMoveDrag(ray) {
   if (t === null) return; // no trustworthy reading right now — hold position
   if (g.startT === null) g.startT = t; // the grab itself had no reading — start counting from the first good one
   selected.root.position.copy(g.origin).addScaledVector(g.axisWorld, roundMm(t - g.startT));
+  touchDebugProgress(`зсув ${formatMm(roundMm(t - g.startT))} мм`);
   outlineHelper?.update();
 }
 
@@ -6130,6 +6156,52 @@ canvas.addEventListener('wheel', (e) => {
   camera.position.addScaledVector(dir, -e.deltaY * refDist * 0.0011);
 }, { passive: false });
 
+// Is a finger currently dragging any gizmo handle (the "Жила" gizmo, an
+// object's move arrow or rotate ring, a vertex dot)? While it is, that
+// touch is the gizmo's only: no second finger turns it into a pinch, and
+// neither the flight controls nor a look-drag move the camera under it.
+function gizmoDragActive() {
+  return !!(slTool.drag || moveDragGizmo || rotateDragGizmo || vertexDrag);
+}
+
+// ---------------------------------------------------------------------------
+// TEMPORARY on-screen debug line for touch handling on a real phone: for
+// every touch, what it landed on. "ціль" is the element the browser gave
+// the touch to — if that isn't the scene, something on top of it took the
+// touch before the gizmo could; "гізмо" is which part of the gizmo the scene
+// then decided was hit; and during a drag, how far it has moved things.
+// Tap the line itself to hide it. To be removed once touch handling is
+// confirmed on the device.
+// ---------------------------------------------------------------------------
+const touchDebugEl = document.getElementById('touchDebug');
+let touchDebugCount = 0, touchDebugBase = '';
+function touchDebug(target, part) {
+  touchDebugBase = `Дотик ${++touchDebugCount} · ціль: ${target} · гізмо: ${part}`;
+  touchDebugEl.textContent = touchDebugBase;
+}
+function touchDebugProgress(text) {
+  touchDebugEl.textContent = `${touchDebugBase} · ${text}`;
+}
+function describeTouchTarget(el) {
+  if (!el || el === canvas) return 'сцена';
+  let node = el;
+  for (let i = 0; node && i < 4; i++, node = node.parentNode) if (node.id) return `#${node.id}`;
+  return (el.tagName || 'елемент').toLowerCase();
+}
+const SL_HANDLE_NAMES = { x: 'стрілка X', y: 'стрілка Y', z: 'стрілка Z', h: 'стрілка H', azimuth: 'кільце повороту (фіолетове)', elevation: 'кільце нахилу (жовте)' };
+function describeSlHandle(handle) {
+  if (!handle) return 'нічого';
+  if (handle.kind === 'center') return 'центр';
+  return SL_HANDLE_NAMES[handle.axis] || 'нічого';
+}
+// Capture phase, on the window: sees every touch first, including the ones
+// some overlay swallows before they could reach the scene.
+window.addEventListener('pointerdown', (e) => {
+  if (e.target === touchDebugEl) return;
+  if (e.target !== canvas) touchDebug(describeTouchTarget(e.target), 'дотик не дійшов до сцени');
+}, true);
+touchDebugEl.addEventListener('click', () => touchDebugEl.classList.add('hidden'));
+
 function currentPinchDist() {
   const pts = [...activePointers.values()];
   return pts.length < 2 ? 0 : Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
@@ -6168,14 +6240,17 @@ canvas.addEventListener('pointerdown', (e) => {
     // a touch merely near one leaves the arrow its drag.
     const vertexHit = vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY, gizmoHit.length ? VERTEX_PICK_TIGHT_PX : VERTEX_PICK_PX) : -1;
     if (vertexHit >= 0) {
+      touchDebug('сцена', 'вершина об’єкта');
       beginVertexDrag(vertexHit);
       armLongPress(e.clientX, e.clientY);
     } else if (gizmoHit.length) {
       const hitMesh = gizmoHit[0].object;
       const axisLetter = hitMesh.userData.gizmoAxis;
       if (gizmoMoveTargets.includes(hitMesh)) {
+        touchDebug('сцена', `стрілка ${axisLetter.toUpperCase()} (переміщення об’єкта)`);
         beginMoveDrag(axisLetter, rayFromClient(e.clientX, e.clientY));
       } else {
+        touchDebug('сцена', `кільце ${axisLetter.toUpperCase()} (обертання об’єкта)`);
         beginRotateDrag(axisLetter, e.clientX, e.clientY);
       }
       armLongPress(e.clientX, e.clientY);
@@ -6201,6 +6276,7 @@ canvas.addEventListener('pointerdown', (e) => {
       // slPickHandle checks centre/arrows/ring in that priority order — see
       // its own comment for why (screen-space distance, not a 3D raycast).
       const handle = slPickHandle(e.clientX, e.clientY);
+      touchDebug('сцена', describeSlHandle(handle));
       if (handle) {
         beginSlDrag(handle, e.clientX, e.clientY);
       } else {
@@ -6224,10 +6300,11 @@ canvas.addEventListener('pointerdown', (e) => {
         applySculptAt(hits[0].point);
       }
     } else if (!moveMode && !paperDrawing) {
+      touchDebug('сцена', selected && gizmo ? 'нічого (поворот камери)' : 'гізмо на екрані немає (поворот камери)');
       startLookDrag(e.pointerId, e.clientX, e.clientY);
       armLongPress(e.clientX, e.clientY); // held still on the selected object → "Властивості"
     }
-  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag && !clayTool.stroke) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !gizmoDragActive() && !sculptDragging && !clayTool.stroke) {
     pinchStartDist = currentPinchDist();
     if (mode === 'walk') {
       // Walking never "zooms toward" anything the way flying does — pinch
@@ -6270,7 +6347,7 @@ canvas.addEventListener('pointermove', (e) => {
     updateClayStroke(e.clientX, e.clientY);
     return;
   }
-  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag && !clayTool.stroke) {
+  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !gizmoDragActive() && !sculptDragging && !clayTool.stroke) {
     const dist = currentPinchDist();
     if (mode === 'walk') {
       // Pure optical zoom (FOV) from the pinch distance — completely
@@ -7107,8 +7184,12 @@ function updateFreeCamera(dt, refDist) {
   my = Math.max(-1, Math.min(1, my));
   // The on-screen "Політ" controls: stick (analog — how far it's pushed is
   // how fast) and the two vertical buttons.
-  const fx = flyTool.visible ? flyTool.x : 0, fy = flyTool.visible ? flyTool.y : 0;
-  const fv = flyTool.visible ? (flyTool.up ? 1 : 0) - (flyTool.down ? 1 : 0) : 0;
+  // ...held still while a finger is dragging a gizmo handle: a drag measures
+  // the finger against the axis as seen from where the camera IS, and the
+  // touch that started on a gizmo belongs to the gizmo alone.
+  const flying = flyTool.visible && !gizmoDragActive();
+  const fx = flying ? flyTool.x : 0, fy = flying ? flyTool.y : 0;
+  const fv = flying ? (flyTool.up ? 1 : 0) - (flyTool.down ? 1 : 0) : 0;
   if (mx === 0 && my === 0 && fx === 0 && fy === 0 && fv === 0) return;
   const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
   const forward = new THREE.Vector3();

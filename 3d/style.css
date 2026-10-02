@@ -385,6 +385,7 @@ html, body {
 .zoom-control .fly-toggle { border-top: 1px solid var(--hud-line); font-size: 17px; }
 .zoom-control .fly-toggle.on { background: var(--accent); }
 .fly-left, .fly-right {
+  pointer-events: none; /* the gaps between the controls let touches through to the scene */
   position: fixed;
   bottom: 84px; /* re-set from app.js (layoutFlyUi) to clear whatever is open along the bottom edge */
   z-index: 17;
@@ -449,7 +450,27 @@ html, body {
   touch-action: none;
 }
 .fly-vbtn b { font-size: 18px; line-height: 1; }
+.fly-stick, .fly-speed, .fly-vbtn { pointer-events: auto; }
 .fly-stick.held, .fly-vbtn.held { background: rgba(131, 56, 236, 0.55); }
+
+/* ---------- TEMPORARY touch debug line ---------- */
+.touch-debug {
+  position: fixed;
+  top: max(4px, env(safe-area-inset-top));
+  left: 74px;   /* between the "← 2D" link and the scale bar */
+  right: 124px;
+  z-index: 30;
+  padding: 3px 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(57, 255, 122, 0.5);
+  color: #39ff7a;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.3;
+  text-align: center;
+  white-space: normal;
+}
 
 /* ---------- "Просторова лінія" — own corner button, not in the toolbar ---------- */
 .fab {
