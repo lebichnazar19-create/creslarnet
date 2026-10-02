@@ -30,6 +30,26 @@
   <a href="../index.html" class="back-link" title="Повернутись до 2D-режиму">← 2D</a>
   <button id="resetViewBtn" class="back-link reset-view-btn" title="Скинути камеру до початкового вигляду">⌂ Початковий вигляд</button>
 
+  <!-- "Камера" settings: field-of-view slider + look sensitivity, folded
+       away behind this one button until asked for — see app.js. -->
+  <button id="camSettingsBtn" class="back-link cam-settings-btn" title="Налаштування камери: кут огляду і чутливість повороту">🎥 Камера</button>
+  <div id="camSettingsPanel" class="cam-settings-panel hidden">
+    <div class="cam-settings-head">
+      <span>Камера</span>
+      <button id="camSettingsClose" title="Сховати">✕</button>
+    </div>
+    <label class="cam-row">
+      <span>Кут огляду</span>
+      <input type="range" id="fovSlider" min="60" max="120" step="1" value="60">
+      <output id="fovValue">60°</output>
+    </label>
+    <label class="cam-row">
+      <span>Чутливість повороту</span>
+      <input type="range" id="lookSensSlider" min="20" max="300" step="5" value="100">
+      <output id="lookSensValue">100%</output>
+    </label>
+  </div>
+
   <div id="crosshair" class="crosshair hidden" aria-hidden="true">
     <svg viewBox="0 0 24 24"><path d="M12 4v6M12 14v6M4 12h6M14 12h6"/></svg>
   </div>

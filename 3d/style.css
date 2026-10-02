@@ -52,6 +52,68 @@ html, body {
   cursor: pointer;
 }
 
+/* ---------- "Камера" settings: button + fold-away panel ---------- */
+.cam-settings-btn {
+  top: calc(max(10px, env(safe-area-inset-top)) + 80px);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.cam-settings-btn.on { background: var(--accent); border-color: var(--accent); }
+.cam-settings-panel {
+  position: fixed;
+  top: calc(max(10px, env(safe-area-inset-top)) + 120px);
+  left: 10px;
+  z-index: 22;
+  width: min(250px, calc(100vw - 20px));
+  background: var(--hud-bg-solid);
+  border: 1px solid var(--hud-line);
+  border-radius: 12px;
+  padding: 8px 10px 10px;
+  box-shadow: 0 12px 32px -10px rgba(0, 0, 0, 0.55);
+}
+.cam-settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--hud-text-muted);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.cam-settings-head button {
+  border: none;
+  background: none;
+  color: var(--hud-text-muted);
+  font-size: 14px;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.cam-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  column-gap: 8px;
+  font-size: 12.5px;
+  margin-top: 6px;
+}
+.cam-row span { grid-column: 1; }
+.cam-row output {
+  grid-column: 2;
+  grid-row: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--hud-text-muted);
+}
+.cam-row input[type="range"] {
+  grid-column: 1 / -1;
+  width: 100%;
+  accent-color: var(--accent);
+  margin: 4px 0 0;
+}
+
 /* ---------- bottom toolbar ---------- */
 .toolbar {
   position: fixed;

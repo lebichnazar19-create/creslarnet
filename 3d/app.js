@@ -154,7 +154,15 @@ scene.environment = null;
 // to whatever's actually ahead of the camera — a fixed pair can't cover
 // "2 mm from a bolt" and "80 m across a plot" at once even with a
 // logarithmic depth buffer.
-const DEFAULT_FOV = 60, MIN_FOV = 32, MAX_FOV = 100;
+const DEFAULT_FOV = 60, MIN_FOV = 32, MAX_FOV = 120;
+// The user's own choices from the "Камера" settings panel (see its section
+// further down, next to the rest of the camera navigation code):
+//   preferredFov    — the angle every "back to normal" path returns to
+//                     (reset view, leaving a room) instead of a hardcoded 60°.
+//   lookSensitivity — multiplier on how far a look-drag turns the view.
+let preferredFov = DEFAULT_FOV;
+let lookSensitivity = 1;
+let onFovChanged = null; // set by the settings panel so its slider follows pinch-zoom too
 const camera = new THREE.PerspectiveCamera(DEFAULT_FOV, window.innerWidth / window.innerHeight, 1, 1000000);
 camera.rotation.order = 'YXZ';
 const INITIAL_CAMERA_POS = new THREE.Vector3(6000, 5000, 9000);
@@ -166,6 +174,7 @@ camera.position.copy(INITIAL_CAMERA_POS);
 function setFov(fov) {
   camera.fov = Math.max(MIN_FOV, Math.min(MAX_FOV, fov));
   camera.updateProjectionMatrix();
+  if (onFovChanged) onFovChanged(camera.fov);
 }
 
 const hemi = new THREE.HemisphereLight(0xffffff, 0x8a7a63, 0.9);
@@ -269,7 +278,7 @@ camera.rotation.set(pitch, yaw, 0, 'YXZ');
 function resetView() {
   camera.position.copy(INITIAL_CAMERA_POS);
   faceDirection(new THREE.Vector3(0, 1000, 0).sub(INITIAL_CAMERA_POS).normalize());
-  setFov(DEFAULT_FOV);
+  setFov(preferredFov);
   toast('Вигляд скинуто');
 }
 
@@ -716,8 +725,9 @@ function viewRoomInside(roomId) {
   faceDirection(new THREE.Vector3(0, 0, -1));
   // Wider than the default FOV — standing at the centre of a small room is
   // only a metre or two from any wall, and the default angle crops it. The
-  // +/- zoom control (setFov) still works from here for further adjustment.
-  setFov(78);
+  // The "Камера" panel's own slider still works from here for further
+  // adjustment — and if the user already picked something wider, keep that.
+  setFov(Math.max(78, preferredFov));
 }
 
 function viewRoomOutside(roomId) {
@@ -729,7 +739,7 @@ function viewRoomOutside(roomId) {
   camera.position.set(c.x + offset.x, c.y + offset.y, c.z + offset.z);
   const lookAt = new THREE.Vector3(c.x, c.y + p.height / 2, c.z);
   faceDirection(lookAt.sub(camera.position).normalize());
-  setFov(DEFAULT_FOV);
+  setFov(preferredFov);
 }
 
 // Tears down every part of a room (including any tiles/grout placed on its
@@ -4437,6 +4447,73 @@ function wireZoomButton(btn, stepSign) {
 wireZoomButton(document.getElementById('zoomInBtn'), 1);   // dolly forward — closer
 wireZoomButton(document.getElementById('zoomOutBtn'), -1); // dolly backward — see more (e.g. a whole nearby wall)
 
+// ---------------------------------------------------------------------------
+// "Камера" settings — a small panel that stays folded away behind its own
+// corner button until asked for:
+//   - "Кут огляду" 60–120°: camera.fov directly (vertical field of view), so
+//     a whole wall fits in view from inside a small room without having to
+//     back away from it. The slider follows pinch-zoom too (onFovChanged),
+//     so it never shows a stale number.
+//   - "Чутливість повороту": how far the view turns per pixel of look-drag,
+//     as a percentage of the default — independent of the angle above.
+// Both are remembered on this device between sessions.
+// ---------------------------------------------------------------------------
+const CAMERA_SETTINGS_KEY = 'creslarnet-3d-camera-settings';
+const FOV_SLIDER_MIN = 60, FOV_SLIDER_MAX = 120;
+const LOOK_SENS_MIN = 0.2, LOOK_SENS_MAX = 3;
+const camSettingsBtn = document.getElementById('camSettingsBtn');
+const camSettingsPanelEl = document.getElementById('camSettingsPanel');
+const fovSliderEl = document.getElementById('fovSlider');
+const fovValueEl = document.getElementById('fovValue');
+const lookSensSliderEl = document.getElementById('lookSensSlider');
+const lookSensValueEl = document.getElementById('lookSensValue');
+
+function saveCameraSettings() {
+  try {
+    localStorage.setItem(CAMERA_SETTINGS_KEY, JSON.stringify({ fov: preferredFov, lookSensitivity }));
+  } catch (err) { /* private mode / storage full — the setting still applies for this session */ }
+}
+
+function loadCameraSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CAMERA_SETTINGS_KEY) || 'null');
+    if (!saved) return;
+    if (Number.isFinite(saved.fov)) preferredFov = Math.max(FOV_SLIDER_MIN, Math.min(FOV_SLIDER_MAX, saved.fov));
+    if (Number.isFinite(saved.lookSensitivity)) lookSensitivity = Math.max(LOOK_SENS_MIN, Math.min(LOOK_SENS_MAX, saved.lookSensitivity));
+  } catch (err) { /* corrupt entry — fall back to the defaults */ }
+}
+
+onFovChanged = (fov) => {
+  // Pinch-zoom can go narrower than the slider's own 60° floor — the slider
+  // just rests at its end then, while the readout still shows the real angle.
+  fovSliderEl.value = String(Math.round(Math.max(FOV_SLIDER_MIN, Math.min(FOV_SLIDER_MAX, fov))));
+  fovValueEl.textContent = `${Math.round(fov)}°`;
+};
+
+fovSliderEl.addEventListener('input', () => {
+  preferredFov = Number(fovSliderEl.value);
+  setFov(preferredFov);
+  saveCameraSettings();
+});
+lookSensSliderEl.addEventListener('input', () => {
+  lookSensitivity = Number(lookSensSliderEl.value) / 100;
+  lookSensValueEl.textContent = `${lookSensSliderEl.value}%`;
+  saveCameraSettings();
+});
+camSettingsBtn.addEventListener('click', () => {
+  const open = camSettingsPanelEl.classList.toggle('hidden') === false;
+  camSettingsBtn.classList.toggle('on', open);
+});
+document.getElementById('camSettingsClose').addEventListener('click', () => {
+  camSettingsPanelEl.classList.add('hidden');
+  camSettingsBtn.classList.remove('on');
+});
+
+loadCameraSettings();
+lookSensSliderEl.value = String(Math.round(lookSensitivity * 100));
+lookSensValueEl.textContent = `${lookSensSliderEl.value}%`;
+setFov(preferredFov);
+
 // "Просторова лінія" gets its own corner button (not buried in the
 // scrollable bottom toolbar) — one tap starts it, tap again to cancel.
 const spatialLineFabBtn = document.getElementById('spatialLineFab');
@@ -4617,7 +4694,7 @@ function handleFreeLook(e) {
   smoothLookDx = smoothLookDx * DELTA_SMOOTHING + rawDx * (1 - DELTA_SMOOTHING);
   smoothLookDy = smoothLookDy * DELTA_SMOOTHING + rawDy * (1 - DELTA_SMOOTHING);
   const dx = smoothLookDx, dy = smoothLookDy;
-  const sens = 0.002;
+  const sens = 0.002 * lookSensitivity;
   if (autoRotateActive) setAutoRotate(false); // any manual look takes control back
   if (orbitActive) {
     // Same drag gesture, driving orbit angles around the pivot instead of
