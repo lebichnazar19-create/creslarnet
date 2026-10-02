@@ -477,6 +477,7 @@ function removeObject(record) {
     objects.filter((r) => r.kind === 'sketchLine' && r.paperId === record.id).forEach(removeObject);
   }
   scene.remove(record.root);
+  record.pointUndo?.forEach((g) => g.dispose());
   record.root.traverse((o) => {
     if (o.isMesh) {
       const idx = raycastTargets.indexOf(o);
@@ -2469,6 +2470,8 @@ function select(record) {
     gizmoRotateTargets = built.rotateTargets;
     record.root.add(gizmo); // child — tracks position/rotation/scale for free
   }
+  attachVertexHandles(record); // draggable vertex dots — only for the kinds canVertexEdit allows
+
   closePopover();
   renderSelectionPanel();
 }
@@ -2481,6 +2484,7 @@ function deselect() {
     outlineHelper = null;
   }
   removeGizmo();
+  if (contour) { clearContourVisual(); contour = null; }
   hideDimensionOverlay();
   selected = null;
   holeToolActive = false;
@@ -2635,6 +2639,7 @@ function buildGizmo(record) {
 }
 
 function removeGizmo() {
+  removeVertexHandles(); // every tool that hides the arrows wants the vertex dots gone too
   if (!gizmo) return;
   gizmo.parent?.remove(gizmo);
   gizmo.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
@@ -3545,6 +3550,477 @@ function renderSculptPill() {
 }
 
 // ---------------------------------------------------------------------------
+// "Редагування точками" — two things on a selected single-mesh object:
+//
+//   1. Its vertices are shown as yellow dots, and each one can be dragged:
+//      the object stretches or narrows around it. Coincident vertices (a
+//      cube's corner is three of them, one per face) always move together,
+//      and nearby ones follow with a smooth falloff, so a dense shape
+//      (cylinder, sphere) bulges as a whole instead of growing a one-vertex
+//      spike. A dense mesh shows an evenly spread selection of its vertices
+//      rather than hundreds of dots.
+//
+//   2. "Точки й контур": tap the surface to place your own points (or one
+//      tap for a whole circle of points), then "Вирізати" — either a hole
+//      inside the outline, or cut away everything outside it. The outline
+//      is pushed straight through the object along the surface normal and
+//      cut with the same CSG used by the hole/window tools.
+//
+// Every change keeps the previous geometry on the object's own short undo
+// stack ("↶ Форма" in its panel).
+// ---------------------------------------------------------------------------
+const VERTEX_HANDLE_MAX = 64;   // dots shown at most — beyond that, an evenly spread subset
+const VERTEX_PICK_PX = 20;      // how close a touch must be to a dot to grab it
+const VERTEX_PICK_TIGHT_PX = 10; // ...when a move/rotate arrow is under the same touch: only a touch right on the dot takes it from the arrow
+const VERTEX_MIN_SCREEN_PX = 90; // an object smaller than this on screen hides its dots — too crowded to pick, and they'd bury the arrows
+const VERTEX_FALLOFF = 0.35;    // influence radius as a fraction of the object's own diagonal (a cube's nearest other corner is 0.58 away — untouched)
+const POINT_UNDO_MAX = 8;
+const NO_VERTEX_EDIT_KINDS = new Set(['ground', 'paper', 'sketchLine', 'tile', 'tileGrout']);
+let vertexHandles = null; // { record, points, handles: [Vector3 local], radius }
+let vertexDrag = null;    // { index, plane, startLocal, before, weights, handleStart, handleWeights, moved }
+
+function canVertexEdit(record) {
+  if (!record || !record.root.isMesh || record.roomId || NO_VERTEX_EDIT_KINDS.has(record.kind)) return false;
+  const pos = record.root.geometry.attributes.position;
+  return !!pos && pos.count > 0 && pos.count <= 150000;
+}
+
+// One entry per distinct vertex POSITION — a box has 24 vertices (each
+// corner once per face, for flat shading) but 8 corners.
+function collectUniqueVertices(geom) {
+  const pos = geom.attributes.position;
+  const seen = new Set();
+  const list = [];
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const key = `${Math.round(x * 100)}_${Math.round(y * 100)}_${Math.round(z * 100)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    list.push(new THREE.Vector3(x, y, z));
+  }
+  return list;
+}
+
+// At most VERTEX_HANDLE_MAX of them, spread as evenly as possible over the
+// shape (farthest-point sampling: each next dot is the vertex furthest from
+// every dot chosen so far).
+function pickHandlePoints(unique) {
+  if (unique.length <= VERTEX_HANDLE_MAX) return unique;
+  let cur = 0, bestScore = -Infinity;
+  unique.forEach((p, i) => { const s = p.x + p.y * 1.3 + p.z * 1.7; if (s > bestScore) { bestScore = s; cur = i; } });
+  const nearest = new Float64Array(unique.length).fill(Infinity);
+  const chosen = [];
+  for (let k = 0; k < VERTEX_HANDLE_MAX; k++) {
+    chosen.push(unique[cur]);
+    let far = cur, farD = -1;
+    for (let i = 0; i < unique.length; i++) {
+      const dd = unique[i].distanceToSquared(unique[cur]);
+      if (dd < nearest[i]) nearest[i] = dd;
+      if (nearest[i] > farD) { farD = nearest[i]; far = i; }
+    }
+    cur = far;
+  }
+  return chosen;
+}
+
+function removeVertexHandles() {
+  if (!vertexHandles) return;
+  vertexHandles.points.parent?.remove(vertexHandles.points);
+  vertexHandles.points.geometry.dispose();
+  vertexHandles.points.material.dispose();
+  vertexHandles = null;
+  vertexDrag = null;
+}
+
+function attachVertexHandles(record) {
+  removeVertexHandles();
+  if (!canVertexEdit(record)) return;
+  const geom = record.root.geometry;
+  const handles = pickHandlePoints(collectUniqueVertices(geom)).map((p) => p.clone());
+  if (!handles.length) return;
+  const points = new THREE.Points(
+    new THREE.BufferGeometry().setFromPoints(handles),
+    new THREE.PointsMaterial({ color: 0xffd60a, size: 10, sizeAttenuation: false, depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 }),
+  );
+  points.renderOrder = 1001;
+  points.frustumCulled = false;
+  points.userData.isHelper = true;
+  points.raycast = () => {}; // picked in screen space (pickVertexHandle), never by a scene raycast
+  record.root.add(points); // child — follows the object's own move/turn/resize for free
+  if (!geom.boundingBox) geom.computeBoundingBox();
+  const radius = geom.boundingBox.getSize(new THREE.Vector3()).length() * VERTEX_FALLOFF;
+  vertexHandles = { record, points, handles, radius };
+  scene.updateMatrixWorld(true);
+  updateVertexHandleVisibility();
+}
+
+// Vertex dots are only live in plain "object selected" state — never while
+// some other tool owns the touch.
+function vertexEditAllowed() {
+  return mode === 'edit' && !!selected && !!vertexHandles && vertexHandles.record === selected
+    && !moveMode && !holeToolActive && !paperDrawing && !tileToolActive && !groupSelectMode && !wallDrawing
+    && !windowToolActive && !placingKind && !placingLibraryEntry && !slTool.active && !slTool.attach.picking;
+}
+
+// Which dot (index into vertexHandles.handles) a touch landed on, or -1.
+// Screen-space, like the "Жила" gizmo: the dots draw over everything, so
+// what matters is what's under the finger. Two dots nearly on top of each
+// other on screen → the one nearer the camera.
+function pickVertexHandle(clientX, clientY, maxPx = VERTEX_PICK_PX) {
+  if (!vertexHandles || !vertexHandles.points.visible) return -1;
+  scene.updateMatrixWorld(true);
+  const root = vertexHandles.record.root;
+  const w = new THREE.Vector3();
+  let best = -1, bestD = Infinity, bestCam = Infinity;
+  vertexHandles.handles.forEach((h, i) => {
+    w.copy(h).applyMatrix4(root.matrixWorld);
+    const ndc = w.clone().project(camera);
+    if (ndc.z < -1 || ndc.z > 1) return;
+    const s = projectToScreenPx(w);
+    const d = Math.hypot(clientX - s.x, clientY - s.y);
+    if (d > maxPx) return;
+    const cam = camera.position.distanceToSquared(w);
+    if (d < bestD - 6 || (Math.abs(d - bestD) <= 6 && cam < bestCam)) { best = i; bestD = d; bestCam = cam; }
+  });
+  return best;
+}
+
+// Dots only while the object is big enough on screen for them to be told
+// apart (and for the move/rotate arrows not to be buried under them) —
+// seen from far away an object is just its arrows; come closer and its
+// vertices appear. Called every edit-mode frame.
+function updateVertexHandleVisibility() {
+  if (!vertexHandles || vertexDrag) return;
+  const root = vertexHandles.record.root;
+  const w = new THREE.Vector3();
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, anyInFront = false;
+  for (const h of vertexHandles.handles) {
+    w.copy(h).applyMatrix4(root.matrixWorld);
+    const s = slProjectToScreen(w);
+    if (s.behind) continue;
+    anyInFront = true;
+    if (s.x < minX) minX = s.x;
+    if (s.x > maxX) maxX = s.x;
+    if (s.y < minY) minY = s.y;
+    if (s.y > maxY) maxY = s.y;
+  }
+  vertexHandles.points.visible = anyInFront && Math.max(maxX - minX, maxY - minY) >= VERTEX_MIN_SCREEN_PX;
+}
+
+// 1 on the dragged point itself, easing to 0 at the influence radius.
+function vertexFalloff(dist, radius) {
+  if (dist < 1e-6) return 1;
+  if (dist >= radius) return 0;
+  const t = 1 - (dist / radius) * (dist / radius);
+  return t * t;
+}
+
+function beginVertexDrag(index) {
+  const h = vertexHandles;
+  const root = h.record.root, geom = root.geometry, pos = geom.attributes.position;
+  scene.updateMatrixWorld(true);
+  const startLocal = h.handles[index].clone();
+  // The finger moves the vertex in the plane facing the camera, through
+  // where the vertex is now — what you see is what moves.
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new THREE.Vector3()), root.localToWorld(startLocal.clone()));
+  const weights = new Float32Array(pos.count);
+  const v = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) weights[i] = vertexFalloff(v.fromBufferAttribute(pos, i).distanceTo(startLocal), h.radius);
+  vertexDrag = {
+    index, plane, startLocal, weights,
+    before: geom.clone(), // goes on the undo stack if the drag actually changes anything
+    start: new Float32Array(pos.array),
+    handleStart: h.handles.map((p) => p.clone()),
+    handleWeights: h.handles.map((p) => vertexFalloff(p.distanceTo(startLocal), h.radius)),
+    moved: false,
+  };
+  if (outlineHelper) outlineHelper.visible = false; // it traces the shape as it was — back (rebuilt) when the drag ends
+}
+
+function updateVertexDrag(clientX, clientY) {
+  const g = vertexDrag, h = vertexHandles;
+  const root = h.record.root, geom = root.geometry, pos = geom.attributes.position;
+  const hit = new THREE.Vector3();
+  if (!rayFromClient(clientX, clientY).ray.intersectPlane(g.plane, hit)) return;
+  const delta = root.worldToLocal(hit).sub(g.startLocal);
+  delta.set(roundMm(delta.x), roundMm(delta.y), roundMm(delta.z));
+  for (let i = 0; i < pos.count; i++) {
+    const w = g.weights[i];
+    if (w === 0) continue;
+    pos.setXYZ(i, g.start[i * 3] + delta.x * w, g.start[i * 3 + 1] + delta.y * w, g.start[i * 3 + 2] + delta.z * w);
+  }
+  pos.needsUpdate = true;
+  const dots = h.points.geometry.attributes.position;
+  h.handles.forEach((p, i) => {
+    p.copy(g.handleStart[i]).addScaledVector(delta, g.handleWeights[i]);
+    dots.setXYZ(i, p.x, p.y, p.z);
+  });
+  dots.needsUpdate = true;
+  geom.computeBoundingSphere(); // raycasts (selection, look-distance) cull by it
+  g.moved = g.moved || delta.lengthSq() > 0;
+}
+
+function endVertexDrag(cancelled) {
+  const g = vertexDrag, h = vertexHandles;
+  vertexDrag = null;
+  if (!g || !h) return;
+  const record = h.record, geom = record.root.geometry, pos = geom.attributes.position;
+  if (cancelled || !g.moved) {
+    pos.array.set(g.start);
+    pos.needsUpdate = true;
+    geom.computeBoundingSphere();
+    g.before.dispose();
+    if (outlineHelper) outlineHelper.visible = true;
+    h.handles.forEach((p, i) => p.copy(g.handleStart[i]));
+    h.points.geometry.setFromPoints(h.handles);
+    return;
+  }
+  pushPointUndo(record, g.before);
+  finishGeometryEdit(record, true);
+}
+
+function pushPointUndo(record, geometryBefore) {
+  record.pointUndo = record.pointUndo || [];
+  record.pointUndo.push(geometryBefore);
+  while (record.pointUndo.length > POINT_UNDO_MAX) record.pointUndo.shift().dispose();
+}
+
+function undoPointEdit(record) {
+  const prev = record.pointUndo && record.pointUndo.pop();
+  if (!prev) return;
+  record.root.geometry.dispose();
+  record.root.geometry = prev;
+  reselectKeepingPanel(record);
+  toast('Повернуто попередню форму');
+}
+
+// select() builds the outline, the gizmo and the vertex dots from the
+// geometry as it is at that moment — after the geometry changes, selecting
+// again is what brings all three back in line with it. The panel stays as
+// open or folded as the user had it.
+function reselectKeepingPanel(record) {
+  const collapsed = selectionPanelCollapsed;
+  deselect();
+  select(record);
+  selectionPanelCollapsed = collapsed;
+  renderSelectionPanel();
+}
+
+// Common tail of every hand edit of a mesh's own vertices (vertex drag,
+// contour cut). `geometry.parameters` is dropped for the same reason as in
+// applySculptAt: with it present, save writes only "a box W×H×D" and the
+// edit silently vanishes on load.
+function finishGeometryEdit(record, recomputeNormals) {
+  const geom = record.root.geometry;
+  delete geom.parameters;
+  record.sculpted = true; // no longer its textbook shape — outline from real edges, see select()
+  if (recomputeNormals) geom.computeVertexNormals();
+  geom.computeBoundingBox();
+  geom.computeBoundingSphere();
+  reselectKeepingPanel(record);
+}
+
+// ----- own points on the surface + "Вирізати" -----
+const CONTOUR_CIRCLE_POINTS = 24;
+const NO_CONTOUR_KINDS = new Set(['ground', 'paper', 'sketchLine']);
+let contour = null; // { record, points: [{ local, normal }], circleArmed, choosing, dots, loop }
+let contourCircleRadius = 100; // mm
+
+function canContourCut(record) {
+  return !!record && record.root.isMesh && !NO_CONTOUR_KINDS.has(record.kind);
+}
+
+// With something selected a two-finger pinch normally resizes it — not
+// while placing contour points on it, where the same gesture must stay
+// plain camera navigation.
+function pinchResizesSelection() {
+  return !!selected && !contour;
+}
+
+function anyPerpendicular(n) {
+  const ref = Math.abs(n.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+  return new THREE.Vector3().crossVectors(ref, n).normalize();
+}
+
+function enterContourMode(record) {
+  contour = { record, points: [], circleArmed: false, choosing: false, dots: null, loop: null };
+  hideEl(selectionPanelEl);
+  removeGizmo(); // arrows, rings and vertex dots would all sit right where the points go
+  renderContourPill();
+  toast('Торкайтесь поверхні об’єкта — ставте точки контуру');
+}
+
+function clearContourVisual() {
+  if (!contour) return;
+  for (const key of ['dots', 'loop']) {
+    const o = contour[key];
+    if (!o) continue;
+    o.parent?.remove(o);
+    o.geometry.dispose();
+    o.material.dispose();
+    contour[key] = null;
+  }
+}
+
+function refreshContourVisual() {
+  clearContourVisual();
+  if (!contour || !contour.points.length) return;
+  scene.updateMatrixWorld(true);
+  const root = contour.record.root;
+  const world = contour.points.map((p) => root.localToWorld(p.local.clone()));
+  const dots = new THREE.Points(
+    new THREE.BufferGeometry().setFromPoints(world),
+    new THREE.PointsMaterial({ color: 0x39ff7a, size: 11, sizeAttenuation: false, depthTest: false, depthWrite: false, transparent: true }),
+  );
+  dots.renderOrder = 1001; dots.frustumCulled = false; dots.raycast = () => {};
+  scene.add(dots);
+  contour.dots = dots;
+  if (world.length >= 2) {
+    const mat = new THREE.LineBasicMaterial({ color: 0x39ff7a, depthTest: false, depthWrite: false, transparent: true });
+    const geom = new THREE.BufferGeometry().setFromPoints(world);
+    const loop = world.length >= 3 ? new THREE.LineLoop(geom, mat) : new THREE.Line(geom, mat);
+    loop.renderOrder = 1000; loop.frustumCulled = false; loop.raycast = () => {};
+    scene.add(loop);
+    contour.loop = loop;
+  }
+}
+
+function exitContourMode() {
+  const record = contour ? contour.record : null;
+  clearContourVisual();
+  contour = null;
+  hideEl(modePillEl);
+  // Same reselect-to-rebuild pattern as exitBendMode/exitSculptMode.
+  if (record && objects.includes(record)) { deselect(); select(record); }
+}
+
+// A tap while the contour tool is on: a point on the object's surface, or —
+// with "Коло" armed — the centre of a whole circle of points lying in the
+// surface's own plane at that spot.
+function contourTap(clientX, clientY) {
+  const root = contour.record.root;
+  const hits = rayFromClient(clientX, clientY).intersectObject(root, false);
+  if (!hits.length) { toast('Торкніться поверхні самого об’єкта'); return; }
+  const hit = hits[0];
+  const normalLocal = hit.face.normal.clone();
+  if (contour.circleArmed) {
+    const n = normalLocal.clone().transformDirection(root.matrixWorld).normalize();
+    const u = anyPerpendicular(n), v = new THREE.Vector3().crossVectors(n, u);
+    contour.points = [];
+    for (let i = 0; i < CONTOUR_CIRCLE_POINTS; i++) {
+      const a = (i / CONTOUR_CIRCLE_POINTS) * Math.PI * 2;
+      const world = hit.point.clone().addScaledVector(u, Math.cos(a) * contourCircleRadius).addScaledVector(v, Math.sin(a) * contourCircleRadius);
+      contour.points.push({ local: root.worldToLocal(world), normal: normalLocal.clone() });
+    }
+    contour.circleArmed = false;
+  } else {
+    contour.points.push({ local: root.worldToLocal(hit.point.clone()), normal: normalLocal });
+  }
+  contour.choosing = false;
+  refreshContourVisual();
+  renderContourPill();
+}
+
+function renderContourPill() {
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  const add = (text, onClick, cls) => {
+    const b = document.createElement('button');
+    b.textContent = text;
+    if (cls) b.className = cls;
+    b.addEventListener('click', onClick);
+    modePillEl.appendChild(b);
+    return b;
+  };
+  if (contour.choosing) {
+    label.textContent = 'Що вирізати?';
+    modePillEl.appendChild(label);
+    add('🕳 Дірка всередині контуру', () => cutByContour('hole'));
+    add('✂ Відрізати все поза контуром', () => cutByContour('outside'));
+    add('← Назад', () => { contour.choosing = false; renderContourPill(); }, 'ghost');
+    showEl(modePillEl);
+    return;
+  }
+  const n = contour.points.length;
+  label.textContent = contour.circleArmed
+    ? 'Торкніться поверхні — там буде центр кола'
+    : `Контур: ${n} ${n === 1 ? 'точка' : 'точок'} — торкайтесь поверхні об’єкта`;
+  modePillEl.appendChild(label);
+  add('◯ Коло', () => { contour.circleArmed = !contour.circleArmed; renderContourPill(); }, contour.circleArmed ? 'on' : '');
+  modePillEl.appendChild(pillNumberField('R', contourCircleRadius, 'мм', { min: 1, max: 20000 }, (v) => { contourCircleRadius = v; }));
+  if (n) {
+    add('⌫ Точка', () => { contour.points.pop(); refreshContourVisual(); renderContourPill(); });
+    add('Очистити', () => { contour.points = []; refreshContourVisual(); renderContourPill(); }, 'ghost');
+  }
+  if (n >= 3) add('✂ Вирізати', () => { contour.choosing = true; renderContourPill(); });
+  add('✓ Готово', exitContourMode, 'ghost');
+  showEl(modePillEl);
+}
+
+// Do segments (a,b) and (c,d) properly cross? (2D, shared endpoints don't count.)
+function segmentsCross2D(a, b, c, d) {
+  const o = (p, q, r) => Math.sign((q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x));
+  return o(a, b, c) * o(a, b, d) < 0 && o(c, d, a) * o(c, d, b) < 0;
+}
+
+// The outline's points, flattened onto the plane the surface faces, as a
+// prism long enough to pass through the whole object — then one boolean:
+// subtract it (a hole inside the outline) or intersect with it (only what's
+// inside the outline survives — everything outside is cut away).
+function cutByContour(kind) {
+  const record = contour.record, root = record.root;
+  scene.updateMatrixWorld(true);
+  const world = contour.points.map((p) => root.localToWorld(p.local.clone()));
+  const normal = new THREE.Vector3();
+  for (const p of contour.points) normal.add(p.normal.clone().transformDirection(root.matrixWorld));
+  if (normal.lengthSq() < 1e-8) normal.copy(contour.points[0].normal).transformDirection(root.matrixWorld);
+  normal.normalize();
+  const centre = world.reduce((acc, p) => acc.add(p), new THREE.Vector3()).multiplyScalar(1 / world.length);
+  const u = anyPerpendicular(normal), v = new THREE.Vector3().crossVectors(normal, u); // u × v = normal
+  const flat = world.map((p) => { const d = p.clone().sub(centre); return new THREE.Vector2(d.dot(u), d.dot(v)); });
+
+  if (Math.abs(THREE.ShapeUtils.area(flat)) < 1) { toast('Контур замалий — розставте точки ширше'); return; }
+  for (let i = 0; i < flat.length; i++) {
+    for (let j = i + 2; j < flat.length; j++) {
+      if (i === 0 && j === flat.length - 1) continue; // neighbours across the closing edge
+      if (segmentsCross2D(flat[i], flat[(i + 1) % flat.length], flat[j], flat[(j + 1) % flat.length])) {
+        toast('Контур перетинає сам себе — ставте точки по колу, одну за одною');
+        return;
+      }
+    }
+  }
+  if (THREE.ShapeUtils.isClockWise(flat)) flat.reverse();
+
+  root.geometry.computeBoundingSphere();
+  const maxScale = Math.max(Math.abs(root.scale.x), Math.abs(root.scale.y), Math.abs(root.scale.z));
+  const reach = (root.geometry.boundingSphere?.radius || 500) * maxScale * 2.5 + 200;
+  const prismGeom = new THREE.ExtrudeGeometry(new THREE.Shape(flat), { depth: reach * 2, bevelEnabled: false, steps: 1, curveSegments: 1 });
+  prismGeom.translate(0, 0, -reach); // centred on the surface: through the object both ways
+  const prism = new THREE.Mesh(prismGeom);
+  prism.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(u, v, normal));
+  prism.position.copy(centre);
+  prism.updateMatrixWorld(true);
+
+  let result = null;
+  try {
+    result = kind === 'hole' ? CSG.subtract(root, prism) : CSG.intersect(root, prism);
+    if (!result.attributes.position.count) throw new Error('empty result');
+  } catch (e) {
+    result = null;
+  }
+  prismGeom.dispose();
+  if (!result) { toast('Не вдалося вирізати цим контуром — спробуйте інші точки'); return; }
+
+  pushPointUndo(record, root.geometry); // the old geometry lives on in the undo stack, not disposed
+  root.geometry = result;
+  clearContourVisual();
+  contour = null;
+  hideEl(modePillEl);
+  finishGeometryEdit(record, false); // CSG output already carries correct normals
+  toast(kind === 'hole' ? 'Дірку вирізано — «↶ Форма» в панелі поверне як було' : 'Усе поза контуром відрізано — «↶ Форма» в панелі поверне як було', 3600);
+}
+
+// ---------------------------------------------------------------------------
 // Selection panel rendering
 // ---------------------------------------------------------------------------
 const selectionPanelEl = document.getElementById('selectionPanel');
@@ -3770,6 +4246,13 @@ function renderSelectionPanel() {
   bodyEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
   bodyEl.appendChild(materialSwatchRow(applyMaterialToSelected));
 
+  if (canVertexEdit(selected)) {
+    const vertexHint = document.createElement('p');
+    vertexHint.className = 'dim-readout';
+    vertexHint.textContent = 'Жовті точки на об’єкті — вершини: тягніть будь-яку, щоб розтягнути чи звузити форму.';
+    bodyEl.appendChild(vertexHint);
+  }
+
   const actions = document.createElement('div');
   actions.className = 'panel-row';
 
@@ -3796,6 +4279,21 @@ function renderSelectionPanel() {
     drawBtn.className = 'pbtn'; drawBtn.textContent = '✎ Малювати лінії';
     drawBtn.addEventListener('click', enterPaperDrawMode);
     actions.appendChild(drawBtn);
+  }
+
+  if (canContourCut(selected)) {
+    const contourBtn = document.createElement('button');
+    contourBtn.className = 'pbtn'; contourBtn.textContent = '✎ Точки й контур';
+    contourBtn.title = 'Поставити свої точки (або коло з точок) на поверхні й вирізати по них';
+    contourBtn.addEventListener('click', () => enterContourMode(selected));
+    actions.appendChild(contourBtn);
+  }
+  if (selected.pointUndo && selected.pointUndo.length) {
+    const undoShapeBtn = document.createElement('button');
+    undoShapeBtn.className = 'pbtn'; undoShapeBtn.textContent = `↶ Форма (${selected.pointUndo.length})`;
+    undoShapeBtn.title = 'Повернути форму, якою вона була до останньої зміни точками';
+    undoShapeBtn.addEventListener('click', () => undoPointEdit(selected));
+    actions.appendChild(undoShapeBtn);
   }
 
   if (selected.root.isMesh) {
@@ -4393,7 +4891,12 @@ canvas.addEventListener('pointerdown', (e) => {
     const gizmoHit = mode === 'edit' && selected && gizmo
       ? rayFromClient(e.clientX, e.clientY).intersectObjects(gizmoMoveTargets.concat(gizmoRotateTargets), false)
       : [];
-    if (gizmoHit.length) {
+    // A touch right on a vertex dot takes it even with an arrow underneath;
+    // a touch merely near one leaves the arrow its drag.
+    const vertexHit = vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY, gizmoHit.length ? VERTEX_PICK_TIGHT_PX : VERTEX_PICK_PX) : -1;
+    if (vertexHit >= 0) {
+      beginVertexDrag(vertexHit);
+    } else if (gizmoHit.length) {
       const hitMesh = gizmoHit[0].object;
       const axisLetter = hitMesh.userData.gizmoAxis;
       if (gizmoMoveTargets.includes(hitMesh)) {
@@ -4442,7 +4945,7 @@ canvas.addEventListener('pointerdown', (e) => {
     } else if (!moveMode && !paperDrawing) {
       startLookDrag(e.pointerId, e.clientX, e.clientY);
     }
-  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag) {
     pinchStartDist = currentPinchDist();
     if (mode === 'walk') {
       // Walking never "zooms toward" anything the way flying does — pinch
@@ -4459,7 +4962,7 @@ canvas.addEventListener('pointerdown', (e) => {
       pinchStartScale = null; // orbit mode always keeps `selected` set for its panel — make sure a stale scale from an earlier pinch can't leak into a resize below
     } else {
       // with something selected, pinch resizes it; otherwise it drives the camera
-      pinchStartScale = selected ? selected.root.scale.clone() : null;
+      pinchStartScale = pinchResizesSelection() ? selected.root.scale.clone() : null;
     }
     lookPointerId = null; // second finger arrived — hand off from look to pinch
   }
@@ -4476,7 +4979,11 @@ canvas.addEventListener('pointermove', (e) => {
     updateRotateDrag(e.clientX, e.clientY);
     return;
   }
-  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging) {
+  if (vertexDrag && e.pointerId === primaryPointerId) {
+    updateVertexDrag(e.clientX, e.clientY);
+    return;
+  }
+  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag) {
     const dist = currentPinchDist();
     if (mode === 'walk') {
       // Pure optical zoom (FOV) from the pinch distance — completely
@@ -4512,7 +5019,7 @@ canvas.addEventListener('pointermove', (e) => {
         outlineHelper?.update();
         refreshSizeInputs();
       }
-    } else if (!selected && pinchStartDist > 0 && mode === 'edit' && isCameraInsideAnyRoom()) {
+    } else if (!pinchResizesSelection() && pinchStartDist > 0 && mode === 'edit' && isCameraInsideAnyRoom()) {
       // Inside a room, two-finger pinch is an optical zoom (camera.fov)
       // instead of moving the camera: a small room only has a metre or two
       // of actual floor space to dolly back into, nowhere near enough to
@@ -4523,7 +5030,7 @@ canvas.addEventListener('pointermove', (e) => {
       const delta = dist - pinchStartDist;
       setFov(camera.fov - delta * 0.15);
       pinchStartDist = dist;
-    } else if (!selected && pinchStartDist > 0) {
+    } else if (!pinchResizesSelection() && pinchStartDist > 0) {
       // navigation pinch (outside any room): spreading fingers apart moves
       // forward, pinching together moves back — tracked incrementally so
       // continuing the gesture keeps moving rather than saturating at one
@@ -4601,6 +5108,7 @@ function endPointer(e) {
   }
   if (lookPointerId === e.pointerId) lookPointerId = null;
   if (e.pointerId === primaryPointerId) { moveDragGizmo = null; rotateDragGizmo = null; }
+  if (vertexDrag && e.pointerId === primaryPointerId) { endVertexDrag(e.type === 'pointercancel'); return; } // a vertex drag is never a tap
 
   if (e.type === 'pointercancel') {
     if (mode === 'edit' && moveMode) moveDragging = false;
@@ -4726,6 +5234,7 @@ function handleEditTap(x, y) {
   if (windowToolActive) { insertWindowAt(x, y); return; }
   if (holeToolActive) { performHolePlacement(x, y); return; }
   if (bendActive) { setBendPointFromTap(x, y); return; }
+  if (contour) { contourTap(x, y); return; }
   // tileToolActive is handled entirely as a drag in pointerdown/move/up
   // (see beginTileAreaDrag etc.) — a tap that isn't a drag just falls
   // through to normal selection below, same as with nothing active.
@@ -5225,7 +5734,7 @@ function serializeObjectRecord(rec, positionOverride) {
     const parts = partsOf(rec).map((child) => {
       const pos = rec.explodeOriginal?.get(child) || child.position;
       return {
-        geometry: child.geometry.toJSON(),
+        geometry: geometryToJSON(child.geometry),
         material: { type: child.material.userData.creslarnetType, color: child.material.userData.creslarnetColor },
         position: pos.toArray(),
         quaternion: child.quaternion.toArray(),
@@ -5246,7 +5755,8 @@ function serializeObjectRecord(rec, positionOverride) {
     paperId: rec.paperId, lineLength: rec.lineLength,
     lineStart: rec.lineStart?.toArray(), lineEnd: rec.lineEnd?.toArray(),
     roomId: rec.roomId, roomParams: rec.roomParams, roomCenter: rec.roomCenter,
-    geometry: mesh.geometry.toJSON(),
+    sculpted: rec.sculpted || undefined,
+    geometry: geometryToJSON(mesh.geometry),
     material: { type: mesh.material.userData.creslarnetType, color: mesh.material.userData.creslarnetColor },
     position: (positionOverride || mesh.position).toArray(),
     quaternion: mesh.quaternion.toArray(),
@@ -5312,6 +5822,17 @@ function clearScene() {
 // BufferGeometryLoader can't read them back — ObjectLoader's geometry
 // parser understands both that shorthand and CSG's raw-attribute output.
 const geomLoader = new THREE.ObjectLoader();
+// A hand-edited primitive (sculpted, bent, vertex-dragged, cut) has had its
+// .parameters removed so that its REAL vertices get written — but three's
+// loader chooses "rebuild from parameters" by the geometry's type NAME
+// alone, so a "BoxGeometry" with no parameters came back from a save as a
+// default 1×1×1 box. Such a geometry is saved as a plain BufferGeometry.
+function geometryToJSON(geom) {
+  const json = geom.toJSON();
+  if (geom.parameters === undefined) json.type = 'BufferGeometry';
+  return json;
+}
+
 function parseGeometryJSON(json) {
   return Object.values(geomLoader.parseGeometries([json], {}))[0];
 }
@@ -5402,6 +5923,7 @@ function buildObjectFromItem(item) {
       lineStart: item.lineStart && new THREE.Vector3().fromArray(item.lineStart),
       lineEnd: item.lineEnd && new THREE.Vector3().fromArray(item.lineEnd),
       roomId: item.roomId, roomParams: item.roomParams, roomCenter: item.roomCenter,
+      sculpted: !!item.sculpted,
     },
   };
 }
@@ -5904,6 +6426,7 @@ function animate() {
     }
     updateSlGizmoScale();
     updateSlOverlay();
+    updateVertexHandleVisibility();
     updateAxisLabels();
     updateHoleLabels();
     updateTileCutLabels();
@@ -5939,6 +6462,9 @@ window.__creslarnet3d = {
   // Test/debug access to pieces with no other handle from outside.
   addObject, finishSpatialLine, cancelSpatialLine, buildSpatialLineRunGroup, setSpatialLineRadius, projectToScreenPx,
   get gizmoTargets() { return { move: gizmoMoveTargets, rotate: gizmoRotateTargets }; },
+  get vertexHandles() { return vertexHandles; },
+  get contour() { return contour; },
+  enterContourMode, exitContourMode, cutByContour, undoPointEdit, deselect,
   // "Просторова лінія" internals — same introspection purpose as the rest
   // of this hook, read-only. slTool itself is exposed directly (not spread
   // into individual getters) since it's already the single source of truth.

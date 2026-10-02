@@ -3,7 +3,7 @@
 // purges the cache-first bucket below. Everyday app files (html/css/js/json)
 // no longer need a version bump to show up: they're served network-first,
 // so a plain reload while online always gets the latest copy.
-const CACHE_NAME = 'creslarnet-v4';
+const CACHE_NAME = 'creslarnet-v5';
 
 const APP_SHELL = [
   './',
