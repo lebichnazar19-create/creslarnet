@@ -2872,88 +2872,140 @@ function updateRotateDrag(clientX, clientY) {
 }
 
 // ---------------------------------------------------------------------------
-// Live-updated engineering-style dimension lines — an arrow-to-arrow line
-// spanning the selected object's actual X/Y/Z extent (e.g. one side of a
-// cylinder to the other for its diameter), with the mm value labelled
-// alongside, drawn as SVG so real arrowheads are free. Uses the object's
-// actual local bounding box (not an assumed centre) so it's correct even
-// for a merged object whose geometry isn't centred at its own origin.
+// Dimensions ON the selected object, drawn the way a drawing shows them: for
+// each of width / height / depth, a thin line running along one EDGE of the
+// object's box, set a little way off it, with extension lines back to the
+// edge's two ends, an arrowhead at each end and the number beside it.
+//
+// It's SVG laid over the scene, re-placed every frame, so the text is
+// always flat to the screen (always "facing the camera") at one readable
+// size however the object is turned or however far away it is.
+//
+// Which edge: of the four parallel edges for an axis, the one furthest out
+// from the object's centre as seen right now (an outline edge, not one
+// across the middle of the object), so the three dimensions sit round the
+// outside of the object instead of crossing in the middle of it — which is
+// exactly what made the old centre-to-centre readout pile its three numbers
+// on top of each other. And the labels are then checked against each other
+// and pushed further out until none overlaps.
 // ---------------------------------------------------------------------------
-const dimGroups = {
-  total: { g: document.getElementById('dimGroupTotal'), line: document.querySelector('#dimGroupTotal .dim-line'), text: document.querySelector('#dimGroupTotal .dim-text') },
-  x: { g: document.getElementById('dimGroupX'), line: document.querySelector('#dimGroupX .dim-line'), text: document.querySelector('#dimGroupX .dim-text') },
-  y: { g: document.getElementById('dimGroupY'), line: document.querySelector('#dimGroupY .dim-line'), text: document.querySelector('#dimGroupY .dim-text') },
-  z: { g: document.getElementById('dimGroupZ'), line: document.querySelector('#dimGroupZ .dim-line'), text: document.querySelector('#dimGroupZ .dim-text') },
-};
+const DIM_AXES = ['x', 'y', 'z'];
+const DIM_LETTER = { x: 'Ш', y: 'В', z: 'Г' }; // ширина, висота, глибина
+const DIM_OFFSET_PX = 16;       // dimension line this far out from the edge
+const DIM_EXT_GAP_PX = 3;       // extension lines start this far off the edge's end…
+const DIM_EXT_OVERSHOOT_PX = 5; // …and run this far past the dimension line
+const DIM_LABEL_GAP_PX = 11;    // label centre this far beyond the dimension line
+const DIM_LABEL_H_PX = 15, DIM_CHAR_PX = 6.9; // label box estimate (11 px bold mono)
+const DIM_EDGE_STICKY_PX = 14;  // an edge keeps its dimension until another one is clearly further out — no flicker between two near-equal edges
+const dimGroups = {};
+for (const axis of DIM_AXES) {
+  const id = `#dimGroup${axis.toUpperCase()}`;
+  dimGroups[axis] = {
+    g: document.getElementById(`dimGroup${axis.toUpperCase()}`),
+    line: document.querySelector(`${id} .dim-line`),
+    ext1: document.querySelector(`${id} .dim-ext-1`),
+    ext2: document.querySelector(`${id} .dim-ext-2`),
+    text: document.querySelector(`${id} .dim-text`),
+  };
+}
+let dimEdgeMemo = { record: null };
 
 function hideDimensionOverlay() {
-  for (const axis of ['total', 'x', 'y', 'z']) dimGroups[axis].g.classList.add('hidden');
+  for (const axis of DIM_AXES) dimGroups[axis].g.classList.add('hidden');
+}
+
+// 1 000 / 12,5 — millimetres as on a drawing: no trailing ",0".
+function formatDimMm(v) { return formatMm(v, 1).replace(/,0$/, ''); }
+
+function setSvgLine(el, ax, ay, bx, by) {
+  el.setAttribute('x1', ax.toFixed(1)); el.setAttribute('y1', ay.toFixed(1));
+  el.setAttribute('x2', bx.toFixed(1)); el.setAttribute('y2', by.toFixed(1));
+}
+
+// Places one drawing-style dimension for the on-screen segment a→b into an
+// SVG group ({ line, ext1, ext2, text }): the line `DIM_OFFSET_PX` out to
+// the `(nx, ny)` side, extension lines, arrowheads (dropped when the line
+// is too short to hold two), and the label — moved further out, step by
+// step, until it's clear of every label box already in `placed`.
+function layoutDimension(group, a, b, nx, ny, label, markerId, placed) {
+  const len = Math.hypot(b.x - a.x, b.y - a.y);
+  const ax = a.x + nx * DIM_OFFSET_PX, ay = a.y + ny * DIM_OFFSET_PX, bx = b.x + nx * DIM_OFFSET_PX, by = b.y + ny * DIM_OFFSET_PX;
+  setSvgLine(group.line, ax, ay, bx, by);
+  const marker = len >= 26 ? `url(#${markerId})` : 'none';
+  group.line.setAttribute('marker-start', marker);
+  group.line.setAttribute('marker-end', marker);
+  setSvgLine(group.ext1, a.x + nx * DIM_EXT_GAP_PX, a.y + ny * DIM_EXT_GAP_PX, ax + nx * DIM_EXT_OVERSHOOT_PX, ay + ny * DIM_EXT_OVERSHOOT_PX);
+  setSvgLine(group.ext2, b.x + nx * DIM_EXT_GAP_PX, b.y + ny * DIM_EXT_GAP_PX, bx + nx * DIM_EXT_OVERSHOOT_PX, by + ny * DIM_EXT_OVERSHOOT_PX);
+  const w = label.length * DIM_CHAR_PX + 8;
+  let lx = (ax + bx) / 2 + nx * DIM_LABEL_GAP_PX, ly = (ay + by) / 2 + ny * DIM_LABEL_GAP_PX;
+  // a label beside a steep line would sit half over it — give it room for its own half-width
+  lx += nx * (Math.abs(nx) * w) / 2;
+  const hits = () => placed.some((p) => Math.abs(p.x - lx) < (p.w + w) / 2 && Math.abs(p.y - ly) < DIM_LABEL_H_PX);
+  for (let tries = 0; tries < 12 && hits(); tries++) { lx += nx * DIM_LABEL_H_PX; ly += ny * DIM_LABEL_H_PX; }
+  placed.push({ x: lx, y: ly, w });
+  group.text.setAttribute('x', lx.toFixed(1));
+  group.text.setAttribute('y', ly.toFixed(1));
+  group.text.textContent = label;
 }
 
 function updateAxisLabels() {
-  if (!selected || selected.kind === 'ground' || selected.kind === 'sketchLine' || mode !== 'edit') {
+  if (!selected || selected.kind === 'ground' || selected.kind === 'sketchLine' || isLinkKind(selected.kind) || mode !== 'edit') {
     hideDimensionOverlay();
     return;
   }
   const root = selected.root;
-  let localMin, localMax, sizeMm;
+  let lo, hi, sizeMm;
   if (selected.kind === 'window') {
     const p = root.userData.windowParams;
-    localMin = new THREE.Vector3(-p.width / 2, -p.height / 2, -p.thickness / 2);
-    localMax = new THREE.Vector3(p.width / 2, p.height / 2, p.thickness / 2);
+    lo = new THREE.Vector3(-p.width / 2, -p.height / 2, -p.thickness / 2);
+    hi = new THREE.Vector3(p.width / 2, p.height / 2, p.thickness / 2);
     sizeMm = new THREE.Vector3(p.width, p.height, p.thickness).multiply(root.scale);
   } else {
     const box = localBoundingBox(root);
-    localMin = box.min;
-    localMax = box.max;
+    lo = box.min;
+    hi = box.max;
     sizeMm = box.getSize(new THREE.Vector3()).multiply(root.scale);
   }
-  const localCenter = localMin.clone().add(localMax).multiplyScalar(0.5);
-  // one arrow-to-arrow span per axis, running edge-to-edge through the centre
-  const ends = {
-    x: [new THREE.Vector3(localMin.x, localCenter.y, localCenter.z), new THREE.Vector3(localMax.x, localCenter.y, localCenter.z)],
-    y: [new THREE.Vector3(localCenter.x, localMin.y, localCenter.z), new THREE.Vector3(localCenter.x, localMax.y, localCenter.z)],
-    z: [new THREE.Vector3(localCenter.x, localCenter.y, localMin.z), new THREE.Vector3(localCenter.x, localCenter.y, localMax.z)],
-  };
-  const texts = { x: `${formatMm(sizeMm.x)} мм`, y: `${formatMm(sizeMm.y)} мм`, z: `${formatMm(sizeMm.z)} мм` };
+  if (dimEdgeMemo.record !== selected) dimEdgeMemo = { record: selected };
 
   const toScreen = (v) => {
-    const ndc = v.clone().applyMatrix4(root.matrixWorld).project(camera);
-    return { x: (ndc.x * 0.5 + 0.5) * window.innerWidth, y: (-ndc.y * 0.5 + 0.5) * window.innerHeight, behind: ndc.z < -1 || ndc.z > 1 };
+    const ndc = v.applyMatrix4(root.matrixWorld).project(camera);
+    return { x: (ndc.x * 0.5 + 0.5) * window.innerWidth, y: (-ndc.y * 0.5 + 0.5) * window.innerHeight, depth: ndc.z, behind: ndc.z < -1 || ndc.z > 1 };
   };
-
-  // The one overall "start of the object -> end of the object" span — the
-  // bounding box's own corner-to-corner diagonal, in local (unscaled) size —
-  // scaled up the same way sizeMm above is, so it reads correctly even on a
-  // resized object.
-  const totalSizeMm = localMax.clone().sub(localMin).multiply(root.scale);
-  ends.total = [localMin.clone(), localMax.clone()];
-  texts.total = `${formatMm(totalSizeMm.length())} мм`;
-
-  // All three spans share the same centre point, so anchoring every label at
-  // its own line's exact midpoint puts all three labels on top of each other
-  // in screen space — that's the "solid clump of text" bug. Two independent
-  // fixes, combined: anchor each label 2/3 of the way toward its own line's
-  // end (not dead centre, so the three anchors land at genuinely different
-  // screen points), and give each axis a different perpendicular offset
-  // distance so even a coincidental viewing angle can't restack them.
-  const LABEL_ANCHOR_T = 0.68;
-  const LABEL_OFFSET_PX = { total: 8, x: 18, y: 28, z: 38 };
-  for (const axis of ['total', 'x', 'y', 'z']) {
-    const [aLocal, bLocal] = ends[axis];
-    const a = toScreen(aLocal), b = toScreen(bLocal);
-    const { g, line, text } = dimGroups[axis];
-    if (a.behind || b.behind || Math.hypot(a.x - b.x, a.y - b.y) < 6) { g.classList.add('hidden'); continue; }
-    line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
-    line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
-    const mx = a.x + (b.x - a.x) * LABEL_ANCHOR_T, my = a.y + (b.y - a.y) * LABEL_ANCHOR_T;
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const nx = -dy / len, ny = dx / len; // perpendicular unit vector
-    text.setAttribute('x', mx + nx * LABEL_OFFSET_PX[axis]);
-    text.setAttribute('y', my + ny * LABEL_OFFSET_PX[axis]);
-    text.textContent = texts[axis];
-    g.classList.remove('hidden');
+  const centre = toScreen(lo.clone().add(hi).multiplyScalar(0.5));
+  const placed = [];
+  for (const axis of DIM_AXES) {
+    const group = dimGroups[axis];
+    const [u, w] = DIM_AXES.filter((k) => k !== axis);
+    // the four edges running along this axis: one per corner of the box's cross-section
+    let best = null, kept = null;
+    for (const iu of [0, 1]) {
+      for (const iw of [0, 1]) {
+        const a3 = new THREE.Vector3(), b3 = new THREE.Vector3();
+        a3[axis] = lo[axis]; b3[axis] = hi[axis];
+        a3[u] = b3[u] = iu ? hi[u] : lo[u];
+        a3[w] = b3[w] = iw ? hi[w] : lo[w];
+        const a = toScreen(a3), b = toScreen(b3);
+        if (a.behind || b.behind) continue;
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        // furthest out from the centre as seen; of two equally far, the nearer to the camera
+        const cand = { a, b, mx, my, key: `${iu}${iw}`, score: Math.hypot(mx - centre.x, my - centre.y) - (a.depth + b.depth) * 0.5 };
+        if (!best || cand.score > best.score) best = cand;
+        if (dimEdgeMemo[axis] === cand.key) kept = cand;
+      }
+    }
+    if (kept && best && best.score - kept.score < DIM_EDGE_STICKY_PX) best = kept;
+    if (!best || centre.behind) { group.g.classList.add('hidden'); continue; }
+    dimEdgeMemo[axis] = best.key;
+    const { a, b } = best;
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    // outward = square to the edge on screen, on the side away from the object's centre
+    let nx, ny;
+    if (len > 0.5) { nx = -(b.y - a.y) / len; ny = (b.x - a.x) / len; }
+    else { nx = best.mx - centre.x; ny = best.my - centre.y; const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l; if (!nx && !ny) ny = -1; } // edge seen end-on: just "away from the centre"
+    if (nx * (best.mx - centre.x) + ny * (best.my - centre.y) < 0) { nx = -nx; ny = -ny; }
+    layoutDimension(group, a, b, nx, ny, `${DIM_LETTER[axis]} ${formatDimMm(sizeMm[axis])} мм`, `dimArrow${axis.toUpperCase()}`, placed);
+    group.g.classList.remove('hidden');
   }
 }
 
@@ -8183,7 +8235,7 @@ window.__creslarnet3d = {
     camera.position.copy(target).add(offset);
     faceDirection(new THREE.Vector3().subVectors(target, camera.position).normalize());
   },
-  pickObjectGizmo, slPickHandle, removeGizmo, openPopover,
+  pickObjectGizmo, slPickHandle, removeGizmo, openPopover, dimGroups,
   // put the camera at one point looking at another (tests/debugging)
   lookFrom(from, target) {
     camera.position.set(from.x, from.y, from.z);

@@ -540,7 +540,8 @@ html, body {
   pointer-events: none;
 }
 .dim-group.hidden { display: none; }
-.dim-line { stroke-width: 1.5; }
+.dim-line { stroke-width: 1.2; }
+.dim-ext { stroke-width: 0.8; opacity: 0.75; }
 .dim-line-x { stroke: #d83e3e; }
 .dim-line-y { stroke: #3a6cd8; }
 .dim-line-z { stroke: #3aa85a; }

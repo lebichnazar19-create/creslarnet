@@ -121,25 +121,25 @@
         <path d="M0,0 L10,5 L0,10 z" fill="#39ff7a"></path>
       </marker>
     </defs>
-    <!-- The one overall "start of the object -> end of the object" span
-         (its full bounding-box diagonal), always bright green so it reads
-         at a glance next to the softer per-axis X/Y/Z lines below — shown
-         automatically the moment an object is selected, which in practice
-         is also the moment it's created (every add/convert/finish flow
-         ends with select(newRecord)). -->
-    <g id="dimGroupTotal" class="dim-group hidden">
-      <line class="dim-line dim-line-total" marker-start="url(#dimArrowTotal)" marker-end="url(#dimArrowTotal)"></line>
-      <text class="dim-text dim-text-total"></text>
-    </g>
+    <!-- Width / height / depth of the selected object, drawing-style: a
+         dimension line along one edge with arrowheads, two extension lines
+         back to the edge's ends, and the number — placed every frame by
+         updateAxisLabels() in app.js. -->
     <g id="dimGroupX" class="dim-group hidden">
+      <line class="dim-ext dim-ext-1 dim-line-x"></line>
+      <line class="dim-ext dim-ext-2 dim-line-x"></line>
       <line class="dim-line dim-line-x" marker-start="url(#dimArrowX)" marker-end="url(#dimArrowX)"></line>
       <text class="dim-text dim-text-x"></text>
     </g>
     <g id="dimGroupY" class="dim-group hidden">
+      <line class="dim-ext dim-ext-1 dim-line-y"></line>
+      <line class="dim-ext dim-ext-2 dim-line-y"></line>
       <line class="dim-line dim-line-y" marker-start="url(#dimArrowY)" marker-end="url(#dimArrowY)"></line>
       <text class="dim-text dim-text-y"></text>
     </g>
     <g id="dimGroupZ" class="dim-group hidden">
+      <line class="dim-ext dim-ext-1 dim-line-z"></line>
+      <line class="dim-ext dim-ext-2 dim-line-z"></line>
       <line class="dim-line dim-line-z" marker-start="url(#dimArrowZ)" marker-end="url(#dimArrowZ)"></line>
       <text class="dim-text dim-text-z"></text>
     </g>
