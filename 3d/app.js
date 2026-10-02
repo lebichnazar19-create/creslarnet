@@ -163,6 +163,16 @@ const DEFAULT_FOV = 60, MIN_FOV = 32, MAX_FOV = 120;
 let preferredFov = DEFAULT_FOV;
 let lookSensitivity = 1;
 let onFovChanged = null; // set by the settings panel so its slider follows pinch-zoom too
+// "Політ" — the on-screen flight controls (see their own section, next to
+// the camera settings). Declared up here because the saved settings are
+// read back before that section runs.
+const flyTool = {
+  visible: false,   // joystick + up/down buttons shown
+  speed: 1500,      // mm/s at full stick deflection
+  x: 0, y: 0,       // stick, −1..1 each (x: right, y: DOWN the screen — so forward is −y)
+  up: false, down: false, // the two vertical buttons, while held
+  stickPointer: null,
+};
 const camera = new THREE.PerspectiveCamera(DEFAULT_FOV, window.innerWidth / window.innerHeight, 1, 1000000);
 camera.rotation.order = 'YXZ';
 const INITIAL_CAMERA_POS = new THREE.Vector3(6000, 5000, 9000);
@@ -6607,7 +6617,7 @@ const lookSensValueEl = document.getElementById('lookSensValue');
 
 function saveCameraSettings() {
   try {
-    localStorage.setItem(CAMERA_SETTINGS_KEY, JSON.stringify({ fov: preferredFov, lookSensitivity }));
+    localStorage.setItem(CAMERA_SETTINGS_KEY, JSON.stringify({ fov: preferredFov, lookSensitivity, flySpeed: flyTool.speed, flyVisible: flyTool.visible }));
   } catch (err) { /* private mode / storage full — the setting still applies for this session */ }
 }
 
@@ -6617,6 +6627,8 @@ function loadCameraSettings() {
     if (!saved) return;
     if (Number.isFinite(saved.fov)) preferredFov = Math.max(FOV_SLIDER_MIN, Math.min(FOV_SLIDER_MAX, saved.fov));
     if (Number.isFinite(saved.lookSensitivity)) lookSensitivity = Math.max(LOOK_SENS_MIN, Math.min(LOOK_SENS_MAX, saved.lookSensitivity));
+    if (Number.isFinite(saved.flySpeed)) flyTool.speed = Math.max(20, Math.min(20000, saved.flySpeed));
+    if (typeof saved.flyVisible === 'boolean') flyTool.visible = saved.flyVisible;
   } catch (err) { /* corrupt entry — fall back to the defaults */ }
 }
 
@@ -6651,6 +6663,166 @@ lookSensSliderEl.value = String(Math.round(lookSensitivity * 100));
 lookSensValueEl.textContent = `${lookSensSliderEl.value}%`;
 setFov(preferredFov);
 
+// ---------------------------------------------------------------------------
+// "Політ" — on-screen flight controls for touch, next to the zoom buttons
+// (which stay exactly as they were):
+//   - a joystick bottom-left: forward / back / left / right, relative to
+//     where the camera is looking (forward flies along the view itself,
+//     pitch included — the same "true fly" the desktop W/A/S/D keys do);
+//   - "Вгору" / "Вниз" bottom-right: straight up or down for as long as
+//     they're held, whatever the camera is looking at;
+//   - a speed slider, logarithmic: 20 mm/s for working on a small detail up
+//     to 20 m/s for crossing a big scene;
+//   - one finger on the free part of the screen still turns the view, as
+//     always — and since the joystick is its own element with its own
+//     finger, flying and looking around work at the same time.
+// Everything is see-through, and the "✈" button under the zoom buttons
+// shows/hides the lot. The whole block lifts itself above whatever panel is
+// open at the bottom of the screen, so it's never underneath one.
+// ---------------------------------------------------------------------------
+const FLY_SPEED_MIN = 20, FLY_SPEED_MAX = 20000; // mm/s
+const FLY_STICK_DEADZONE = 0.1;
+const flyToggleBtn = document.getElementById('flyToggle');
+const flyLeftEl = document.getElementById('flyLeft');
+const flyRightEl = document.getElementById('flyRight');
+const flyStickEl = document.getElementById('flyStick');
+const flyKnobEl = document.getElementById('flyKnob');
+const flyUpBtn = document.getElementById('flyUpBtn');
+const flyDownBtn = document.getElementById('flyDownBtn');
+const flySpeedSliderEl = document.getElementById('flySpeedSlider');
+const flySpeedValueEl = document.getElementById('flySpeedValue');
+
+function flySpeedFromSlider(v) { return FLY_SPEED_MIN * Math.pow(FLY_SPEED_MAX / FLY_SPEED_MIN, v / 100); }
+function flySliderFromSpeed(s) { return (100 * Math.log(s / FLY_SPEED_MIN)) / Math.log(FLY_SPEED_MAX / FLY_SPEED_MIN); }
+function flySpeedLabel(s) {
+  return s < 1000 ? `${formatMm(Math.round(s), 0)} мм/с` : `${formatMm(s / 1000, 1)} м/с`;
+}
+
+function resetFlyInput() {
+  flyTool.x = 0; flyTool.y = 0; flyTool.up = false; flyTool.down = false; flyTool.stickPointer = null;
+  flyKnobEl.style.transform = '';
+  flyStickEl.classList.remove('held');
+  flyUpBtn.classList.remove('held');
+  flyDownBtn.classList.remove('held');
+}
+
+// Shown only in edit mode (walking has its own way of moving), and only
+// while switched on.
+function refreshFlyUi() {
+  const show = flyTool.visible && mode === 'edit';
+  flyLeftEl.classList.toggle('hidden', !show);
+  flyRightEl.classList.toggle('hidden', !show);
+  flyToggleBtn.classList.toggle('on', flyTool.visible);
+  flyToggleBtn.classList.toggle('hidden', mode !== 'edit');
+  if (!show) resetFlyInput();
+  else layoutFlyUi(true);
+}
+
+function setFlyVisible(on) {
+  flyTool.visible = !!on;
+  refreshFlyUi();
+  saveCameraSettings();
+}
+
+// Keeps both halves just above whatever is open along the bottom edge on
+// their own side of the screen (toolbar, a tool's pill, the object panel,
+// the room minimap…) — re-measured a few times a second, not every frame.
+const FLY_BOTTOM_OBSTACLES = ['toolbar', 'modePill', 'selectionPanel', 'popover', 'propsPanel', 'minimapWrap'];
+let flyLayoutAt = 0;
+function layoutFlyUi(force = false) {
+  if (!flyTool.visible || mode !== 'edit') return;
+  const now = performance.now();
+  if (!force && now - flyLayoutAt < 250) return;
+  flyLayoutAt = now;
+  const W = window.innerWidth, H = window.innerHeight;
+  const place = (el, x0, x1) => {
+    let bottom = 12;
+    for (const id of FLY_BOTTOM_OBSTACLES) {
+      const o = document.getElementById(id);
+      if (!o || o.classList.contains('hidden')) continue;
+      const r = o.getBoundingClientRect();
+      if (!r.width || !r.height || r.right < x0 || r.left > x1 || r.top < H * 0.35) continue; // not on this side, or not a bottom-edge thing
+      bottom = Math.max(bottom, H - r.top + 10);
+    }
+    el.style.bottom = `${Math.min(bottom, Math.max(12, H - 260))}px`;
+  };
+  place(flyLeftEl, 0, 170);
+  place(flyRightEl, W - 90, W);
+}
+
+function updateFlyStick(e) {
+  const r = flyStickEl.getBoundingClientRect();
+  const max = r.width * 0.31; // how far the knob travels from centre
+  let dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+  const len = Math.hypot(dx, dy);
+  if (len > max) { dx *= max / len; dy *= max / len; }
+  flyKnobEl.style.transform = `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)`;
+  // A small dead zone in the middle (a resting thumb isn't a command), then
+  // smoothly from 0 to full deflection — half-way out is half speed.
+  const mag = Math.min(1, len / max);
+  const eff = mag <= FLY_STICK_DEADZONE ? 0 : (mag - FLY_STICK_DEADZONE) / (1 - FLY_STICK_DEADZONE);
+  flyTool.x = len > 0 ? (dx / Math.min(len, max)) * eff : 0;
+  flyTool.y = len > 0 ? (dy / Math.min(len, max)) * eff : 0;
+}
+
+flyStickEl.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  flyStickEl.setPointerCapture?.(e.pointerId);
+  flyTool.stickPointer = e.pointerId;
+  flyStickEl.classList.add('held');
+  if (autoRotateActive) setAutoRotate(false);
+  updateFlyStick(e);
+});
+flyStickEl.addEventListener('pointermove', (e) => {
+  if (e.pointerId !== flyTool.stickPointer) return;
+  e.stopPropagation();
+  updateFlyStick(e);
+});
+function releaseFlyStick(e) {
+  if (e.pointerId !== flyTool.stickPointer) return;
+  e.stopPropagation(); // the scene's own pointerup handler has nothing to do with this finger
+  flyTool.stickPointer = null;
+  flyTool.x = 0; flyTool.y = 0;
+  flyKnobEl.style.transform = '';
+  flyStickEl.classList.remove('held');
+}
+flyStickEl.addEventListener('pointerup', releaseFlyStick);
+flyStickEl.addEventListener('pointercancel', releaseFlyStick);
+flyStickEl.addEventListener('lostpointercapture', releaseFlyStick);
+
+function wireFlyVerticalButton(btn, key) {
+  const set = (held) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (held) btn.setPointerCapture?.(e.pointerId);
+    flyTool[key] = held;
+    btn.classList.toggle('held', held);
+    if (held && autoRotateActive) setAutoRotate(false);
+  };
+  btn.addEventListener('pointerdown', set(true));
+  btn.addEventListener('pointerup', set(false));
+  btn.addEventListener('pointercancel', set(false));
+  btn.addEventListener('lostpointercapture', set(false));
+}
+wireFlyVerticalButton(flyUpBtn, 'up');
+wireFlyVerticalButton(flyDownBtn, 'down');
+
+flySpeedSliderEl.addEventListener('input', () => {
+  flyTool.speed = flySpeedFromSlider(Number(flySpeedSliderEl.value));
+  flySpeedValueEl.textContent = flySpeedLabel(flyTool.speed);
+  saveCameraSettings();
+});
+flyToggleBtn.addEventListener('click', () => setFlyVisible(!flyTool.visible));
+// Anything that takes the fingers away without a pointerup (app switch,
+// a system gesture) must not leave the camera flying on by itself.
+window.addEventListener('blur', resetFlyInput);
+
+flySpeedSliderEl.value = String(Math.round(flySliderFromSpeed(flyTool.speed)));
+flySpeedValueEl.textContent = flySpeedLabel(flyTool.speed);
+refreshFlyUi();
+
+
 // "Просторова лінія" gets its own corner button (not buried in the
 // scrollable bottom toolbar) — one tap starts it, tap again to cancel.
 const spatialLineFabBtn = document.getElementById('spatialLineFab');
@@ -6679,6 +6851,7 @@ function enterWalkMode() {
   hideEl(document.getElementById('toolbar'));
   hideEl(scaleBarEl);
   hideEl(resetViewBtn);
+  refreshFlyUi(); // flight controls are an edit-mode thing — walking has its own way of moving
   showEl(crosshairEl);
   showEl(walkExitBtn);
   hideEl(spatialLineFabBtn); // edit-only tool — walk mode's pointerdown/move never check slTool.active
@@ -6704,6 +6877,7 @@ function exitWalkMode() {
   showEl(document.getElementById('toolbar'));
   showEl(scaleBarEl);
   showEl(resetViewBtn);
+  refreshFlyUi();
   showEl(spatialLineFabBtn);
   // edit mode re-fits near/far itself every frame; no repositioning needed —
   // there's no orbit pivot to recentre, the camera just stays put and flies on.
@@ -6929,10 +7103,19 @@ function updateFreeCamera(dt, refDist) {
   // had) rather than the walk-mode human model above.
   mx = Math.max(-1, Math.min(1, mx));
   my = Math.max(-1, Math.min(1, my));
-  if (mx === 0 && my === 0) return;
+  // The on-screen "Політ" controls: stick (analog — how far it's pushed is
+  // how fast) and the two vertical buttons.
+  const fx = flyTool.visible ? flyTool.x : 0, fy = flyTool.visible ? flyTool.y : 0;
+  const fv = flyTool.visible ? (flyTool.up ? 1 : 0) - (flyTool.down ? 1 : 0) : 0;
+  if (mx === 0 && my === 0 && fx === 0 && fy === 0 && fv === 0) return;
   const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
   const forward = new THREE.Vector3();
   camera.getWorldDirection(forward);
+  if (fx !== 0 || fy !== 0 || fv !== 0) {
+    const step = flyTool.speed * dt; // the user's own chosen speed — not scaled by what's ahead, so it's predictable
+    camera.position.addScaledVector(forward, -fy * step).addScaledVector(right, fx * step);
+    camera.position.y += fv * step; // straight up/down in the world, whatever the camera is looking at
+  }
   // smoothedRefDist (kept current every edit-mode frame in animate(), and
   // also read directly by the pinch-navigate handler below) is used here
   // instead of the raw refDist argument — see the comment where it's
@@ -7753,6 +7936,7 @@ function animate() {
       if (autoRotateActive) yaw += AUTO_ROTATE_SPEED * dt; // position stays put, only the view turns
       updateFreeCamera(dt, refDist);
     }
+    layoutFlyUi();
     updateSlGizmoScale();
     updateSlOverlay();
     updateVertexHandleVisibility();
@@ -7796,6 +7980,7 @@ window.__creslarnet3d = {
   enterContourMode, exitContourMode, cutByContour, undoPointEdit, deselect,
   updateSpins, updateLinks, createLink, setWheelSize, openPropsPanel, removeObject,
   clayTool, enterClayMode, exitClayMode, setClayTool, clayHeightAt, clayUndo, refreshClayShape,
+  flyTool, updateFreeCamera, get mode() { return mode; },
   get gizmo() { return gizmo; },
   // "Просторова лінія" internals — same introspection purpose as the rest
   // of this hook, read-only. slTool itself is exposed directly (not spread

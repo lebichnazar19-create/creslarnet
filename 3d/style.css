@@ -381,6 +381,76 @@ html, body {
 .zoom-control button:first-child { border-bottom: 1px solid var(--hud-line); }
 .zoom-control button:active { background: rgba(255, 255, 255, 0.12); }
 
+/* ---------- "Політ": toggle under the zoom buttons + see-through flight controls ---------- */
+.zoom-control .fly-toggle { border-top: 1px solid var(--hud-line); font-size: 17px; }
+.zoom-control .fly-toggle.on { background: var(--accent); }
+.fly-left, .fly-right {
+  position: fixed;
+  bottom: 84px; /* re-set from app.js (layoutFlyUi) to clear whatever is open along the bottom edge */
+  z-index: 17;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  opacity: 0.62;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.fly-left { left: max(12px, env(safe-area-inset-left)); gap: 8px; }
+.fly-right { right: max(12px, env(safe-area-inset-right)); gap: 10px; }
+.fly-stick {
+  position: relative;
+  width: 124px;
+  height: 124px;
+  border-radius: 50%;
+  background: rgba(20, 18, 26, 0.45);
+  border: 1.5px solid rgba(255, 255, 255, 0.4);
+  touch-action: none;
+}
+.fly-knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 52px;
+  height: 52px;
+  margin: -26px 0 0 -26px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  pointer-events: none;
+}
+.fly-speed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 140px;
+  padding: 4px 8px 5px;
+  border-radius: 10px;
+  background: rgba(20, 18, 26, 0.45);
+  font-size: 11.5px;
+  color: var(--hud-text);
+  font-variant-numeric: tabular-nums;
+}
+.fly-speed input { width: 100%; margin: 0; accent-color: var(--accent); }
+.fly-vbtn {
+  width: 64px;
+  height: 58px;
+  border-radius: 14px;
+  border: 1.5px solid rgba(255, 255, 255, 0.4);
+  background: rgba(20, 18, 26, 0.45);
+  color: #fff;
+  font: inherit;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  touch-action: none;
+}
+.fly-vbtn b { font-size: 18px; line-height: 1; }
+.fly-stick.held, .fly-vbtn.held { background: rgba(131, 56, 236, 0.55); }
+
 /* ---------- "Просторова лінія" — own corner button, not in the toolbar ---------- */
 .fab {
   position: fixed;

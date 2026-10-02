@@ -59,6 +59,22 @@
   <div id="zoomControl" class="zoom-control">
     <button id="zoomInBtn" title="Наблизити">+</button>
     <button id="zoomOutBtn" title="Віддалити — побачити більше, наприклад, всю стіну">−</button>
+    <button id="flyToggle" class="fly-toggle" title="Політ — показати або сховати джойстик і кнопки «Вгору» / «Вниз»">✈</button>
+  </div>
+
+  <!-- "Політ": see-through flight controls, shown/hidden by the ✈ button
+       above. Left: speed slider + joystick (forward/back/left/right along
+       the view). Right: straight up / straight down while held. -->
+  <div id="flyLeft" class="fly-left hidden">
+    <label class="fly-speed" title="Швидкість польоту">
+      <span>Швидкість · <span id="flySpeedValue">1,5 м/с</span></span>
+      <input type="range" id="flySpeedSlider" min="0" max="100" step="1" value="62">
+    </label>
+    <div id="flyStick" class="fly-stick" title="Джойстик: вперед, назад, вліво, вправо"><div id="flyKnob" class="fly-knob"></div></div>
+  </div>
+  <div id="flyRight" class="fly-right hidden">
+    <button id="flyUpBtn" class="fly-vbtn" title="Тримайте — камера піднімається"><b>▲</b>Вгору</button>
+    <button id="flyDownBtn" class="fly-vbtn" title="Тримайте — камера опускається"><b>▼</b>Вниз</button>
   </div>
 
   <!-- Room minimap — top-down floor plan with a dot for the camera and a
