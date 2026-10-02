@@ -55,7 +55,7 @@ const KIND_LABELS = {
   rebar: 'Арматура', beam: 'Балка', merged: 'Об’єднаний об’єкт', ground: 'Земля',
   compound: 'Складений об’єкт', roomFloor: 'Підлога кімнати', roomCeiling: 'Стеля кімнати',
   tile: 'Плитка', tileGrout: 'Шов (фуга)', spatialLine: 'Жила', wire: 'Провід',
-  stairs: 'Сходи',
+  stairs: 'Сходи', wheel: 'Колесо', belt: 'Пас', chain: 'Ланцюг',
 };
 
 // Standard-ish electrical wire colours — brown/blue/green-yellow (EU phase/
@@ -550,6 +550,15 @@ const KIND_DEFS = {
   // above, so restY stays 0 — placing it puts its base exactly on the
   // tapped surface, same as anything else placed on the ground/a floor.
   stairs: { build: () => ({ geometry: buildStairsGeometry(), restY: 0 }) },
+  // A disc flat on one side, rounded on the other, standing on its rim —
+  // see buildWheelGeometry. Comes with the rotation property ready (off).
+  wheel: {
+    build: () => ({
+      geometry: buildWheelGeometry(WHEEL_DEFAULTS.diameter, WHEEL_DEFAULTS.thickness),
+      restY: WHEEL_DEFAULTS.diameter / 2,
+      extra: { wheel: { ...WHEEL_DEFAULTS }, spin: { on: false, axis: 'z', rpm: SPIN_DEFAULT_RPM } },
+    }),
+  },
 };
 
 function addObject(kind, point) {
@@ -560,7 +569,7 @@ function addObject(kind, point) {
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   mesh.position.set(roundMm(point.x), roundMm(point.y + built.restY), roundMm(point.z));
-  const record = registerObject(kind, mesh, { isPipe: !!built.isPipe });
+  const record = registerObject(kind, mesh, { isPipe: !!built.isPipe, ...(built.extra || {}) });
   select(record);
   return record;
 }
@@ -2424,8 +2433,9 @@ function select(record) {
   // its ORIGINAL shape but misleading for whatever lumpy thing it is now,
   // so a sculpted mesh always falls through to the real EdgesGeometry path.
   const roundOutline = record.root.isMesh && !record.sculpted ? buildRoundOutlineGeometry(record.kind) : null;
-  if (record.kind === 'ground') {
-    // no outline on an 80 m plane — a box around it isn't useful
+  if (record.kind === 'ground' || isLinkKind(record.kind)) {
+    // no outline on an 80 m plane — a box around it isn't useful; and a
+    // belt/chain is restrung every frame, an outline would only lag behind
   } else if (record.kind === 'window') {
     // a window really is boxy — BoxHelper is the honest shape for it
     outlineHelper = new THREE.BoxHelper(record.root, 0x8338ec);
@@ -2463,7 +2473,7 @@ function select(record) {
     outlineHelper.renderOrder = 999;
   }
 
-  if (record.kind !== 'ground' && record.kind !== 'sketchLine') {
+  if (record.kind !== 'ground' && record.kind !== 'sketchLine' && !isLinkKind(record.kind)) {
     const built = buildGizmo(record);
     gizmo = built.group;
     gizmoMoveTargets = built.moveTargets;
@@ -2485,6 +2495,11 @@ function deselect() {
   }
   removeGizmo();
   if (contour) { clearContourVisual(); contour = null; }
+  cancelLongPress();
+  hidePropsIcon();
+  hideEl(propsPanelEl);
+  propsTarget = null;
+  linkPick = null;
   hideDimensionOverlay();
   selected = null;
   holeToolActive = false;
@@ -2671,7 +2686,9 @@ const LOCAL_AXES = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0
 // "closest point" maths has no real answer and used to fling the object)
 // leaves no way for it to drift off the axis.
 function beginMoveDrag(axisLetter, ray) {
-  const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(selected.root.matrixWorld).normalize();
+  // The arrow's own world direction (the gizmo's matrix, not the object's:
+  // while the object spins its gizmo is held still — see spinRecord).
+  const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(gizmo.matrixWorld).normalize();
   // An unrotated object's axis should be exactly (1,0,0) etc. — strip float dust so the other two coordinates stay untouched to the last digit
   for (const k of ['x', 'y', 'z']) if (Math.abs(axisWorld[k]) < 1e-9) axisWorld[k] = 0;
   const origin = selected.root.position.clone();
@@ -2698,7 +2715,7 @@ const ROTATE_DRAG_SENSITIVITY = 1.8;
 
 function beginRotateDrag(axisLetter, clientX, clientY) {
   const root = selected.root;
-  const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(root.matrixWorld).normalize();
+  const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(gizmo.matrixWorld).normalize();
   const centerScreen = projectToScreenPx(root.position);
   const startAngle = Math.atan2(clientY - centerScreen.y, clientX - centerScreen.x);
   rotateDragGizmo = { axisWorld, centerScreen, prevAngle: startAngle, accumAngle: 0, startQuaternion: root.quaternion.clone() };
@@ -3571,11 +3588,12 @@ function renderSculptPill() {
 // ---------------------------------------------------------------------------
 const VERTEX_HANDLE_MAX = 64;   // dots shown at most — beyond that, an evenly spread subset
 const VERTEX_PICK_PX = 20;      // how close a touch must be to a dot to grab it
+const VERTEX_PICK_MIN_PX = 9;    // ...and never smaller than this, however crowded the dots are
 const VERTEX_PICK_TIGHT_PX = 10; // ...when a move/rotate arrow is under the same touch: only a touch right on the dot takes it from the arrow
 const VERTEX_MIN_SCREEN_PX = 90; // an object smaller than this on screen hides its dots — too crowded to pick, and they'd bury the arrows
 const VERTEX_FALLOFF = 0.35;    // influence radius as a fraction of the object's own diagonal (a cube's nearest other corner is 0.58 away — untouched)
 const POINT_UNDO_MAX = 8;
-const NO_VERTEX_EDIT_KINDS = new Set(['ground', 'paper', 'sketchLine', 'tile', 'tileGrout']);
+const NO_VERTEX_EDIT_KINDS = new Set(['ground', 'paper', 'sketchLine', 'tile', 'tileGrout', 'belt', 'chain']);
 let vertexHandles = null; // { record, points, handles: [Vector3 local], radius }
 let vertexDrag = null;    // { index, plane, startLocal, before, weights, handleStart, handleWeights, moved }
 
@@ -3671,16 +3689,26 @@ function pickVertexHandle(clientX, clientY, maxPx = VERTEX_PICK_PX) {
   scene.updateMatrixWorld(true);
   const root = vertexHandles.record.root;
   const w = new THREE.Vector3();
-  let best = -1, bestD = Infinity, bestCam = Infinity;
-  vertexHandles.handles.forEach((h, i) => {
+  const screen = vertexHandles.handles.map((h) => {
     w.copy(h).applyMatrix4(root.matrixWorld);
     const ndc = w.clone().project(camera);
-    if (ndc.z < -1 || ndc.z > 1) return;
+    if (ndc.z < -1 || ndc.z > 1) return null;
     const s = projectToScreenPx(w);
+    return { x: s.x, y: s.y, cam: camera.position.distanceToSquared(w) };
+  });
+  let best = -1, bestD = Infinity, bestCam = Infinity;
+  screen.forEach((s, i) => {
+    if (!s) return;
     const d = Math.hypot(clientX - s.x, clientY - s.y);
     if (d > maxPx) return;
-    const cam = camera.position.distanceToSquared(w);
-    if (d < bestD - 6 || (Math.abs(d - bestD) <= 6 && cam < bestCam)) { best = i; bestD = d; bestCam = cam; }
+    // Where dots crowd together (a dense mesh) each one's catch area
+    // shrinks to under half the gap to its nearest neighbour, so there is
+    // always free surface left between them for an ordinary look-drag or a
+    // long press — never a wall-to-wall carpet of grab zones.
+    let gap = Infinity;
+    screen.forEach((o, j) => { if (o && j !== i) gap = Math.min(gap, Math.hypot(o.x - s.x, o.y - s.y)); });
+    if (d > Math.max(VERTEX_PICK_MIN_PX, gap * 0.45)) return;
+    if (d < bestD - 6 || (Math.abs(d - bestD) <= 6 && s.cam < bestCam)) { best = i; bestD = d; bestCam = s.cam; }
   });
   return best;
 }
@@ -3691,7 +3719,9 @@ function pickVertexHandle(clientX, clientY, maxPx = VERTEX_PICK_PX) {
 // vertices appear. Called every edit-mode frame.
 function updateVertexHandleVisibility() {
   if (!vertexHandles || vertexDrag) return;
-  const root = vertexHandles.record.root;
+  const rec = vertexHandles.record;
+  if ((rec.spin && rec.spin.on) || rec.spinOmega) { vertexHandles.points.visible = false; return; } // no grabbing a vertex of something that's turning
+  const root = rec.root;
   const w = new THREE.Vector3();
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, anyInFront = false;
   for (const h of vertexHandles.handles) {
@@ -3822,7 +3852,7 @@ function finishGeometryEdit(record, recomputeNormals) {
 
 // ----- own points on the surface + "Вирізати" -----
 const CONTOUR_CIRCLE_POINTS = 24;
-const NO_CONTOUR_KINDS = new Set(['ground', 'paper', 'sketchLine']);
+const NO_CONTOUR_KINDS = new Set(['ground', 'paper', 'sketchLine', 'belt', 'chain']);
 let contour = null; // { record, points: [{ local, normal }], circleArmed, choosing, dots, loop }
 let contourCircleRadius = 100; // mm
 
@@ -4021,6 +4051,525 @@ function cutByContour(kind) {
 }
 
 // ---------------------------------------------------------------------------
+// "Властивості" — opened by a LONG PRESS on the selected object (a small
+// "⚙ Властивості" chip pops up under the finger; tapping it opens the
+// panel). The first property is "Обертання": the object spins on its own
+// about one of its axes at a set speed.
+//
+// "Колесо" is an object made for it: a disc, flat on one side and rounded
+// on the other, standing upright on its rim with its axle along local Z.
+//
+// Two wheels can be joined by a belt ("Пас") or a chain ("Ланцюг"): turn
+// rotation on for one and it drives the other through the link, at the
+// ratio of their diameters — the rim speeds match, exactly like a real
+// belt drive, so a wheel half the size turns twice as fast. Any number of
+// wheels can be chained this way; whichever one has "Обертання" on drives
+// everything connected to it.
+// ---------------------------------------------------------------------------
+const SPIN_DEFAULT_RPM = 30;
+const WHEEL_DEFAULTS = { diameter: 400, thickness: 60 };
+const LINK_KINDS = new Set(['belt', 'chain']);
+const LINK_BAND_MM = { belt: 8, chain: 12 }; // radial thickness of the band riding on the rims
+const CHAIN_PITCH_MM = 26;
+function isLinkKind(kind) { return LINK_KINDS.has(kind); }
+
+// Lathe profile: a flat face, a straight rim, then a quarter-round over to
+// a flat top — turned so the axle is local Z (flat side toward −Z, rounded
+// side toward +Z) and the disc stands upright like a wheel.
+function buildWheelGeometry(diameter, thickness) {
+  const R = diameter / 2, t = thickness;
+  const fillet = Math.min(t * 0.85, R * 0.6);
+  const pts = [new THREE.Vector2(0, -t / 2), new THREE.Vector2(R, -t / 2), new THREE.Vector2(R, t / 2 - fillet)];
+  const steps = 10;
+  for (let i = 1; i <= steps; i++) {
+    const a = (i / steps) * (Math.PI / 2);
+    pts.push(new THREE.Vector2(R - fillet + Math.cos(a) * fillet, t / 2 - fillet + Math.sin(a) * fillet));
+  }
+  pts.push(new THREE.Vector2(0, t / 2));
+  const g = new THREE.LatheGeometry(pts, 64);
+  g.rotateX(Math.PI / 2);
+  g.computeBoundingBox();
+  g.computeBoundingSphere();
+  return g;
+}
+
+function canSpin(record) {
+  return !!record && record !== groundRecord && !record.roomId && !isLinkKind(record.kind) && record.kind !== 'sketchLine';
+}
+
+// Every object's rotation property, created on first use: off, 30 rpm,
+// about the vertical axis (a wheel: about its axle).
+function spinOf(record) {
+  if (!record.spin) record.spin = { on: false, axis: record.kind === 'wheel' ? 'z' : 'y', rpm: SPIN_DEFAULT_RPM };
+  return record.spin;
+}
+
+function wheelRadius(record) { return (record.wheel.diameter / 2) * Math.abs(record.root.scale.x); }
+function wheelDiameterNow(record) { return roundMm(wheelRadius(record) * 2); }
+function wheelAxisWorld(record) { return new THREE.Vector3(0, 0, 1).transformDirection(record.root.matrixWorld).normalize(); }
+
+const _spinQuat = new THREE.Quaternion();
+// Turns the object itself. Its move/rotate gizmo is a child of it, so it
+// would whirl along — it's turned back by the same amount, staying put on
+// screen with its arrows where they can actually be grabbed.
+function spinRecord(record, axisKey, angle) {
+  if (!angle) return;
+  const axis = LOCAL_AXES[axisKey];
+  record.root.rotateOnAxis(axis, angle);
+  if (selected === record) {
+    if (gizmo) gizmo.quaternion.premultiply(_spinQuat.setFromAxisAngle(axis, -angle));
+    outlineHelper?.update();
+  }
+}
+
+// Called every frame. Wheels joined by links move as one drive: the first
+// wheel (lowest id) with "Обертання" on is the driver, and every wheel
+// connected to it turns at driver-rim-speed / its-own-radius. Everything
+// else with "Обертання" on just spins by itself.
+function updateSpins(dt) {
+  if (moveDragGizmo || rotateDragGizmo || vertexDrag) return; // hands on the object — hold still
+  const links = objects.filter((r) => isLinkKind(r.kind));
+  const driven = new Set();
+  for (const r of objects) if (r.kind === 'wheel') r.spinOmega = 0; // rad/s about its own axle this frame — read by the links and the panel
+  if (links.length) {
+    const byId = new Map(objects.map((r) => [r.id, r]));
+    const adj = new Map();
+    for (const l of links) {
+      if (!adj.has(l.linkA)) adj.set(l.linkA, []);
+      if (!adj.has(l.linkB)) adj.set(l.linkB, []);
+      adj.get(l.linkA).push(l.linkB);
+      adj.get(l.linkB).push(l.linkA);
+    }
+    for (const driver of objects) {
+      if (driver.kind !== 'wheel' || !driver.spin || !driver.spin.on || driven.has(driver.id) || !adj.has(driver.id)) continue;
+      const rimSpeed = (driver.spin.rpm * Math.PI * 2 / 60) * wheelRadius(driver); // mm/s — the same for every wheel on this drive
+      const driverAxis = wheelAxisWorld(driver);
+      const queue = [driver.id];
+      driven.add(driver.id);
+      while (queue.length) {
+        const w = byId.get(queue.shift());
+        if (!w || w.kind !== 'wheel') continue;
+        // A belt/chain turns both wheels the same way round — seen from one
+        // side. A wheel facing the other way has its own axle reversed.
+        const sameWay = w === driver || wheelAxisWorld(w).dot(driverAxis) >= 0 ? 1 : -1;
+        w.spinOmega = (rimSpeed / wheelRadius(w)) * sameWay;
+        spinRecord(w, 'z', w.spinOmega * dt);
+        for (const next of adj.get(w.id) || []) if (!driven.has(next)) { driven.add(next); queue.push(next); }
+      }
+    }
+    for (const l of links) {
+      const a = byId.get(l.linkA);
+      if (a && a.spinOmega) l.linkPhase = (l.linkPhase || 0) + a.spinOmega * wheelRadius(a) * dt;
+    }
+  }
+  for (const r of objects) {
+    if (!r.spin || !r.spin.on || driven.has(r.id)) continue;
+    const omega = r.spin.rpm * Math.PI * 2 / 60;
+    if (r.kind === 'wheel') r.spinOmega = omega;
+    spinRecord(r, r.kind === 'wheel' ? 'z' : r.spin.axis, omega * dt);
+  }
+}
+
+// ----- belt / chain between two wheels -----
+function linkMaterial(kind) {
+  const m = kind === 'belt' ? createPaintMaterial('#2a2a2e') : createMaterial('metal', '#9aa0a8', scene.environment);
+  m.side = THREE.DoubleSide;
+  return m;
+}
+
+// Where the loop lies: in wheel A's own plane (perpendicular to its axle),
+// A at the origin, B out along e1. null when a belt can't be strung at all
+// (centres on top of each other, or one rim wholly inside the other).
+function linkLayout(a, b) {
+  const n = wheelAxisWorld(a);
+  const rel = b.root.position.clone().sub(a.root.position);
+  const off = rel.dot(n);
+  const inPlane = rel.addScaledVector(n, -off);
+  const d = inPlane.length();
+  const rA = wheelRadius(a), rB = wheelRadius(b);
+  if (d < 1 || d <= Math.abs(rA - rB) + 1) return null;
+  const e1 = inPlane.multiplyScalar(1 / d);
+  const e2 = new THREE.Vector3().crossVectors(n, e1);
+  const origin = a.root.position.clone().addScaledVector(n, off / 2);
+  const width = Math.max(4, Math.min(a.wheel.thickness * Math.abs(a.root.scale.z), b.wheel.thickness * Math.abs(b.root.scale.z)) * 0.6);
+  return { origin, e1, e2, n, d, rA, rB, width };
+}
+
+// The open-belt loop as four pieces, counter-clockwise: round the back of
+// A, the lower straight run to B, round the back of B, the upper run home.
+function linkPath(layout, band) {
+  const R1 = layout.rA + band / 2, R2 = layout.rB + band / 2, d = layout.d;
+  const th = Math.PI / 2 - Math.asin((R1 - R2) / d); // angle of the upper tangent point on both wheels
+  const run = Math.sqrt(d * d - (R1 - R2) * (R1 - R2));
+  const segs = [
+    { arc: true, cx: 0, r: R1, a0: th, sweep: Math.PI * 2 - 2 * th },
+    { arc: false, x0: R1 * Math.cos(-th), y0: R1 * Math.sin(-th), x1: d + R2 * Math.cos(-th), y1: R2 * Math.sin(-th) },
+    { arc: true, cx: d, r: R2, a0: -th, sweep: 2 * th },
+    { arc: false, x0: d + R2 * Math.cos(th), y0: R2 * Math.sin(th), x1: R1 * Math.cos(th), y1: R1 * Math.sin(th) },
+  ];
+  let total = 0;
+  for (const s of segs) { s.len = s.arc ? s.r * s.sweep : run; total += s.len; }
+  return { segs, total };
+}
+
+// Point, direction of travel and outward direction at distance s along the loop.
+function linkPathAt(path, s) {
+  s = ((s % path.total) + path.total) % path.total;
+  for (const seg of path.segs) {
+    if (s > seg.len) { s -= seg.len; continue; }
+    if (seg.arc) {
+      const a = seg.a0 + s / seg.r;
+      return { x: seg.cx + Math.cos(a) * seg.r, y: Math.sin(a) * seg.r, tx: -Math.sin(a), ty: Math.cos(a) };
+    }
+    const t = s / seg.len, tx = (seg.x1 - seg.x0) / seg.len, ty = (seg.y1 - seg.y0) / seg.len;
+    return { x: seg.x0 + (seg.x1 - seg.x0) * t, y: seg.y0 + (seg.y1 - seg.y0) * t, tx, ty };
+  }
+  const last = path.segs[path.segs.length - 1];
+  return { x: last.x1, y: last.y1, tx: (last.x1 - last.x0) / last.len, ty: (last.y1 - last.y0) / last.len };
+}
+
+function linkToWorld(layout, x, y, z, out) {
+  return out.copy(layout.origin).addScaledVector(layout.e1, x).addScaledVector(layout.e2, y).addScaledVector(layout.n, z);
+}
+
+function pushQuad(arr, a, b, c, d) {
+  arr.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z);
+}
+
+// A belt: one continuous flat band, rectangular in section, lying on both rims.
+function beltPositions(layout) {
+  const band = LINK_BAND_MM.belt, path = linkPath(layout, band), hw = layout.width / 2, hb = band / 2;
+  const rings = [];
+  for (const seg of path.segs) {
+    if (!seg.arc) continue; // the straight runs are just the gap between one arc's end and the next one's start
+    const n = Math.max(2, Math.ceil(seg.sweep / (Math.PI / 24)));
+    for (let i = 0; i <= n; i++) {
+      const a = seg.a0 + (seg.sweep * i) / n, ox = Math.cos(a), oy = Math.sin(a);
+      const cx = seg.cx + ox * seg.r, cy = oy * seg.r;
+      rings.push([
+        linkToWorld(layout, cx - ox * hb, cy - oy * hb, -hw, new THREE.Vector3()),
+        linkToWorld(layout, cx + ox * hb, cy + oy * hb, -hw, new THREE.Vector3()),
+        linkToWorld(layout, cx + ox * hb, cy + oy * hb, hw, new THREE.Vector3()),
+        linkToWorld(layout, cx - ox * hb, cy - oy * hb, hw, new THREE.Vector3()),
+      ]);
+    }
+  }
+  const arr = [];
+  for (let i = 0; i < rings.length; i++) {
+    const p = rings[i], q = rings[(i + 1) % rings.length];
+    for (let k = 0; k < 4; k++) pushQuad(arr, p[k], p[(k + 1) % 4], q[(k + 1) % 4], q[k]);
+  }
+  return new Float32Array(arr);
+}
+
+// A chain: separate links spaced evenly round the loop, alternately wide
+// and narrow like outer/inner plates. `phase` (mm) slides them along, so a
+// running chain visibly travels.
+function chainPositions(layout, phase) {
+  const band = LINK_BAND_MM.chain, path = linkPath(layout, band);
+  const count = Math.max(8, Math.round(path.total / CHAIN_PITCH_MM));
+  const pitch = path.total / count, hl = pitch * 0.4, hb = band / 2;
+  const arr = [];
+  const c = [];
+  for (let i = 0; i < 8; i++) c.push(new THREE.Vector3());
+  for (let k = 0; k < count; k++) {
+    const p = linkPathAt(path, phase + k * pitch);
+    const ox = p.ty, oy = -p.tx; // outward = direction of travel turned −90°
+    const hw = (k % 2 ? layout.width * 0.55 : layout.width) / 2;
+    let i = 0;
+    for (const sl of [-1, 1]) for (const sb of [-1, 1]) for (const sw of [-1, 1]) {
+      linkToWorld(layout, p.x + p.tx * hl * sl + ox * hb * sb, p.y + p.ty * hl * sl + oy * hb * sb, hw * sw, c[i++]);
+    }
+    // corner index = (along: 0|4) + (radial: 0|2) + (axial: 0|1)
+    pushQuad(arr, c[0], c[1], c[3], c[2]); pushQuad(arr, c[4], c[6], c[7], c[5]);
+    pushQuad(arr, c[0], c[4], c[5], c[1]); pushQuad(arr, c[2], c[3], c[7], c[6]);
+    pushQuad(arr, c[0], c[2], c[6], c[4]); pushQuad(arr, c[1], c[5], c[7], c[3]);
+  }
+  return new Float32Array(arr);
+}
+
+function rebuildLinkGeometry(link, a, b) {
+  const layout = linkLayout(a, b);
+  link.root.visible = !!layout;
+  if (!layout) return;
+  const arr = link.kind === 'belt' ? beltPositions(layout) : chainPositions(layout, link.linkPhase || 0);
+  let geom = link.root.geometry;
+  const attr = geom.attributes.position;
+  if (attr && attr.array.length === arr.length) {
+    attr.array.set(arr);
+    attr.needsUpdate = true;
+  } else {
+    geom.dispose();
+    geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+    link.root.geometry = geom;
+  }
+  geom.computeVertexNormals();
+  geom.computeBoundingBox();
+  geom.computeBoundingSphere();
+}
+
+// Called every frame: keeps each belt/chain strung between its two wheels
+// wherever they've been moved, turned or resized to (and keeps a running
+// chain travelling). A link whose wheel is gone goes with it.
+function updateLinks() {
+  for (const link of objects.filter((r) => isLinkKind(r.kind))) {
+    const a = objects.find((r) => r.id === link.linkA), b = objects.find((r) => r.id === link.linkB);
+    if (!a || !b || a.kind !== 'wheel' || b.kind !== 'wheel') { removeObject(link); continue; }
+    a.root.updateMatrixWorld(true);
+    b.root.updateMatrixWorld(true);
+    const ax = wheelAxisWorld(a);
+    const sig = [
+      link.kind, a.root.position.x, a.root.position.y, a.root.position.z, ax.x.toFixed(4), ax.y.toFixed(4), ax.z.toFixed(4),
+      wheelRadius(a), a.wheel.thickness * a.root.scale.z,
+      b.root.position.x, b.root.position.y, b.root.position.z, wheelRadius(b), b.wheel.thickness * b.root.scale.z,
+      link.kind === 'chain' ? (link.linkPhase || 0).toFixed(2) : '',
+    ].join('|');
+    if (sig === link.linkSig) continue;
+    link.linkSig = sig;
+    rebuildLinkGeometry(link, a, b);
+  }
+}
+
+function findLinkBetween(a, b) {
+  return objects.find((r) => isLinkKind(r.kind) && ((r.linkA === a.id && r.linkB === b.id) || (r.linkA === b.id && r.linkB === a.id))) || null;
+}
+
+function linksOfWheel(record) {
+  return objects.filter((r) => isLinkKind(r.kind) && (r.linkA === record.id || r.linkB === record.id));
+}
+
+function createLink(a, b, kind) {
+  scene.updateMatrixWorld(true);
+  if (!linkLayout(a, b)) { toast('Колеса стоять надто близько одне до одного — розсуньте їх'); return null; }
+  const existing = findLinkBetween(a, b);
+  if (existing) removeObject(existing); // one link per pair — a new one replaces it (belt ↔ chain)
+  const link = registerObject(kind, new THREE.Mesh(new THREE.BufferGeometry(), linkMaterial(kind)), { linkA: a.id, linkB: b.id, linkPhase: 0, linkSig: '' });
+  spinOf(a);
+  spinOf(b);
+  updateLinks();
+  return link;
+}
+
+// "400 : 200 — у 2 рази швидше" — how wheel `other` turns relative to `record`.
+function gearRatioText(record, other) {
+  const d1 = wheelDiameterNow(record), d2 = wheelDiameterNow(other);
+  const ratio = d1 / d2;
+  const pretty = formatMm(ratio >= 1 ? ratio : 1 / ratio, 2).replace(/,?0+$/, '');
+  const how = Math.abs(ratio - 1) < 0.005 ? 'з тією ж швидкістю' : `у ${pretty} ${ratio > 1 ? 'раза швидше' : 'раза повільніше'}`;
+  return `⌀${formatMm(d1, 0)} : ⌀${formatMm(d2, 0)} — те колесо обертається ${how}`;
+}
+
+function setWheelSize(record, diameter, thickness) {
+  record.wheel = { diameter, thickness };
+  record.root.geometry.dispose();
+  record.root.geometry = buildWheelGeometry(diameter, thickness);
+  record.pointUndo?.forEach((g) => g.dispose());
+  record.pointUndo = [];
+  record.sculpted = false;
+}
+
+// ----- long press → "⚙ Властивості" chip → properties panel -----
+const propsIconEl = document.getElementById('propsIcon');
+const propsPanelEl = document.getElementById('propsPanel');
+const LONG_PRESS_MS = 550;
+const LONG_PRESS_SLOP_PX = 8;
+let longPressTimer = null;
+let longPressFired = false;
+let propsTarget = null;
+let linkPick = null; // { from, kind } while waiting for a tap on the second wheel
+
+function longPressAllowed() {
+  return mode === 'edit' && canSpin(selected) && !holeToolActive && !bendActive && !sculptActive && !orbitActive && !contour
+    && !groupSelectMode && !wallDrawing && !windowToolActive && !tileToolActive && !placingKind && !placingLibraryEntry
+    && !slTool.active && !slTool.attach.picking && !linkPick;
+}
+
+function cancelLongPress() {
+  if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+}
+
+// Armed on a finger going down ON the selected object; fires if the finger
+// then stays put. Until then the same finger is whatever it would have been
+// anyway — a look-drag, or a grab of an arrow/ring/vertex dot that happens
+// to sit over the object — and moving it more than a few pixels calls the
+// long press off.
+function armLongPress(clientX, clientY) {
+  cancelLongPress();
+  longPressFired = false;
+  if (!longPressAllowed()) return;
+  const hit = rayFromClient(clientX, clientY).intersectObject(selected.root, true).find((h) => h.object.isMesh && !h.object.userData.isHelper);
+  if (!hit) return;
+  longPressTimer = setTimeout(() => {
+    longPressTimer = null;
+    longPressFired = true;
+    // Whatever the finger had started on the way down — a look-drag, or a
+    // grab of an arrow/ring/vertex dot that then never moved — is dropped.
+    lookPointerId = null;
+    if (vertexDrag) endVertexDrag(true);
+    moveDragGizmo = null;
+    rotateDragGizmo = null;
+    showPropsIcon(clientX, clientY);
+  }, LONG_PRESS_MS);
+}
+
+function showPropsIcon(clientX, clientY) {
+  propsIconEl.style.left = `${Math.max(8, Math.min(window.innerWidth - 158, clientX - 75))}px`;
+  propsIconEl.style.top = `${Math.max(8, Math.min(window.innerHeight - 52, clientY - 66))}px`;
+  showEl(propsIconEl);
+}
+function hidePropsIcon() { hideEl(propsIconEl); }
+
+propsIconEl.addEventListener('click', () => { if (selected) openPropsPanel(selected); });
+
+function openPropsPanel(record) {
+  propsTarget = record;
+  hidePropsIcon();
+  hideEl(selectionPanelEl);
+  hideEl(modePillEl);
+  renderPropsPanel();
+}
+
+function closePropsPanel() {
+  const had = propsTarget;
+  propsTarget = null;
+  hideEl(propsPanelEl);
+  if (had && selected === had) renderSelectionPanel();
+}
+
+function propNumberRow(labelText, value, unit, { min, max, step = 1 }, onChange) {
+  const row = document.createElement('div');
+  row.className = 'size-row prop-row';
+  const lab = document.createElement('span');
+  lab.className = 'prop-label';
+  lab.textContent = labelText;
+  const input = document.createElement('input');
+  input.type = 'number'; input.inputMode = 'decimal';
+  input.min = String(min); input.max = String(max); input.step = String(step);
+  input.className = 'size-input';
+  input.value = String(value);
+  input.addEventListener('change', () => {
+    const v = parseFloat(String(input.value).replace(',', '.'));
+    if (!Number.isFinite(v)) { input.value = String(value); return; }
+    onChange(Math.max(min, Math.min(max, v)));
+  });
+  const u = document.createElement('span');
+  u.className = 'unit-label prop-unit';
+  u.textContent = unit;
+  row.append(lab, input, u);
+  return row;
+}
+
+function renderPropsPanel() {
+  const record = propsTarget;
+  if (!record || !objects.includes(record)) { closePropsPanel(); return; }
+  const spin = spinOf(record);
+  propsPanelEl.innerHTML = '';
+  const section = (title) => { const h = document.createElement('h3'); h.textContent = title; propsPanelEl.appendChild(h); };
+  const row = () => { const r = document.createElement('div'); r.className = 'panel-row'; propsPanelEl.appendChild(r); return r; };
+  const note = (text) => { const p = document.createElement('p'); p.className = 'dim-readout'; p.textContent = text; propsPanelEl.appendChild(p); return p; };
+  const button = (parent, text, onClick, cls = 'pbtn') => {
+    const b = document.createElement('button');
+    b.className = cls; b.textContent = text;
+    b.addEventListener('click', onClick);
+    parent.appendChild(b);
+    return b;
+  };
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'close-x';
+  closeBtn.textContent = '✕';
+  closeBtn.addEventListener('click', closePropsPanel);
+  propsPanelEl.appendChild(closeBtn);
+  const title = document.createElement('p');
+  title.className = 'panel-title';
+  title.textContent = `Властивості · ${KIND_LABELS[record.kind] || record.kind}`;
+  propsPanelEl.appendChild(title);
+
+  // 1. Обертання
+  section('Обертання');
+  const links = record.kind === 'wheel' ? linksOfWheel(record) : [];
+  const onRow = row();
+  button(onRow, spin.on ? '⏸ Зупинити' : '▶ Увімкнути', () => { spin.on = !spin.on; renderPropsPanel(); }, spin.on ? 'pbtn on' : 'pbtn');
+  button(onRow, '⇄ Напрям', () => { spin.rpm = -spin.rpm; renderPropsPanel(); });
+  propsPanelEl.appendChild(propNumberRow('Швидкість', spin.rpm, 'об/хв', { min: -600, max: 600, step: 1 }, (v) => { spin.rpm = v; renderPropsPanel(); }));
+  if (record.kind === 'wheel') {
+    note('Вісь обертання — вісь самого колеса.');
+  } else {
+    const axisRow = row();
+    const axisLab = document.createElement('span');
+    axisLab.className = 'dim-readout';
+    axisLab.textContent = 'Вісь:';
+    axisRow.appendChild(axisLab);
+    for (const k of ['x', 'y', 'z']) button(axisRow, k.toUpperCase(), () => { spin.axis = k; renderPropsPanel(); }, spin.axis === k ? 'pbtn on' : 'pbtn');
+  }
+
+  if (record.kind === 'wheel') {
+    // 2. Колесо
+    section('Колесо');
+    propsPanelEl.appendChild(propNumberRow('Діаметр', record.wheel.diameter, 'мм', { min: 20, max: 5000, step: 1 }, (v) => {
+      setWheelSize(record, v, record.wheel.thickness);
+      reselectKeepingPanel(record);
+      openPropsPanel(record);
+    }));
+    propsPanelEl.appendChild(propNumberRow('Товщина', record.wheel.thickness, 'мм', { min: 5, max: 1000, step: 1 }, (v) => {
+      setWheelSize(record, record.wheel.diameter, v);
+      reselectKeepingPanel(record);
+      openPropsPanel(record);
+    }));
+
+    // 3. Передача
+    section('Передача');
+    if (!links.length) note('Це колесо ще ні з чим не з’єднане.');
+    for (const link of links) {
+      const other = objects.find((r) => r.id === (link.linkA === record.id ? link.linkB : link.linkA));
+      if (!other) continue;
+      note(`${KIND_LABELS[link.kind]}: ${gearRatioText(record, other)}`);
+      const lr = row();
+      button(lr, link.kind === 'belt' ? '⛓ Зробити ланцюгом' : '➰ Зробити пасом', () => { createLink(record, other, link.kind === 'belt' ? 'chain' : 'belt'); renderPropsPanel(); });
+      button(lr, '✕ Роз’єднати', () => { removeObject(link); renderPropsPanel(); }, 'pbtn danger');
+    }
+    const joinRow = row();
+    button(joinRow, '➰ З’єднати пасом', () => beginLinkPick(record, 'belt'));
+    button(joinRow, '⛓ З’єднати ланцюгом', () => beginLinkPick(record, 'chain'));
+    if (links.length) note('Увімкніть «Обертання» на одному з’єднаному колесі — воно крутитиме решту.');
+  }
+  showEl(propsPanelEl);
+}
+
+function beginLinkPick(record, kind) {
+  linkPick = { from: record, kind };
+  propsTarget = null;
+  hideEl(propsPanelEl);
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = `Торкніться другого колеса — з’єднати ${kind === 'belt' ? 'пасом' : 'ланцюгом'}`;
+  const cancel = document.createElement('button');
+  cancel.className = 'ghost';
+  cancel.textContent = 'Скасувати';
+  cancel.addEventListener('click', () => endLinkPick());
+  modePillEl.append(label, cancel);
+  showEl(modePillEl);
+}
+
+function endLinkPick() {
+  const from = linkPick ? linkPick.from : null;
+  linkPick = null;
+  hideEl(modePillEl);
+  if (from && objects.includes(from) && selected === from) openPropsPanel(from);
+}
+
+function linkPickTap(clientX, clientY) {
+  const hits = rayFromClient(clientX, clientY).intersectObjects(raycastTargets, false);
+  const rec = hits.length ? findRecordByMesh(hits[0].object) : null;
+  if (!rec || rec.kind !== 'wheel' || rec === linkPick.from) { toast('Це не інше колесо — торкніться саме другого колеса'); return; }
+  const { from, kind } = linkPick;
+  const link = createLink(from, rec, kind);
+  if (link) toast(`${KIND_LABELS[kind]}: ${gearRatioText(from, rec)}`, 4200);
+  endLinkPick();
+}
+
+// ---------------------------------------------------------------------------
 // Selection panel rendering
 // ---------------------------------------------------------------------------
 const selectionPanelEl = document.getElementById('selectionPanel');
@@ -4119,6 +4668,33 @@ function renderSelectionPanel() {
     bodyEl.appendChild(hint);
     bodyEl.appendChild(colorSwatchRow(currentPaintColor(selected), applyColorToSelected));
     bodyEl.appendChild(materialSwatchRow(applyMaterialToSelected));
+    return;
+  }
+
+  if (isLinkKind(selected.kind)) {
+    const link = selected;
+    const a = objects.find((r) => r.id === link.linkA), b = objects.find((r) => r.id === link.linkB);
+    const info = document.createElement('p');
+    info.className = 'dim-readout';
+    info.textContent = a && b
+      ? `З’єднує два колеса. Передатне відношення ${gearRatioText(a, b)}. Обертання вмикається у властивостях колеса (довге натискання на нього).`
+      : 'З’єднання між колесами.';
+    bodyEl.appendChild(info);
+    const linkRow = document.createElement('div');
+    linkRow.className = 'panel-row';
+    if (a && b) {
+      const swapBtn = document.createElement('button');
+      swapBtn.className = 'pbtn';
+      swapBtn.textContent = link.kind === 'belt' ? '⛓ Зробити ланцюгом' : '➰ Зробити пасом';
+      swapBtn.addEventListener('click', () => { const made = createLink(a, b, link.kind === 'belt' ? 'chain' : 'belt'); if (made) select(made); });
+      linkRow.appendChild(swapBtn);
+    }
+    const delLinkBtn = document.createElement('button');
+    delLinkBtn.className = 'pbtn danger';
+    delLinkBtn.textContent = '✕ Роз’єднати';
+    delLinkBtn.addEventListener('click', () => removeObject(link));
+    linkRow.appendChild(delLinkBtn);
+    bodyEl.appendChild(linkRow);
     return;
   }
 
@@ -4260,6 +4836,14 @@ function renderSelectionPanel() {
   moveBtn.className = 'pbtn'; moveBtn.textContent = '✥ Перемістити';
   moveBtn.addEventListener('click', enterMoveMode);
   actions.appendChild(moveBtn);
+
+  if (canSpin(selected)) {
+    const propsBtn = document.createElement('button');
+    propsBtn.className = 'pbtn'; propsBtn.textContent = '⚙ Властивості';
+    propsBtn.title = 'Те саме, що довге натискання на об’єкт: обертання, а для колеса — розмір і передача';
+    propsBtn.addEventListener('click', () => openPropsPanel(selected));
+    actions.appendChild(propsBtn);
+  }
 
   const orbitBtn = document.createElement('button');
   orbitBtn.className = 'pbtn'; orbitBtn.textContent = '🔄 Орбіта';
@@ -4450,7 +5034,7 @@ function buildPopoverContent(panel) {
   if (panel === 'objects') {
     const h = document.createElement('h3'); h.textContent = 'Додати об’єкт'; popoverEl.appendChild(h);
     const row = document.createElement('div'); row.className = 'panel-row';
-    for (const kind of ['cube', 'cylinder', 'pipe', 'sphere', 'cone', 'stairs', 'paper']) {
+    for (const kind of ['cube', 'cylinder', 'pipe', 'sphere', 'cone', 'wheel', 'stairs', 'paper']) {
       const b = document.createElement('button');
       b.className = 'pbtn' + (placingKind === kind ? ' on' : '');
       b.textContent = KIND_LABELS[kind];
@@ -4877,6 +5461,9 @@ function currentPinchMidpoint() {
 canvas.addEventListener('pointerdown', (e) => {
   if (autoRotateActive) setAutoRotate(false); // any touch takes control back, even a plain tap with no drag
   activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  hidePropsIcon(); // a new touch anywhere on the scene dismisses the "Властивості" chip
+  cancelLongPress();
+  longPressFired = false;
 
   if (activePointers.size === 1) {
     primaryPointerId = e.pointerId;
@@ -4896,6 +5483,7 @@ canvas.addEventListener('pointerdown', (e) => {
     const vertexHit = vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY, gizmoHit.length ? VERTEX_PICK_TIGHT_PX : VERTEX_PICK_PX) : -1;
     if (vertexHit >= 0) {
       beginVertexDrag(vertexHit);
+      armLongPress(e.clientX, e.clientY);
     } else if (gizmoHit.length) {
       const hitMesh = gizmoHit[0].object;
       const axisLetter = hitMesh.userData.gizmoAxis;
@@ -4904,6 +5492,7 @@ canvas.addEventListener('pointerdown', (e) => {
       } else {
         beginRotateDrag(axisLetter, e.clientX, e.clientY);
       }
+      armLongPress(e.clientX, e.clientY);
     } else if (mode === 'edit' && moveMode && selected) {
       moveDragging = true;
     } else if (mode === 'edit' && paperDrawing && selected) {
@@ -4944,6 +5533,7 @@ canvas.addEventListener('pointerdown', (e) => {
       }
     } else if (!moveMode && !paperDrawing) {
       startLookDrag(e.pointerId, e.clientX, e.clientY);
+      armLongPress(e.clientX, e.clientY); // held still on the selected object → "Властивості"
     }
   } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !slTool.drag && !sculptDragging && !vertexDrag) {
     pinchStartDist = currentPinchDist();
@@ -4970,6 +5560,7 @@ canvas.addEventListener('pointerdown', (e) => {
 
 canvas.addEventListener('pointermove', (e) => {
   if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (longPressTimer && (activePointers.size > 1 || Math.hypot(e.clientX - downX, e.clientY - downY) > LONG_PRESS_SLOP_PX)) cancelLongPress();
 
   if (moveDragGizmo && e.pointerId === primaryPointerId) {
     updateMoveDrag(rayFromClient(e.clientX, e.clientY));
@@ -5098,6 +5689,7 @@ canvas.addEventListener('pointermove', (e) => {
 function endPointer(e) {
   const wasPinching = activePointers.size >= 2 && pinchStartDist > 0;
   const wasGizmoDrag = !!(moveDragGizmo || rotateDragGizmo);
+  cancelLongPress();
   activePointers.delete(e.pointerId);
   if (activePointers.size < 2) {
     pinchStartScale = null; pinchStartDist = 0;
@@ -5119,6 +5711,7 @@ function endPointer(e) {
     return;
   }
 
+  if (longPressFired) { longPressFired = false; return; } // the long press already did its thing — its release isn't a tap
   if (wasGizmoDrag) return; // a gizmo drag is never a tap
   if (mode === 'edit' && moveMode) { moveDragging = false; return; }
   if (mode === 'edit' && paperDrawing) {
@@ -5205,6 +5798,7 @@ function handleEditTap(x, y) {
   scene.updateMatrixWorld(true);
 
   if (slTool.attach.picking) { trySpatialLineAttachTap(x, y); return; }
+  if (linkPick) { linkPickTap(x, y); return; }
 
   if (placingKind) {
     const ray = rayFromClient(x, y);
@@ -5700,6 +6294,18 @@ function updateWalkFloorY(dt) {
 // caller store a position relative to some anchor (used by the object
 // library) instead of the record's own absolute world position.
 function serializeObjectRecord(rec, positionOverride) {
+  if (isLinkKind(rec.kind)) {
+    // A belt/chain is nothing but "which two wheels" — its shape is restrung
+    // from them (updateLinks) rather than stored.
+    return { id: rec.id, kind: rec.kind, linkA: rec.linkA, linkB: rec.linkB, position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: [1, 1, 1] };
+  }
+  const out = serializeObjectRecordCore(rec, positionOverride);
+  if (rec.spin) out.spin = { ...rec.spin };
+  if (rec.wheel) out.wheel = { ...rec.wheel };
+  return out;
+}
+
+function serializeObjectRecordCore(rec, positionOverride) {
   if (rec.spatialLinePoints) {
     // A "Просторова лінія" run (raw draft, or a converted pipe/wire/rebar)
     // is a Group of per-segment meshes, not one mesh with its own
@@ -5855,13 +6461,26 @@ function loadProject(data) {
     if (selected === groundRecord) renderSelectionPanel();
   }
   let maxId = 0;
+  const byOldId = new Map();
   for (const item of data.objects) {
     maxId = Math.max(maxId, item.id || 0);
     const { root, extra } = buildObjectFromItem(item);
     root.position.fromArray(item.position);
-    registerObject(item.kind, root, extra);
+    const record = registerObject(item.kind, root, extra);
+    if (item.id !== undefined) byOldId.set(item.id, record);
   }
-  nextId = maxId + 1;
+  // Objects get fresh ids on load — re-point whatever refers to another
+  // object by its id (a belt/chain to its two wheels, an ink line to its
+  // sheet of paper) at the ids those objects have now.
+  for (const rec of objects) {
+    if (isLinkKind(rec.kind)) {
+      rec.linkA = byOldId.get(rec.linkA)?.id;
+      rec.linkB = byOldId.get(rec.linkB)?.id;
+    }
+    if (rec.paperId !== undefined && byOldId.has(rec.paperId)) rec.paperId = byOldId.get(rec.paperId).id;
+  }
+  nextId = Math.max(nextId, maxId + 1); // never hand out an id that's already in use
+  updateLinks();
   toast('Проєкт завантажено');
 }
 
@@ -5870,6 +6489,17 @@ function loadProject(data) {
 // absolute position; library insertion offsets it by wherever the user
 // tapped instead).
 function buildObjectFromItem(item) {
+  if (isLinkKind(item.kind)) {
+    // Empty for now — strung between its wheels by updateLinks once they exist.
+    return { root: new THREE.Mesh(new THREE.BufferGeometry(), linkMaterial(item.kind)), extra: { linkA: item.linkA, linkB: item.linkB, linkPhase: 0, linkSig: '' } };
+  }
+  const built = buildObjectFromItemCore(item);
+  if (item.spin) built.extra.spin = { ...item.spin };
+  if (item.wheel) built.extra.wheel = { ...item.wheel };
+  return built;
+}
+
+function buildObjectFromItemCore(item) {
   if (item.spatialLinePoints) {
     const points = item.spatialLinePoints.map((a) => new THREE.Vector3().fromArray(a));
     // A "Жила" carries its own material/colour (runMaterial/runPaint — absent
@@ -5970,7 +6600,8 @@ function computeGroupAnchor(records) {
 
 function saveGroupAsMiniObject(name, records) {
   const anchor = computeGroupAnchor(records);
-  const items = records.map((rec) => serializeObjectRecord(rec, rec.root.position.clone().sub(anchor)));
+  // belts/chains are left out: a saved mini-object can't carry "which two wheels" into another project
+  const items = records.filter((rec) => !isLinkKind(rec.kind)).map((rec) => serializeObjectRecord(rec, rec.root.position.clone().sub(anchor)));
   const entry = {
     id: `obj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     name,
@@ -6415,6 +7046,9 @@ function animate() {
   const speedSmoothing = 1 - Math.exp(-dt * 6);
   smoothedRefDist += (refDist - smoothedRefDist) * speedSmoothing;
 
+  updateSpins(dt);
+  updateLinks();
+
   if (mode === 'edit') {
     updateAdaptiveClipping(refDist); // raw — must react instantly so near clipping never lags into geometry
     updateScaleBar(refDist); // raw — a live readout of what's actually ahead, not a movement input
@@ -6465,6 +7099,8 @@ window.__creslarnet3d = {
   get vertexHandles() { return vertexHandles; },
   get contour() { return contour; },
   enterContourMode, exitContourMode, cutByContour, undoPointEdit, deselect,
+  updateSpins, updateLinks, createLink, setWheelSize, openPropsPanel, removeObject,
+  get gizmo() { return gizmo; },
   // "Просторова лінія" internals — same introspection purpose as the rest
   // of this hook, read-only. slTool itself is exposed directly (not spread
   // into individual getters) since it's already the single source of truth.
