@@ -453,6 +453,19 @@ html, body {
 .fly-stick, .fly-speed, .fly-vbtn { pointer-events: auto; }
 .fly-stick.held, .fly-vbtn.held { background: rgba(131, 56, 236, 0.55); }
 
+/* ---------- "Рулетка": measurements as dimension lines + the snap marker ---------- */
+.measure-line { stroke: #39ff7a; stroke-width: 1.4; }
+.measure-live .measure-line { stroke-dasharray: 6 4; }
+.measure-text { fill: #9dffbd; pointer-events: auto; cursor: pointer; }
+.measure-hit { fill: transparent; pointer-events: all; cursor: pointer; }
+.measure-live .measure-hit, .measure-live .measure-text { pointer-events: none; }
+.measure.sel .measure-line { stroke: #ffd60a; stroke-width: 2.2; }
+.measure.sel .measure-text { fill: #ffd60a; }
+.tape-snap circle { fill: none; stroke: #39ff7a; stroke-width: 2; }
+.tape-snap path { stroke: #39ff7a; stroke-width: 1.2; }
+.tape-snap-vertex circle { fill: rgba(57, 255, 122, 0.55); }
+.tape-snap-edge circle { stroke-dasharray: 4 3; }
+
 /* ---------- TEMPORARY touch debug line ---------- */
 .touch-debug {
   position: fixed;

@@ -2480,6 +2480,7 @@ function select(record) {
     ensureObjectGizmo(record);
     return;
   }
+  tapeTool.selected = null; // selecting an object lets go of a picked measurement
   deselect();
   selected = record;
   selectionPanelCollapsed = true; // start collapsed on every new selection — see wireSelectionPanelGrip
@@ -2909,6 +2910,7 @@ for (const axis of DIM_AXES) {
   };
 }
 let dimEdgeMemo = { record: null };
+const dimPlacedLabels = []; // this frame's label boxes — the tape measurements' numbers keep clear of them too (updateMeasureOverlay)
 
 function hideDimensionOverlay() {
   for (const axis of DIM_AXES) dimGroups[axis].g.classList.add('hidden');
@@ -2949,6 +2951,7 @@ function layoutDimension(group, a, b, nx, ny, label, markerId, placed) {
 }
 
 function updateAxisLabels() {
+  dimPlacedLabels.length = 0;
   if (!selected || selected.kind === 'ground' || selected.kind === 'sketchLine' || isLinkKind(selected.kind) || mode !== 'edit') {
     hideDimensionOverlay();
     return;
@@ -2973,7 +2976,7 @@ function updateAxisLabels() {
     return { x: (ndc.x * 0.5 + 0.5) * window.innerWidth, y: (-ndc.y * 0.5 + 0.5) * window.innerHeight, depth: ndc.z, behind: ndc.z < -1 || ndc.z > 1 };
   };
   const centre = toScreen(lo.clone().add(hi).multiplyScalar(0.5));
-  const placed = [];
+  const placed = dimPlacedLabels;
   for (const axis of DIM_AXES) {
     const group = dimGroups[axis];
     const [u, w] = DIM_AXES.filter((k) => k !== axis);
@@ -5287,6 +5290,7 @@ const clayToggleBtn = document.getElementById('clayToggle');
 function enterClayMode() {
   if (mode !== 'edit') return;
   if (wallDrawing || tileToolActive || groupSelectMode) { toast('Спершу завершіть поточний інструмент'); return; }
+  exitTapeMode();
   if (slTool.active) cancelSpatialLine();
   placingKind = null;
   placingLibraryEntry = null;
@@ -5419,6 +5423,417 @@ function buildClayFromItem(item) {
   refreshClayShape({ root: mesh, clay: mesh.userData.clay });
   return { root: mesh, extra };
 }
+
+// ---------------------------------------------------------------------------
+// "Рулетка" — measure the distance between two points on the scene.
+//
+// Put a finger down on the first point and drag to the second: the distance
+// in mm follows the finger. (Or tap the first point, then tap or drag to
+// the second.) Lift the finger and the measurement stays on the scene as a
+// dimension line — arrow, arrow, number — until it's deleted.
+//
+// The points SNAP, so a measurement runs exactly from object to object and
+// never into thin air behind one:
+//   1. to a vertex (a corner — an end of one of the object's real edges),
+//   2. else to an edge (the nearest point along it),
+//   3. else to the face under the finger.
+// Vertices and edges are looked for around the finger ON SCREEN, among
+// every object nearby — not only on whatever the finger's ray happens to
+// hit — because the classic way to miss is to aim at a corner, be a few
+// pixels outside the object's outline, and have the ray sail past it onto
+// the floor ten metres behind. Anything hidden behind the surface under the
+// finger is left out.
+//
+// "Real edges" are creases — where two faces meet at more than 25° — plus
+// open borders, from three's EdgesGeometry, cached per geometry: a cube has
+// 12, a cylinder or a funnel has its rims, a smooth sphere has none.
+// ---------------------------------------------------------------------------
+const TAPE_VERTEX_PX = 18;     // finger this close to a corner → the corner
+const TAPE_EDGE_PX = 13;       // …this close to an edge → the edge
+const TAPE_CREASE_DEG = 25;
+const TAPE_MAX_TRIANGLES = 60000; // beyond this a mesh is measured by its faces only
+const TAPE_SNAP_NAMES = { vertex: 'вершина', edge: 'ребро', face: 'грань' };
+const tapeTool = {
+  active: false,
+  look: false,      // "Огляд": the finger turns the camera instead of measuring
+  first: null,      // { point, type } once the first point is placed
+  live: null,       // { point, type } under the finger right now
+  stroke: null,     // { placingFirst, moved } while a finger is down measuring
+  selected: null,   // a finished measurement picked by tapping its number
+};
+let measures = [];  // [{ id, a: Vector3, b: Vector3 }] — finished measurements, kept on the scene
+let nextMeasureId = 1;
+const tapeEdgeCache = new WeakMap(); // geometry → { version, count, segs: Float32Array(pairs), verts: Float32Array }
+const tapeToggleBtn = document.getElementById('tapeToggle');
+const measureGroupEl = document.getElementById('measureGroup');
+const tapeSnapMarkerEl = document.getElementById('tapeSnapMarker');
+const measureEls = new Map(); // measure id (or 'live') → { g, line, hit, text }
+
+// A mesh's real edges and corners in its own local space (see the header).
+function tapeEdgesOf(geom) {
+  const pos = geom.attributes.position;
+  if (!pos) return null;
+  const cached = tapeEdgeCache.get(geom);
+  if (cached && cached.version === pos.version && cached.count === pos.count) return cached;
+  const entry = { version: pos.version, count: pos.count, segs: new Float32Array(0), verts: new Float32Array(0) };
+  const triangles = (geom.index ? geom.index.count : pos.count) / 3;
+  if (triangles <= TAPE_MAX_TRIANGLES) {
+    const edges = new THREE.EdgesGeometry(geom, TAPE_CREASE_DEG);
+    entry.segs = new Float32Array(edges.attributes.position.array);
+    edges.dispose();
+    const seen = new Set(), verts = [];
+    for (let i = 0; i < entry.segs.length; i += 3) {
+      const key = `${Math.round(entry.segs[i] * 50)}_${Math.round(entry.segs[i + 1] * 50)}_${Math.round(entry.segs[i + 2] * 50)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      verts.push(entry.segs[i], entry.segs[i + 1], entry.segs[i + 2]);
+    }
+    // Plus sharp POINTS that no crease edge runs through — a cone's tip:
+    // the faces round it turn only a few degrees from one to the next (so
+    // none of the edges between them counts as a crease), yet together
+    // they face every way round. Found as vertices whose surrounding face
+    // normals largely cancel out when averaged.
+    const acc = new Map();
+    const pa = new THREE.Vector3(), pb = new THREE.Vector3(), pc = new THREE.Vector3(), n = new THREE.Vector3(), e1 = new THREE.Vector3();
+    const idx = geom.index;
+    for (let t = 0; t < triangles; t++) {
+      const ia = idx ? idx.getX(t * 3) : t * 3, ib = idx ? idx.getX(t * 3 + 1) : t * 3 + 1, ic = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+      pa.fromBufferAttribute(pos, ia); pb.fromBufferAttribute(pos, ib); pc.fromBufferAttribute(pos, ic);
+      n.subVectors(pb, pa).cross(e1.subVectors(pc, pa));
+      if (n.lengthSq() < 1e-12) continue;
+      n.normalize();
+      for (const p of [pa, pb, pc]) {
+        const key = `${Math.round(p.x * 50)}_${Math.round(p.y * 50)}_${Math.round(p.z * 50)}`;
+        if (seen.has(key)) continue; // already a corner
+        let a = acc.get(key);
+        if (!a) { a = { x: p.x, y: p.y, z: p.z, nx: 0, ny: 0, nz: 0, count: 0 }; acc.set(key, a); }
+        a.nx += n.x; a.ny += n.y; a.nz += n.z; a.count++;
+      }
+    }
+    for (const a of acc.values()) {
+      if (a.count >= 3 && Math.hypot(a.nx, a.ny, a.nz) / a.count < 0.6) verts.push(a.x, a.y, a.z);
+    }
+    entry.verts = new Float32Array(verts);
+  }
+  tapeEdgeCache.set(geom, entry);
+  return entry;
+}
+
+// Closest point on the segment p0→p1 to a ray (all world space).
+function closestPointOnSegmentToRay(p0, p1, ray, out) {
+  const u = out.copy(p1).sub(p0), w0x = p0.x - ray.origin.x, w0y = p0.y - ray.origin.y, w0z = p0.z - ray.origin.z;
+  const d = ray.direction;
+  const a = u.dot(u), b = u.dot(d), dd = u.x * w0x + u.y * w0y + u.z * w0z, e = d.x * w0x + d.y * w0y + d.z * w0z;
+  const denom = a - b * b; // (ray direction is unit length)
+  let t = denom > 1e-9 ? (b * e - dd) / denom : 0;
+  t = Math.max(0, Math.min(1, t));
+  return out.multiplyScalar(t).add(p0);
+}
+
+// The point a finger at (clientX, clientY) means: { point, type } with type
+// 'vertex' | 'edge' | 'face', or null if there's nothing there at all.
+function snapTapePoint(clientX, clientY) {
+  scene.updateMatrixWorld(true);
+  const rc = rayFromClient(clientX, clientY);
+  const ray = rc.ray.clone();
+  const hit = rc.intersectObjects(raycastTargets, false)[0] || null;
+  // Anything further from the camera than the surface under the finger
+  // (give or take a few pixels' worth) is behind that surface — hidden.
+  const depthLimit = hit ? hit.distance + Math.max(2, worldPerPixelAt(hit.point) * 6) : Infinity;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const toPx = (v) => {
+    const n = v.clone().project(camera);
+    return n.z < -1 || n.z > 1 ? null : { x: (n.x * 0.5 + 0.5) * rect.width + rect.left, y: (-n.y * 0.5 + 0.5) * rect.height + rect.top };
+  };
+
+  let bestV = null, bestE = null;
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), centre = new THREE.Vector3();
+  for (const mesh of raycastTargets) {
+    if (mesh === ground || mesh.userData.clay || !mesh.visible) continue;
+    const rec = findRecordByMesh(mesh);
+    if (!rec || isLinkKind(rec.kind)) continue;
+    const geom = mesh.geometry;
+    if (!geom.boundingSphere) geom.computeBoundingSphere();
+    // quick reject: is this mesh anywhere near the finger on screen?
+    centre.copy(geom.boundingSphere.center).applyMatrix4(mesh.matrixWorld);
+    const cs = toPx(centre);
+    const ms = mesh.matrixWorld.getMaxScaleOnAxis();
+    const radiusPx = (geom.boundingSphere.radius * ms) / worldPerPixelAt(centre);
+    if (cs && Math.hypot(cs.x - clientX, cs.y - clientY) > radiusPx + TAPE_VERTEX_PX + 4) continue;
+    const edges = tapeEdgesOf(geom);
+    if (!edges) continue;
+
+    const vs = edges.verts;
+    for (let i = 0; i < vs.length; i += 3) {
+      a.set(vs[i], vs[i + 1], vs[i + 2]).applyMatrix4(mesh.matrixWorld);
+      const s = toPx(a);
+      if (!s) continue;
+      const d = Math.hypot(s.x - clientX, s.y - clientY);
+      if (d > TAPE_VERTEX_PX) continue;
+      const cam = camera.position.distanceTo(a);
+      if (cam > depthLimit) continue;
+      if (!bestV || d < bestV.d - 3 || (Math.abs(d - bestV.d) <= 3 && cam < bestV.cam)) bestV = { d, cam, point: a.clone() };
+    }
+    if (bestV && bestV.d < 4) continue; // dead on a corner — no need to look at this mesh's edges
+    const sg = edges.segs;
+    for (let i = 0; i < sg.length; i += 6) {
+      a.set(sg[i], sg[i + 1], sg[i + 2]).applyMatrix4(mesh.matrixWorld);
+      b.set(sg[i + 3], sg[i + 4], sg[i + 5]).applyMatrix4(mesh.matrixWorld);
+      const sa = toPx(a), sb = toPx(b);
+      if (!sa || !sb) continue;
+      if (distToSegmentPx(clientX, clientY, sa.x, sa.y, sb.x, sb.y) > TAPE_EDGE_PX) continue;
+      closestPointOnSegmentToRay(a, b, ray, c);
+      const s = toPx(c);
+      if (!s) continue;
+      const d = Math.hypot(s.x - clientX, s.y - clientY);
+      if (d > TAPE_EDGE_PX) continue;
+      const cam = camera.position.distanceTo(c);
+      if (cam > depthLimit) continue;
+      if (!bestE || d < bestE.d - 3 || (Math.abs(d - bestE.d) <= 3 && cam < bestE.cam)) bestE = { d, cam, point: c.clone() };
+    }
+  }
+  if (bestV) return { point: roundVec(bestV.point), type: 'vertex' };
+  if (bestE) return { point: roundVec(bestE.point), type: 'edge' };
+  if (hit) return { point: roundVec(hit.point), type: 'face' };
+  return null;
+}
+
+// ----- measuring with a finger -----
+// true = the finger is measuring now; false = nothing under it to measure
+// from (the caller falls back to an ordinary look-drag).
+function beginTapeStroke(clientX, clientY) {
+  const snap = snapTapePoint(clientX, clientY);
+  if (!snap) return false;
+  tapeTool.selected = null;
+  if (!tapeTool.first) {
+    tapeTool.first = snap;
+    tapeTool.stroke = { placingFirst: true, moved: false };
+  } else {
+    tapeTool.stroke = { placingFirst: false, moved: true };
+  }
+  tapeTool.live = snap;
+  renderTapePill();
+  return true;
+}
+
+function updateTapeStroke(clientX, clientY) {
+  const s = tapeTool.stroke;
+  if (s.placingFirst && !s.moved) {
+    if (Math.hypot(clientX - downX, clientY - downY) <= 8) return; // still just putting the first point down
+    s.moved = true; // now it's a drag out to the second point
+  }
+  const snap = snapTapePoint(clientX, clientY);
+  if (snap) tapeTool.live = snap; // over empty sky the end simply stays where it last was
+  updateTapePillLabel();
+}
+
+function endTapeStroke(cancelled) {
+  const s = tapeTool.stroke;
+  tapeTool.stroke = null;
+  if (cancelled) {
+    if (s.placingFirst) tapeTool.first = null;
+    tapeTool.live = null;
+  } else if (s.placingFirst && !s.moved) {
+    tapeTool.live = null; // a tap: the first point stays put and waits for the second
+  } else {
+    addMeasure(tapeTool.first.point, tapeTool.live.point);
+    tapeTool.first = null;
+    tapeTool.live = null;
+  }
+  renderTapePill();
+}
+
+function addMeasure(a, b) {
+  const dist = a.distanceTo(b);
+  if (dist < 0.5) { toast('Обидві точки в одному місці — замір не додано'); return null; }
+  const m = { id: nextMeasureId++, a: a.clone(), b: b.clone() };
+  measures.push(m);
+  toast(`Замір: ${formatDimMm(roundMm(dist))} мм`);
+  return m;
+}
+
+function removeMeasure(m) {
+  measures = measures.filter((x) => x !== m);
+  if (tapeTool.selected === m) tapeTool.selected = null;
+}
+
+function clearMeasureSelection() {
+  if (!tapeTool.selected) return;
+  tapeTool.selected = null;
+  if (!tapeTool.active) hideEl(modePillEl);
+}
+
+// A finished measurement's number was tapped: pick it (tap again to let go),
+// and offer to delete it.
+function selectMeasure(m) {
+  if (tapeTool.selected === m) { clearMeasureSelection(); if (tapeTool.active) renderTapePill(); return; }
+  if (!tapeTool.active) deselect(); // (also closes whatever pill/panel an object had open)
+  tapeTool.selected = m;
+  if (tapeTool.active) { renderTapePill(); return; }
+  modePillEl.innerHTML = '';
+  const label = document.createElement('span');
+  label.textContent = `Замір: ${formatDimMm(roundMm(m.a.distanceTo(m.b)))} мм`;
+  const del = document.createElement('button');
+  del.textContent = '🗑 Видалити замір';
+  del.addEventListener('click', () => { removeMeasure(m); hideEl(modePillEl); });
+  const close = document.createElement('button');
+  close.className = 'ghost';
+  close.textContent = '✕';
+  close.addEventListener('click', clearMeasureSelection);
+  modePillEl.append(label, del, close);
+  showEl(modePillEl);
+}
+
+// ----- drawing: every measurement as a dimension line over the scene -----
+function measureElFor(key, m) {
+  let els = measureEls.get(key);
+  if (els) return els;
+  const g = document.createElementNS(SVG_NS, 'g');
+  g.setAttribute('class', key === 'live' ? 'measure measure-live' : 'measure');
+  const line = document.createElementNS(SVG_NS, 'line');
+  line.setAttribute('class', 'measure-line');
+  line.setAttribute('marker-start', 'url(#dimArrowTotal)');
+  line.setAttribute('marker-end', 'url(#dimArrowTotal)');
+  const hit = document.createElementNS(SVG_NS, 'rect'); // a fingertip-sized target behind the number
+  hit.setAttribute('class', 'measure-hit');
+  const text = document.createElementNS(SVG_NS, 'text');
+  text.setAttribute('class', 'dim-text measure-text');
+  g.append(line, hit, text);
+  if (m) {
+    const pick = (e) => { e.stopPropagation(); selectMeasure(m); };
+    hit.addEventListener('click', pick);
+    text.addEventListener('click', pick);
+  }
+  measureGroupEl.appendChild(g);
+  els = { g, line, hit, text };
+  measureEls.set(key, els);
+  return els;
+}
+
+// Called every edit-mode frame, after the selected object's own dimensions
+// (whose label boxes come in as `placed`, so these numbers keep clear of
+// those too).
+function updateMeasureOverlay(placed = []) {
+  const wanted = new Set();
+  const draw = (key, m, aWorld, bWorld, suffix) => {
+    const a = slProjectToScreen(aWorld), b = slProjectToScreen(bWorld);
+    const els = measureElFor(key, m);
+    wanted.add(key);
+    if (a.behind || b.behind) { els.g.classList.add('hidden'); return; }
+    els.g.classList.remove('hidden');
+    els.g.classList.toggle('sel', !!m && tapeTool.selected === m);
+    setSvgLine(els.line, a.x, a.y, b.x, b.y);
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    const marker = len >= 26 ? 'url(#dimArrowTotal)' : 'none';
+    els.line.setAttribute('marker-start', marker);
+    els.line.setAttribute('marker-end', marker);
+    const label = `${formatDimMm(roundMm(aWorld.distanceTo(bWorld)))} мм${suffix || ''}`;
+    // the number sits beside the middle of the line, on its upper side
+    let nx = len > 0.5 ? -(b.y - a.y) / len : 0, ny = len > 0.5 ? (b.x - a.x) / len : -1;
+    if (ny > 0) { nx = -nx; ny = -ny; }
+    const w = label.length * DIM_CHAR_PX + 8;
+    let lx = (a.x + b.x) / 2 + nx * (DIM_LABEL_GAP_PX + (Math.abs(nx) * w) / 2), ly = (a.y + b.y) / 2 + ny * DIM_LABEL_GAP_PX;
+    const hits = () => placed.some((p) => Math.abs(p.x - lx) < (p.w + w) / 2 && Math.abs(p.y - ly) < DIM_LABEL_H_PX);
+    for (let tries = 0; tries < 12 && hits(); tries++) { lx += nx * DIM_LABEL_H_PX; ly += ny * DIM_LABEL_H_PX; }
+    placed.push({ x: lx, y: ly, w });
+    els.text.setAttribute('x', lx.toFixed(1));
+    els.text.setAttribute('y', ly.toFixed(1));
+    els.text.textContent = label;
+    els.hit.setAttribute('x', (lx - w / 2 - 6).toFixed(1));
+    els.hit.setAttribute('y', (ly - 15).toFixed(1));
+    els.hit.setAttribute('width', (w + 12).toFixed(1));
+    els.hit.setAttribute('height', '30');
+  };
+  if (mode === 'edit') {
+    for (const m of measures) draw(m.id, m, m.a, m.b);
+    if (tapeTool.active && tapeTool.first && tapeTool.live && tapeTool.stroke && tapeTool.stroke.moved) draw('live', null, tapeTool.first.point, tapeTool.live.point);
+  }
+  for (const [key, els] of measureEls) {
+    if (wanted.has(key)) continue;
+    els.g.remove();
+    measureEls.delete(key);
+  }
+  // where the next point will land, and what it has snapped to
+  const mark = tapeTool.active && mode === 'edit' ? (tapeTool.live || tapeTool.first) : null;
+  const ms = mark ? slProjectToScreen(mark.point) : null;
+  if (!ms || ms.behind) { tapeSnapMarkerEl.classList.add('hidden'); return; }
+  tapeSnapMarkerEl.classList.remove('hidden');
+  tapeSnapMarkerEl.setAttribute('transform', `translate(${ms.x.toFixed(1)}, ${ms.y.toFixed(1)})`);
+  tapeSnapMarkerEl.setAttribute('class', `tape-snap tape-snap-${mark.type}`);
+}
+
+// ----- mode on/off + the pill -----
+let tapePillLabelEl = null;
+function tapePillText() {
+  if (tapeTool.look) return 'Огляд: палець крутить камеру, заміри не ставляться';
+  if (tapeTool.stroke && tapeTool.stroke.moved && tapeTool.first && tapeTool.live) {
+    return `${formatDimMm(roundMm(tapeTool.first.point.distanceTo(tapeTool.live.point)))} мм · прилипло: ${TAPE_SNAP_NAMES[tapeTool.live.type]}`;
+  }
+  if (tapeTool.first) return `Перша точка стоїть (${TAPE_SNAP_NAMES[tapeTool.first.type]}) — торкніться другої або тягніть до неї`;
+  if (tapeTool.selected) return `Вибрано замір ${formatDimMm(roundMm(tapeTool.selected.a.distanceTo(tapeTool.selected.b)))} мм`;
+  return 'Рулетка: поставте палець на першу точку і тягніть до другої';
+}
+function updateTapePillLabel() {
+  if (tapePillLabelEl) tapePillLabelEl.textContent = tapePillText();
+}
+
+function renderTapePill() {
+  if (!tapeTool.active) return;
+  modePillEl.innerHTML = '';
+  tapePillLabelEl = document.createElement('span');
+  tapePillLabelEl.textContent = tapePillText();
+  modePillEl.appendChild(tapePillLabelEl);
+  const add = (text, onClick, cls) => {
+    const b = document.createElement('button');
+    b.textContent = text;
+    if (cls) b.className = cls;
+    b.addEventListener('click', onClick);
+    modePillEl.appendChild(b);
+  };
+  add('👁 Огляд', () => { tapeTool.look = !tapeTool.look; renderTapePill(); }, tapeTool.look ? 'on' : 'ghost');
+  if (tapeTool.first && !tapeTool.stroke) add('⌫ Першу точку', () => { tapeTool.first = null; tapeTool.live = null; renderTapePill(); }, 'ghost');
+  if (tapeTool.selected) add('🗑 Видалити замір', () => { removeMeasure(tapeTool.selected); renderTapePill(); });
+  if (measures.length) add('⌫ Останній замір', () => { removeMeasure(measures[measures.length - 1]); renderTapePill(); }, 'ghost');
+  if (measures.length > 1) add('🗑 Усі заміри', () => { measures = []; tapeTool.selected = null; renderTapePill(); }, 'ghost');
+  add('✓ Готово', exitTapeMode);
+  showEl(modePillEl);
+}
+
+function enterTapeMode() {
+  if (mode !== 'edit') return;
+  if (wallDrawing || tileToolActive || groupSelectMode) { toast('Спершу завершіть поточний інструмент'); return; }
+  exitClayMode();
+  if (slTool.active) cancelSpatialLine();
+  placingKind = null;
+  placingLibraryEntry = null;
+  windowToolActive = false;
+  const keep = tapeTool.selected;
+  deselect();
+  closePopover();
+  tapeTool.active = true;
+  tapeTool.look = false;
+  tapeTool.first = null;
+  tapeTool.live = null;
+  tapeTool.stroke = null;
+  tapeTool.selected = keep;
+  tapeToggleBtn.classList.add('on');
+  renderTapePill();
+  toast('Рулетка: поставте палець на першу точку і тягніть до другої — точки прилипають до вершин, ребер і граней', 3600);
+}
+
+function exitTapeMode() {
+  if (!tapeTool.active) return;
+  tapeTool.active = false;
+  tapeTool.first = null;
+  tapeTool.live = null;
+  tapeTool.stroke = null;
+  tapeTool.selected = null;
+  tapePillLabelEl = null;
+  tapeToggleBtn.classList.remove('on');
+  hideEl(modePillEl);
+}
+
+tapeToggleBtn.addEventListener('click', () => { tapeTool.active ? exitTapeMode() : enterTapeMode(); });
 
 // ---------------------------------------------------------------------------
 // Selection panel rendering
@@ -5882,6 +6297,7 @@ function closePopover() {
 function openPopover(panel, btn) {
   const wasOpenForSameBtn = !popoverEl.classList.contains('hidden') && btn.classList.contains('active');
   exitClayMode(); // a toolbar panel means another tool is about to take over
+  exitTapeMode();
   closePopover();
   if (wasOpenForSameBtn) return;
   btn.classList.add('active');
@@ -6437,6 +6853,12 @@ canvas.addEventListener('pointerdown', (e) => {
         // locked out while this tool was active).
         startLookDrag(e.pointerId, e.clientX, e.clientY);
       }
+    } else if (mode === 'edit' && tapeTool.active) {
+      // The finger measures if there's something under it to measure from
+      // ("Огляд" off); otherwise it turns the camera like anywhere else.
+      const works = !tapeTool.look && beginTapeStroke(e.clientX, e.clientY);
+      touchDebug('сцена', works ? `рулетка: ${TAPE_SNAP_NAMES[tapeTool.live.type]}` : 'рулетка: нічого (поворот камери)');
+      if (!works) startLookDrag(e.pointerId, e.clientX, e.clientY);
     } else if (mode === 'edit' && clayTool.active) {
       // "Огляд" and "Різати" (which works by taps) leave the finger to the
       // camera; the other tools take it if there's something to work on
@@ -6455,7 +6877,7 @@ canvas.addEventListener('pointerdown', (e) => {
       startLookDrag(e.pointerId, e.clientX, e.clientY);
       armLongPress(e.clientX, e.clientY); // held still on the selected object → "Властивості"
     }
-  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !gizmoDragActive() && !sculptDragging && !clayTool.stroke) {
+  } else if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !gizmoDragActive() && !sculptDragging && !clayTool.stroke && !tapeTool.stroke) {
     pinchStartDist = currentPinchDist();
     if (mode === 'walk') {
       // Walking never "zooms toward" anything the way flying does — pinch
@@ -6498,7 +6920,11 @@ canvas.addEventListener('pointermove', (e) => {
     updateClayStroke(e.clientX, e.clientY);
     return;
   }
-  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !gizmoDragActive() && !sculptDragging && !clayTool.stroke) {
+  if (tapeTool.stroke && e.pointerId === primaryPointerId) {
+    updateTapeStroke(e.clientX, e.clientY);
+    return;
+  }
+  if (activePointers.size === 2 && !moveMode && !paperDrawing && !tileDrag && !gizmoDragActive() && !sculptDragging && !clayTool.stroke && !tapeTool.stroke) {
     const dist = currentPinchDist();
     if (mode === 'walk') {
       // Pure optical zoom (FOV) from the pinch distance — completely
@@ -6626,6 +7052,7 @@ function endPointer(e) {
   if (e.pointerId === primaryPointerId) { moveDragGizmo = null; rotateDragGizmo = null; }
   if (vertexDrag && e.pointerId === primaryPointerId) { endVertexDrag(e.type === 'pointercancel'); return; } // a vertex drag is never a tap
   if (clayTool.stroke && e.pointerId === primaryPointerId) { endClayStroke(); renderClayPill(); return; } // nor is a stroke on clay
+  if (tapeTool.stroke && e.pointerId === primaryPointerId) { endTapeStroke(e.type === 'pointercancel'); return; } // the tape decides tap-or-drag itself
 
   if (e.type === 'pointercancel') {
     if (mode === 'edit' && moveMode) moveDragging = false;
@@ -6722,6 +7149,8 @@ function handleEditTap(x, y) {
   // arriving in the same tick as an object add/move never raycasts stale.
   scene.updateMatrixWorld(true);
 
+  if (tapeTool.active) return; // the tape handles its own touches (beginTapeStroke…) — a tap here selects nothing
+  if (tapeTool.selected) clearMeasureSelection(); // a tap anywhere else lets go of a picked measurement
   if (clayTool.active) {
     // In clay mode a tap never selects/places anything — it's either a cut point or nothing.
     if (clayTool.tool === 'cut') clayCutTap(x, y);
@@ -7058,6 +7487,7 @@ refreshFlyUi();
 const spatialLineFabBtn = document.getElementById('spatialLineFab');
 spatialLineFabBtn.addEventListener('click', () => {
   exitClayMode();
+  exitTapeMode();
   if (slTool.active) {
     cancelSpatialLine();
     spatialLineFabBtn.classList.remove('on');
@@ -7072,6 +7502,7 @@ spatialLineFabBtn.addEventListener('click', () => {
 
 function enterWalkMode() {
   exitClayMode();
+  exitTapeMode();
   mode = 'walk';
   orbitActive = false; // no orbit pivot while walking — deselect() below drops `selected` anyway
   setAutoRotate(false);
@@ -7492,6 +7923,7 @@ function buildProjectData() {
     app: 'creslarnet-3d', version: 2, units: 'mm',
     ground: { type: ground.material.userData.creslarnetType, color: ground.material.userData.creslarnetColor },
     objects: objects.map((rec) => serializeObjectRecord(rec)),
+    measures: measures.map((m) => ({ a: m.a.toArray(), b: m.b.toArray() })), // "Рулетка" measurements left on the scene
   };
 }
 
@@ -7536,6 +7968,8 @@ async function saveProject() {
 }
 
 function clearScene() {
+  measures = [];
+  tapeTool.selected = null;
   deselect();
   [...objects].forEach(removeObject);
 }
@@ -7598,6 +8032,9 @@ function loadProject(data) {
   }
   nextId = Math.max(nextId, maxId + 1); // never hand out an id that's already in use
   updateLinks();
+  measures = (Array.isArray(data.measures) ? data.measures : [])
+    .filter((m) => Array.isArray(m.a) && Array.isArray(m.b))
+    .map((m) => ({ id: nextMeasureId++, a: new THREE.Vector3().fromArray(m.a), b: new THREE.Vector3().fromArray(m.b) }));
   toast('Проєкт завантажено');
 }
 
@@ -8190,6 +8627,8 @@ function animate() {
     updateFreeCamera(dt, 0);
     updateWalkFloorY(dt);
   }
+  if (mode !== 'edit') dimPlacedLabels.length = 0;
+  updateMeasureOverlay(dimPlacedLabels);
   updateMinimap();
   renderer.render(scene, camera);
   renderAxisGizmo();
@@ -8236,6 +8675,8 @@ window.__creslarnet3d = {
     faceDirection(new THREE.Vector3().subVectors(target, camera.position).normalize());
   },
   pickObjectGizmo, slPickHandle, removeGizmo, openPopover, dimGroups,
+  tapeTool, snapTapePoint, enterTapeMode, exitTapeMode, selectMeasure, measureEls,
+  get measures() { return measures; },
   // put the camera at one point looking at another (tests/debugging)
   lookFrom(from, target) {
     camera.position.set(from.x, from.y, from.z);
