@@ -99,6 +99,14 @@
        see touchDebug in app.js. Tap it to hide. -->
   <div id="touchDebug" class="touch-debug">Дотик — · торкніться екрана</div>
 
+  <!-- What the selected object's gizmo shows: arrows (slide along an axis)
+       or rings (turn about an axis). Only on screen while the gizmo is —
+       see setObjectGizmoMode in app.js. -->
+  <div id="gizmoModes" class="gizmo-modes hidden">
+    <button id="gizmoMoveBtn" class="on" title="Стрілки: рух об’єкта вздовж осі">Рух</button>
+    <button id="gizmoRotateBtn" title="Кільця: обертання об’єкта навколо осі">Обертання</button>
+  </div>
+
   <div id="scaleBar" class="scale-bar" aria-hidden="true">
     <div id="scaleBarFill" class="scale-bar-fill"></div>
     <span id="scaleBarLabel" class="scale-bar-label">—</span>

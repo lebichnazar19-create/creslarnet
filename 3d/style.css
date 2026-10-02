@@ -452,6 +452,34 @@ html, body {
 .fly-vbtn b { font-size: 18px; line-height: 1; }
 .fly-stick, .fly-speed, .fly-vbtn { pointer-events: auto; }
 .fly-stick.held, .fly-vbtn.held { background: rgba(131, 56, 236, 0.55); }
+/* flight is off while a gizmo handle is being dragged — see layoutFlyUi */
+.fly-left.paused, .fly-right.paused { opacity: 0.18; }
+
+/* ---------- gizmo of the selected object: "Рух" / "Обертання" ---------- */
+.gizmo-modes {
+  position: fixed;
+  right: max(10px, env(safe-area-inset-right));
+  top: calc(max(10px, env(safe-area-inset-top)) + 56px); /* under the scale bar */
+  z-index: 18;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--hud-bg);
+  border: 1px solid var(--hud-line);
+  border-radius: 14px;
+  backdrop-filter: blur(8px);
+}
+.gizmo-modes button {
+  border: none;
+  border-radius: 10px;
+  padding: 9px 12px;
+  background: transparent;
+  color: var(--hud-text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+.gizmo-modes button.on { background: var(--accent); color: #fff; }
 
 /* ---------- "Рулетка": measurements as dimension lines + the snap marker ---------- */
 .measure-line { stroke: #39ff7a; stroke-width: 1.4; }

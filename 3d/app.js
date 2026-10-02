@@ -1,4 +1,5 @@
 import * as THREE from './vendor/three/three.module.min.js';
+import { TransformControls } from './vendor/three/TransformControls.js';
 import { CSG } from './csg.js';
 import { createMaterial, createPaintMaterial, MATERIAL_LABELS } from './materials.js';
 
@@ -1145,11 +1146,140 @@ function convertSketchLine(record, targetKind) {
 }
 
 // ---------------------------------------------------------------------------
+// The gizmo — three.js' own TransformControls: the same control, with the
+// same two additions on top of it, that was first proven in isolation on a
+// real phone (gizmo-test.html). It replaces the arrows and rings this app
+// used to build and hit-test by hand, for the selected object and for the
+// "Жила" tool alike.
+//
+// What comes from the control: the handles themselves (it keeps them one
+// size on screen at any distance and any field of view), which handle a
+// touch is on, and all the maths of a drag. What stays the app's own is WHO
+// gets a touch. The control normally listens on the canvas by itself; here
+// those listeners are taken off and the app's one pointer pipeline (see
+// "Pointer interaction") hands it the touches instead — so a gizmo drag
+// belongs to exactly one finger (a second one can neither hijack it nor end
+// it), and the gizmo takes its turn with the vertex dots, the long press and
+// every tool exactly where the old one did.
+// ---------------------------------------------------------------------------
+const GIZMO_SIZE = 1.35; // as on the test page — handles sized for a fingertip
+const GIZMO_MODES = ['translate', 'rotate', 'scale'];
+
+// `handles` — which of the control's stock handles stay, per mode, e.g.
+// { translate: ['X', 'Y', 'Z'] }. The stock gizmo also carries handles that
+// are NOT one axis: squares that slide in a plane, a centre handle that moves
+// freely, a free-rotate ball and a big "turn about the view" ring that spans
+// the whole width of a phone held upright. Whatever isn't listed is removed,
+// the drawn handle and its invisible touch target both — a fingertip can only
+// ever land on something that was asked for.
+function createGizmo(space, handles) {
+  const tc = new TransformControls(camera, canvas);
+  canvas.removeEventListener('pointerdown', tc._onPointerDown);
+  canvas.removeEventListener('pointermove', tc._onPointerHover);
+  canvas.removeEventListener('pointerup', tc._onPointerUp);
+  tc.setSize(GIZMO_SIZE);
+  tc.setSpace(space);
+  tc.setRotationSnap(THREE.MathUtils.degToRad(1)); // whole degrees
+  for (const m of GIZMO_MODES) {
+    for (const group of [tc._gizmo.gizmo[m], tc._gizmo.picker[m]]) {
+      for (const child of [...group.children]) if (!(handles[m] || []).includes(child.name)) group.remove(child);
+    }
+  }
+  scene.add(tc);
+  return tc;
+}
+
+// The app's own colours on the handles ({ X: 0x…, … }) in place of the
+// control's red/green/blue — a colour means the same axis everywhere.
+function tintGizmo(tc, colors) {
+  for (const m of GIZMO_MODES) {
+    for (const handle of tc._gizmo.gizmo[m].children) {
+      if (colors[handle.name] === undefined) continue;
+      handle.material.color.setHex(colors[handle.name]);
+      handle.material._color = handle.material.color.clone(); // what the control goes back to after highlighting a held handle
+    }
+  }
+}
+
+// A touch as the control wants it: −1…1 across the canvas, plus the button
+// its own checks look at (0 on the way down/up, −1 for a move).
+function gizmoPointer(clientX, clientY, button) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: ((clientX - rect.left) / rect.width) * 2 - 1, y: -((clientY - rect.top) / rect.height) * 2 + 1, button };
+}
+
+// Which handle of `tc` the finger is on: { tc, name, distance } or null.
+// Only looks — nothing is grabbed, so several controls (and the vertex dots)
+// can be asked before deciding whose touch it is.
+function pickGizmo(tc, clientX, clientY) {
+  if (!tc.object || !tc.visible) return null;
+  tc.updateMatrixWorld(); // handles where the object and the camera are NOW, not as of the last drawn frame
+  const ray = tc.getRaycaster();
+  ray.setFromCamera(gizmoPointer(clientX, clientY, 0), camera);
+  const hit = ray.intersectObject(tc._gizmo.picker[tc.mode], true).find((h) => h.object.visible);
+  return hit ? { tc, name: hit.object.name, distance: hit.distance } : null;
+}
+
+// Starts dragging the handle under the finger: the control's own touch-down
+// sequence, with the one fix it needs for TOUCH. The control measures a drag
+// on a helper plane that it turns to suit the handle being dragged — but
+// only when a frame is drawn. A mouse hovers over an arrow (plane turned,
+// frames pass) long before its button goes down; a finger has no hover:
+// "which handle" and "the drag starts here" happen inside one and the same
+// touch-down, so the start point got measured on the plane as it lay for NO
+// handle, and the first movement — measured on the re-turned plane — threw
+// the object hundreds of mm along the axis. Turning the plane right here,
+// between the two, removes that leap. Nothing moves on the way down.
+function grabGizmo(tc, clientX, clientY) {
+  if (!tc.object || !tc.visible) return false;
+  const pointer = gizmoPointer(clientX, clientY, 0);
+  tc.updateMatrixWorld();
+  tc.pointerHover(pointer); // which handle — sets tc.axis
+  if (tc.axis === null) return false;
+  tc._plane.updateMatrixWorld(true);
+  tc.rotationAngle = 0; // nothing turned yet in THIS drag (the control only writes it on a move)
+  tc.pointerDown(pointer);
+  tc.userData.grab = pointer;
+  return tc.dragging;
+}
+
+// A ring turns by how far the finger has travelled across the plane facing
+// the camera, in mm — and the same finger travel covers up to three times as
+// many mm with the field of view opened to 120° as at the 60° the control
+// was tried at. The travel is scaled back to what it would be at 60°, so a
+// ring turns at one speed under the finger whatever "Кут огляду" is set to.
+const GIZMO_ROTATE_REF_TAN = Math.tan(THREE.MathUtils.degToRad(30));
+function dragGizmoTo(tc, clientX, clientY) {
+  const pointer = gizmoPointer(clientX, clientY, -1);
+  const grab = tc.userData.grab;
+  if (tc.mode === 'rotate' && grab) {
+    const k = GIZMO_ROTATE_REF_TAN / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+    pointer.x = grab.x + (pointer.x - grab.x) * k;
+    pointer.y = grab.y + (pointer.y - grab.y) * k;
+  }
+  tc.pointerMove(pointer);
+}
+
+// Lets go: the drag is over and whatever it moved stays where it is.
+function releaseGizmo(tc) {
+  tc.pointerUp({ button: 0 });
+  tc.userData.grab = null;
+}
+
+// How far from its centre a gizmo's arrows reach on screen (to the tip of an
+// arrowhead), CSS px — the control sizes its handles as a fixed share of the
+// viewport's height.
+function gizmoReachPx() {
+  const viewH = renderer.domElement.clientHeight || window.innerHeight || 1;
+  return 0.6 * (1.9 / 8) * GIZMO_SIZE * viewH;
+}
+
+// ---------------------------------------------------------------------------
 // "Жила" (the "Просторова лінія" tool) — a polyline drawn in 3D space (not
-// confined to a paper sheet) with a small on-screen gizmo: axis arrows
-// X / Y / Z, a fourth arrow "H" with a set tilt (45° by default — the two
-// rings or the number fields in the pill re-aim it), and a centre ball for
-// free movement.
+// confined to a paper sheet) with an on-screen gizmo: axis arrows
+// X / Y / Z, a fourth arrow "H" with a set tilt (45° by default — the
+// number fields in the pill re-aim it, or the two rings "↻ Напрям H" puts
+// in place of the X / Y / Z arrows), and a centre ball for free movement.
 //
 // How a line gets drawn:
 //   1. tap the screen — the gizmo appears there; that's the first point,
@@ -1185,9 +1315,10 @@ const slTool = {
   materialKey: 'metal',    // what a finished "Жила" is made of until changed in its own panel
   color: '#b87333',        // copper
   showAngle: false,        // "Показати градуси" toggle — turn-angle readout from the 2nd segment on
-  gizmo: null,             // { group, targets, customGroup, ringT } — see buildSlGizmo/attachSlGizmo
-  customAngle: 0,          // radians, azimuth (around Y) of the H axis — purple "N" ring / "поворот" field
-  customElevation: Math.PI / 4, // radians, H's tilt out of horizontal — yellow "T" ring / "нахил" field (45° by default)
+  gizmo: null,             // set while the gizmo is on screen (the first point exists) — see attachSlGizmo
+  aiming: false,           // "↻ Напрям H": the two rings that turn H are shown in place of the X / Y / Z arrows
+  customAngle: 0,          // radians, azimuth (around Y) of the H axis — purple ring / "поворот" field
+  customElevation: Math.PI / 4, // radians, H's tilt out of horizontal — yellow ring / "нахил" field (45° by default)
   previewMesh: null,       // thin line covering fixed + stretched segments
   startMarker: null,       // green dot on the first point once the chain can be closed into a frame
   drag: null,              // { kind: 'axis'|'center'|'start'|'ring', ... } — exactly one at a time
@@ -1201,17 +1332,11 @@ const SL_H_COLOR = 0x8338ec;
 
 function roundVec(v) { return new THREE.Vector3(roundMm(v.x), roundMm(v.y), roundMm(v.z)); }
 
-// Whole degrees — the same 1° step the object rotation controls use.
-function snapAngleRad(a) {
-  const step = Math.PI / 180;
-  return Math.round(a / step) * step;
-}
-
 // The "H" axis: a direction with a set tilt. Two values drive it — azimuth
-// (slTool.customAngle, the purple "N" ring or the "поворот" field) spins it
-// around Y, and elevation (slTool.customElevation, the yellow "T" ring or
+// (slTool.customAngle, the purple ring or the "поворот" field) spins it
+// around Y, and elevation (slTool.customElevation, the yellow ring or
 // the "нахил" field, 45° by default) tilts it up/down out of the horizontal
-// plane, around the axis the T ring itself visually sits on (Z rotated by
+// plane, around the axis the yellow ring itself visually sits on (Z rotated by
 // the current azimuth) — so tilting always happens in the vertical plane
 // the arrow currently occupies, regardless of which way it's already aimed.
 function slCustomDir() {
@@ -1254,137 +1379,75 @@ function buildAxisLetterSprite(letter, cssColor, size) {
   return sprite;
 }
 
-// Three bidirectional arrows (drag either way once grabbed — same
-// convention as the regular object move-gizmo's own arrows), the H arrow
-// with the two rings that aim it, and a centre handle.
-// mm, sized once at a fixed baseline; updateSlGizmoScale() then rescales the
-// whole group every edit-mode frame to a constant on-screen size regardless
-// of camera distance — without that, a point placed on a distant wall (or
-// one the camera later zoomed away from) got a gizmo that shrank to a few
-// on-screen pixels, impossible to grab on a touchscreen.
-const SL_GIZMO_SIZE = 280;
-// H's shaft as a fraction of the gizmo size — a little shorter than X/Y/Z's
-// 0.9 so the four arrows are told apart by length too.
-const SL_H_SHAFT = 0.75;
-function buildSlGizmo(size = SL_GIZMO_SIZE) {
-  const group = new THREE.Group();
-  group.userData.isHelper = true;
-  const targets = [];
-  const shaftLen = size * 0.9, shaftR = size * 0.05, headLen = size * 0.3, headR = size * 0.13;
-  const hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, depthTest: false });
+// The "Жила" gizmo is three of the controls above sat on one point:
+//   slGizmo    — arrows X / Y / Z along the world axes and the white ball
+//                in the middle (free movement);
+//   slGizmoH   — the one purple arrow H, along slCustomDir();
+//   slGizmoAim — two rings that turn H by hand: purple (azimuth, about the
+//                vertical) and yellow (tilt). They're shown INSTEAD of the
+//                X / Y / Z arrows, while "↻ Напрям H" in the pill is on:
+//                rings and arrows never share the screen, so a finger can't
+//                take one for the other.
+// A control moves or turns an object, so each sits on an empty one (a
+// "proxy") placed at the gizmo's point. What a drag did to the proxy is read
+// back and turned into the segment being stretched — see updateSlDrag.
+const slProxy = new THREE.Object3D();
+const slProxyH = new THREE.Object3D();   // turned so that its own X axis IS the H direction
+const slProxyAim = new THREE.Object3D(); // turned by H's azimuth only: its Y is the vertical, its Z the axis H tilts about
+scene.add(slProxy, slProxyH, slProxyAim);
+const slGizmo = createGizmo('world', { translate: ['X', 'Y', 'Z', 'XYZ'] });
+const slGizmoH = createGizmo('local', { translate: ['X'] });
+const slGizmoAim = createGizmo('local', { rotate: ['Y', 'Z'] });
+slGizmoAim.setMode('rotate');
+tintGizmo(slGizmo, { X: AXIS_COLOR.x, Y: AXIS_COLOR.y, Z: AXIS_COLOR.z });
+tintGizmo(slGizmoH, { X: SL_H_COLOR });
+tintGizmo(slGizmoAim, { Y: SL_H_COLOR, Z: 0xffd60a });
 
-  for (const axisKey of ['x', 'y', 'z']) {
-    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axisKey], depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 });
-    const arrow = new THREE.Group();
-    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 10), mat);
-    shaft.position.y = shaftLen / 2;
-    shaft.renderOrder = 999;
-    const head = new THREE.Mesh(new THREE.ConeGeometry(headR, headLen, 10), mat);
-    head.position.y = shaftLen + headLen / 2;
-    head.renderOrder = 999;
-    arrow.add(shaft, head);
-    arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), SL_AXIS_DIRS[axisKey]);
-    shaft.userData.isHelper = true; head.userData.isHelper = true;
-
-    const shaftHit = new THREE.Mesh(new THREE.CylinderGeometry(shaftR * 3.5, shaftR * 3.5, shaftLen, 8), hitMat);
-    shaftHit.position.y = shaftLen / 2;
-    const headHit = new THREE.Mesh(new THREE.ConeGeometry(headR * 1.5, headLen * 1.3, 8), hitMat);
-    headHit.position.y = shaftLen + headLen / 2;
-    shaftHit.userData.slAxis = axisKey; headHit.userData.slAxis = axisKey;
-    shaftHit.userData.isHelper = true; headHit.userData.isHelper = true;
-    arrow.add(shaftHit, headHit);
-    targets.push(shaftHit, headHit);
-
-    const letter = buildAxisLetterSprite(SL_AXIS_LABEL[axisKey], AXIS_COLOR_CSS[axisKey], size * 0.3);
-    letter.position.y = shaftLen + headLen + size * 0.17;
-    arrow.add(letter);
-    group.add(arrow);
+// The centre handle: a small, plainly-neutral (not axis-coloured) ball.
+// Dragging it moves the gizmo freely, in the plane facing the camera: before
+// any segment exists that picks the place of the first point, afterwards it
+// stretches a free (not axis-locked) segment. Its touch zone is kept small —
+// a finger aimed at an arrow a little way out must get the arrow.
+for (const [group, radius] of [[slGizmo._gizmo.gizmo.translate, 0.07], [slGizmo._gizmo.picker.translate, 0.13]]) {
+  const ball = group.children.find((c) => c.name === 'XYZ');
+  ball.geometry.dispose();
+  ball.geometry = new THREE.SphereGeometry(radius, 16, 12);
+  if (group === slGizmo._gizmo.gizmo.translate) {
+    ball.material.color.setHex(0xf4f2f8);
+    ball.material._color = ball.material.color.clone();
+    ball.material.opacity = ball.material._opacity = 0.9;
   }
-
-  // Centre handle — a small, plainly-neutral (not axis-coloured) ball right
-  // at the gizmo's own origin. Dragging it moves the gizmo freely to
-  // wherever the finger lands: before any segment exists that picks the
-  // place of the first point, afterwards it stretches a free (not
-  // axis-locked) segment. Only drawn/visible, not itself in `targets`: it's
-  // picked in screen space (slPickHandle), same reasoning as the arrows.
-  const moveHandleMat = new THREE.MeshBasicMaterial({ color: 0xf4f2f8, depthTest: false, depthWrite: false, transparent: true, opacity: 0.9 });
-  const moveHandle = new THREE.Mesh(new THREE.SphereGeometry(size * 0.11, 14, 10), moveHandleMat);
-  moveHandle.renderOrder = 999;
-  moveHandle.userData.isHelper = true;
-  group.add(moveHandle);
-
-  // Rotation ring "N" (horizontal plane) — aims the H arrow's azimuth.
-  // Radius kept well outside the arrows' own reach (tip at
-  // shaftLen+headLen = 1.2*size): a raycast anywhere past roughly 3/4 of the
-  // way out an arrow otherwise tends to hit the ring's fatter hit-torus
-  // instead of the arrow itself, which is why arrow-picking below uses
-  // screen-space distance rather than a 3D raycast at all.
-  const ringR = size * 1.5, tubeR = size * 0.03;
-  const ringMat = new THREE.MeshBasicMaterial({ color: SL_H_COLOR, depthTest: false, depthWrite: false, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
-  const ring = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), ringMat);
-  ring.rotateX(-Math.PI / 2);
-  ring.userData.isHelper = true;
-  group.add(ring);
-  const ringHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 4, 8, 48), hitMat);
-  ringHit.rotateX(-Math.PI / 2);
-  ringHit.userData.slRing = true;
-  ringHit.userData.isHelper = true;
-  group.add(ringHit);
-  targets.push(ringHit);
-
-  // Ring "T" (yellow) — tilts the H arrow up/down out of the horizontal
-  // plane, giving it a full sphere of directions instead of just the plane
-  // N alone sweeps through. A bare TorusGeometry already lies in the local
-  // XY plane (hole along local Z) — exactly the vertical ring containing
-  // the Y axis, no build-time rotation needed like N's. As N spins the
-  // azimuth, updateSlCustomArrow() spins this ring's own quaternion by the
-  // same amount around Y so it visibly stays the vertical ring containing
-  // whichever way the arrow currently points. ringTHit is a child of ringT
-  // (not a sibling, unlike N's) so it always inherits that same live
-  // rotation for free.
-  const ringMatT = new THREE.MeshBasicMaterial({ color: 0xffd60a, depthTest: false, depthWrite: false, transparent: true, opacity: 0.75, side: THREE.DoubleSide });
-  const ringT = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), ringMatT);
-  ringT.userData.isHelper = true;
-  group.add(ringT);
-  const ringTHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 4, 8, 48), hitMat);
-  ringTHit.userData.slRingT = true;
-  ringTHit.userData.isHelper = true;
-  ringT.add(ringTHit);
-  targets.push(ringTHit);
-
-  // H arrow (purple) — orientation kept in sync with
-  // slTool.customAngle/customElevation by updateSlCustomArrow().
-  const customGroup = new THREE.Group();
-  const customMat = new THREE.MeshBasicMaterial({ color: SL_H_COLOR, depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 });
-  const customShaftLen = size * SL_H_SHAFT;
-  const customShaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, customShaftLen, 10), customMat);
-  customShaft.position.y = customShaftLen / 2;
-  customShaft.renderOrder = 999;
-  const customHead = new THREE.Mesh(new THREE.ConeGeometry(headR, headLen, 10), customMat);
-  customHead.position.y = customShaftLen + headLen / 2;
-  customHead.renderOrder = 999;
-  customGroup.add(customShaft, customHead);
-  customShaft.userData.isHelper = true; customHead.userData.isHelper = true;
-  const customShaftHit = new THREE.Mesh(new THREE.CylinderGeometry(shaftR * 3.5, shaftR * 3.5, customShaftLen, 8), hitMat);
-  customShaftHit.position.y = customShaftLen / 2;
-  const customHeadHit = new THREE.Mesh(new THREE.ConeGeometry(headR * 1.5, headLen * 1.3, 8), hitMat);
-  customHeadHit.position.y = customShaftLen + headLen / 2;
-  customShaftHit.userData.slAxis = 'h'; customHeadHit.userData.slAxis = 'h';
-  customShaftHit.userData.isHelper = true; customHeadHit.userData.isHelper = true;
-  customGroup.add(customShaftHit, customHeadHit);
-  targets.push(customShaftHit, customHeadHit);
-  const hLetter = buildAxisLetterSprite('H', '#b98cff', size * 0.3);
-  hLetter.position.y = customShaftLen + headLen + size * 0.17;
-  customGroup.add(hLetter);
-  group.add(customGroup);
-
-  return { group, targets, customGroup, ringT };
 }
 
+// H is one arrow, not the control's stock pair pointing both ways (it's
+// still dragged either way once grabbed): the half on the −X side goes, the
+// drawn arrowhead and its touch target both, so it can't lie across the
+// X / Y / Z arrows on the far side of the centre.
+for (const group of [slGizmoH._gizmo.gizmo.translate, slGizmoH._gizmo.picker.translate]) {
+  for (const child of [...group.children]) {
+    child.geometry.computeBoundingBox();
+    if (child.geometry.boundingBox.max.x < 0.01) group.remove(child);
+  }
+}
+
+// X / Y / Z / H just past each arrow's tip. A letter rides on the arrow's
+// own handle, so it's sized and hidden together with it.
+for (const [tc, name, letter, cssColor] of [
+  [slGizmo, 'X', 'X', AXIS_COLOR_CSS.x], [slGizmo, 'Y', 'Y', AXIS_COLOR_CSS.y], [slGizmo, 'Z', 'Z', AXIS_COLOR_CSS.z],
+  [slGizmoH, 'X', 'H', '#b98cff'],
+]) {
+  const sprite = buildAxisLetterSprite(letter, cssColor, 0.17);
+  sprite.position.copy(SL_AXIS_DIRS[name.toLowerCase()]).multiplyScalar(0.72);
+  sprite.renderOrder = Infinity; // with the handles, over everything else
+  sprite.material.fog = false;   // ...and, like them, not fading into the fog from far away
+  tc._gizmo.gizmo.translate.children.find((c) => c.name === name).add(sprite);
+}
+
+// Turns the H arrow and its two rings to slTool.customAngle/customElevation.
+const _slTiltQuat = new THREE.Quaternion();
 function updateSlCustomArrow() {
-  if (!slTool.gizmo) return;
-  slTool.gizmo.customGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), slCustomDir());
-  slTool.gizmo.ringT.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), slTool.customAngle);
+  slProxyAim.quaternion.setFromAxisAngle(SL_AXIS_DIRS.y, slTool.customAngle);
+  slProxyH.quaternion.copy(slProxyAim.quaternion).multiply(_slTiltQuat.setFromAxisAngle(SL_AXIS_DIRS.z, slTool.customElevation));
 }
 
 // How many millimetres of the world one CSS pixel covers at a given point —
@@ -1401,46 +1464,47 @@ function worldPerPixelAt(point) {
   return (2 * depth * Math.tan((camera.fov * Math.PI) / 360)) / viewH;
 }
 
-// The gizmo's size ON SCREEN, in CSS pixels (its X/Y/Z arrows reach 1.2×
-// this, the rings 1.5×) — sized for a fingertip, and the same at any
-// distance, any field of view, any screen. It used to be sized from
-// distance alone and capped at 900 mm: seen from ten metres away, or with
-// the field of view opened up, an arrow shrank to ~20 px, entirely inside
-// the centre ball's own touch zone — so a touch on an arrow was read as a
-// touch on the ball, the "arrow does nothing" bug.
-const SL_GIZMO_PX = 80;
-// Scaling the whole group (rather than rebuilding its geometry) is cheap
-// enough to do every frame, so it stays right as the camera moves.
-function updateSlGizmoScale() {
-  if (!slTool.gizmo) return;
-  slTool.gizmo.group.scale.setScalar((worldPerPixelAt(slTool.gizmo.group.position) * SL_GIZMO_PX) / SL_GIZMO_SIZE);
+// Moves the gizmo — all three controls' proxies — to `point`.
+function slMoveGizmo(point) {
+  slProxy.position.copy(point);
+  slProxyH.position.copy(point);
+  slProxyAim.position.copy(point);
 }
 
-// Puts the gizmo at `point` — built once per drawing session and then just
-// moved, so its letter textures aren't regenerated for every new point.
-function attachSlGizmo(point) {
-  if (!slTool.gizmo) {
-    slTool.gizmo = buildSlGizmo();
-    scene.add(slTool.gizmo.group);
+// Which of the three controls are on screen: the H arrow always, and either
+// the X / Y / Z arrows with the centre ball or — while H is being aimed —
+// its two rings.
+function slShowGizmo() {
+  if (!slTool.gizmo) return;
+  if (slTool.aiming) {
+    slGizmo.detach();
+    slGizmoAim.attach(slProxyAim);
+  } else {
+    slGizmoAim.detach();
+    slGizmo.attach(slProxy);
   }
-  slTool.gizmo.group.position.copy(point);
-  updateSlGizmoScale(); // size it correctly from the very first frame, not just the next one
+  slGizmoH.attach(slProxyH);
+}
+
+// Puts the gizmo at `point`. The controls themselves are built once, at
+// startup, and only shown/hidden and moved from then on.
+function attachSlGizmo(point) {
+  slTool.gizmo = slGizmo;
+  slMoveGizmo(point);
   updateSlCustomArrow();
+  slShowGizmo();
 }
 
 function detachSlGizmo() {
-  if (!slTool.gizmo) return;
-  slTool.gizmo.group.parent?.remove(slTool.gizmo.group);
-  slTool.gizmo.group.traverse((o) => {
-    if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); }
-    if (o.isSprite) { o.material.map?.dispose(); o.material.dispose(); }
-  });
+  for (const tc of [slGizmo, slGizmoH, slGizmoAim]) {
+    if (tc.dragging) releaseGizmo(tc);
+    tc.detach();
+  }
   slTool.gizmo = null;
 }
 
 // Shortest distance from point (px,py) to the screen-space segment (a->b) —
-// plain 2D geometry, used by slPickHandle to find which arrow a tap landed
-// nearest to.
+// plain 2D geometry, used by the tape measure's edge snapping.
 function distToSegmentPx(px, py, ax, ay, bx, by) {
   const dx = bx - ax, dy = by - ay;
   const lenSq = dx * dx + dy * dy;
@@ -1450,70 +1514,22 @@ function distToSegmentPx(px, py, ax, ay, bx, by) {
   return Math.hypot(px - cx, py - cy);
 }
 
-// One function decides what a tap/pointerdown on the gizmo actually landed
-// on — centre handle, an arrow, or a ring. Centre and arrows are picked by
-// screen-space distance, not a 3D raycast: simulating the 3D-raycast
-// approach directly showed two independent failure modes — the ring fully
-// encircling the arrows can be the geometrically CLOSEST hit along a ray
-// visually aimed at an arrow's shaft, and all the arrows sharing one origin
-// means their fattened hit-cylinders genuinely overlap near the base, so
-// "nearest 3D hit" doesn't reliably match "nearest on screen". The ring is
-// still a plain 3D raycast (against its own two distinct hit-tori) since by
-// this point an arrow can no longer wrongly intercept it first.
-//
-// The centre zone is deliberately layered rather than one big circle: a
-// touch right on the ball is always the (free-moving) centre handle, but a
-// touch a little further out that lies clearly ON an arrow's own line is
-// that arrow. One wide centre circle used to swallow the lower third of
-// every arrow — grab an arrow near its base and the "axis" drag was
-// silently a free drag instead, which is exactly the sideways slip an axis
-// arrow must never have.
-const SL_CENTER_CORE_PX = 22;      // always the centre handle
-const SL_CENTER_HIT_PX = 36;       // centre handle unless the touch is clearly on an arrow
-const SL_ARROW_NEAR_PX = 16;       // "clearly on an arrow" inside that outer centre zone
-const SL_ARROW_HIT_PX = 46;        // fingertip-sized tolerance further out along an arrow
-const SL_ARROW_MIN_SCREEN_PX = 14; // an arrow aimed straight at/away from the camera has no on-screen line to grab
+// One function decides what a touch on the gizmo landed on — the centre
+// ball, an arrow, or (while H is being aimed) a ring: { kind, axis, tc },
+// `tc` being the control that handle belongs to. X / Y / Z and H are two
+// controls on the same point, so where their touch zones overlap on screen
+// the one nearer the camera under the finger wins, the same rule each
+// control already uses among its own handles.
 function slPickHandle(clientX, clientY) {
   if (!slTool.gizmo) return null;
-  const origin = slTool.gizmo.group.position;
-  const base = projectToScreenPx(origin);
-  const dCenter = Math.hypot(clientX - base.x, clientY - base.y);
-  if (dCenter <= SL_CENTER_CORE_PX) return { kind: 'center' };
-
-  const scale = slTool.gizmo.group.scale.x;
-  let bestAxis = null, bestDist = Infinity;
-  for (const axisKey of ['x', 'y', 'z', 'h']) {
-    const reach = SL_GIZMO_SIZE * ((axisKey === 'h' ? SL_H_SHAFT : 0.9) + 0.3) * scale; // shaft + head, current scale
-    const tipWorld = origin.clone().addScaledVector(slAxisDir(axisKey), reach);
-    const ndc = tipWorld.clone().project(camera);
-    if (ndc.z < -1 || ndc.z > 1) continue; // tip behind the camera — can't be what was tapped
-    const tip = projectToScreenPx(tipWorld);
-    if (Math.hypot(tip.x - base.x, tip.y - base.y) < SL_ARROW_MIN_SCREEN_PX) continue;
-    const d = distToSegmentPx(clientX, clientY, base.x, base.y, tip.x, tip.y);
-    if (d < bestDist) { bestDist = d; bestAxis = axisKey; }
+  if (slTool.aiming) {
+    const ring = pickGizmo(slGizmoAim, clientX, clientY);
+    return ring ? { kind: 'ring', axis: ring.name === 'Y' ? 'azimuth' : 'elevation', tc: slGizmoAim } : null;
   }
-  if (dCenter <= SL_CENTER_HIT_PX) return bestDist <= SL_ARROW_NEAR_PX ? { kind: 'axis', axis: bestAxis } : { kind: 'center' };
-  if (bestDist <= SL_ARROW_HIT_PX) return { kind: 'axis', axis: bestAxis };
-
-  const ringHitEntry = rayFromClient(clientX, clientY).intersectObjects(slTool.gizmo.targets, false)
-    .find((h) => h.object.userData.slRing || h.object.userData.slRingT);
-  if (ringHitEntry) return { kind: 'ring', axis: ringHitEntry.object.userData.slRingT ? 'elevation' : 'azimuth' };
-
-  return null;
-}
-
-// Where along the infinite line (lineOrigin + t·lineDir, lineDir a unit
-// vector) the given ray passes closest — the line parameter t in mm, or
-// null when the ray runs so nearly parallel to the line that the answer is
-// numerically meaningless (or lies behind the ray's own origin).
-function axisParamForRay(lineOrigin, lineDir, ray) {
-  const b = lineDir.dot(ray.direction);
-  const denom = 1 - b * b;
-  if (denom < 0.02) return null;
-  const w0 = new THREE.Vector3().subVectors(lineOrigin, ray.origin);
-  const d = lineDir.dot(w0), e = ray.direction.dot(w0);
-  if ((e - b * d) / denom <= 0) return null; // closest approach is behind the camera
-  return (b * e - d) / denom;
+  const hit = pickGizmo(slGizmo, clientX, clientY), hitH = pickGizmo(slGizmoH, clientX, clientY);
+  if (hitH && (!hit || hitH.distance < hit.distance)) return { kind: 'axis', axis: 'h', tc: slGizmoH };
+  if (!hit) return null;
+  return hit.name === 'XYZ' ? { kind: 'center', tc: slGizmo } : { kind: 'axis', axis: hit.name.toLowerCase(), tc: slGizmo };
 }
 
 // Close enough to the chain's first point to mean "close the frame"? Only
@@ -1542,23 +1558,17 @@ function slCloseSnapPoint(candidate, onScreenOnly = false) {
 // in updateSlDrag) touches slTool.pending — a drag only carries its own
 // candidate, so a cancelled gesture or a plain tap leaves the previous
 // state exactly as it was; endSlDrag is the one place the result lands.
+// The touch-down itself moves nothing: the control only notes where the
+// finger landed, and from then on the point is where it started plus how
+// far the finger has travelled (see grabGizmo).
 function beginSlDrag(handle, clientX, clientY) {
   if (handle.kind === 'center') {
-    // The ball is dragged by DISPLACEMENT, never by "put it where the finger
-    // is": the touch-down itself moves nothing — it only records where the
-    // point is and where, on the plane through it facing the camera, the
-    // finger landed. From then on the point is start + (finger now − finger
-    // then). (It used to jump straight to whatever surface lay under the
-    // finger the moment it moved — a finger is never dead-centre on the
-    // ball, and the surface behind an in-the-air point can be metres away.)
     const moving = slTool.draft.points.length === 1 && !slTool.pending;
     const startPoint = (slTool.pending ? slTool.pending.point : slLastPoint()).clone();
-    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new THREE.Vector3()), startPoint);
-    const grab = new THREE.Vector3();
-    if (!rayFromClient(clientX, clientY).ray.intersectPlane(plane, grab)) grab.copy(startPoint);
+    if (!grabGizmo(slGizmo, clientX, clientY)) return;
     slTool.drag = moving
-      ? { kind: 'start', basePoint: startPoint.clone(), startPoint, plane, grab, candidatePoint: startPoint.clone() } // nothing drawn yet — the ball moves the first point itself
-      : { kind: 'center', basePoint: slLastPoint().clone(), startPoint, plane, grab, candidatePoint: startPoint.clone(), closes: false };
+      ? { kind: 'start', tc: slGizmo, startPoint, candidatePoint: startPoint.clone() } // nothing drawn yet — the ball moves the first point itself
+      : { kind: 'center', tc: slGizmo, basePoint: slLastPoint().clone(), startPoint, candidatePoint: startPoint.clone(), closes: false };
     return;
   }
   if (handle.kind === 'axis') {
@@ -1571,135 +1581,74 @@ function beginSlDrag(handle, clientX, clientY) {
     }
     const basePoint = slLastPoint().clone();
     const startOffset = slTool.pending ? slTool.pending.length : 0;
-    const grabPoint = basePoint.clone().addScaledVector(axisWorld, startOffset);
-    // The axis as it appears on screen right now: a 2D direction and how
-    // many pixels a millimetre along it covers, measured at the grab point.
-    const aScreen = projectToScreenPx(grabPoint);
-    // A probe step along the axis that would cover ~60 px if the axis lay
-    // square to the view — so what's being measured is how much the axis is
-    // foreshortened, never how far away the gizmo happens to be. (This used
-    // to be a fixed 100 mm step with "under 2 px = unusable": from far off,
-    // or with a wide field of view, 100 mm IS under 2 px for every axis,
-    // and the arrows silently went dead.)
-    const probeMm = worldPerPixelAt(grabPoint) * 60;
-    const bScreen = projectToScreenPx(grabPoint.clone().addScaledVector(axisWorld, probeMm));
-    const dxs = bScreen.x - aScreen.x, dys = bScreen.y - aScreen.y;
-    const screenLen = Math.hypot(dxs, dys);
-    // An axis pointing almost exactly at/away from the camera has no usable
-    // on-screen direction to drag along; pxPerMm 0 makes every offset below
-    // just stay put.
-    const usable = screenLen >= 6;
-    const axisScreenDir = usable ? { x: dxs / screenLen, y: dys / screenLen } : { x: 0, y: -1 };
-    const pxPerMm = usable ? screenLen / probeMm : 0;
-    // Whether the exact ray-vs-axis solve is usable for this drag at all
-    // (see updateSlDrag) is decided once, here, so one gesture never hops
-    // between two ways of measuring half-way through.
-    const exact = pxPerMm > 0 && axisParamForRay(basePoint, axisWorld, rayFromClient(aScreen.x, aScreen.y).ray) !== null;
+    if (!grabGizmo(handle.tc, clientX, clientY)) return;
     slTool.drag = {
-      kind: 'axis', axis: handle.axis, axisWorld, basePoint, startOffset, grabScreen: aScreen, startX: clientX, startY: clientY,
-      axisScreenDir, pxPerMm, exact, candidatePoint: grabPoint, length: startOffset, closes: false,
+      kind: 'axis', tc: handle.tc, axis: handle.axis, axisWorld, basePoint, startOffset,
+      candidatePoint: basePoint.clone().addScaledVector(axisWorld, startOffset), length: startOffset, closes: false,
     };
     return;
   }
   if (handle.kind === 'ring') {
-    const centerScreen = projectToScreenPx(slTool.gizmo.group.position);
-    slTool.drag = {
-      kind: 'ring', axis: handle.axis, centerScreen,
-      prevAngle: Math.atan2(clientY - centerScreen.y, clientX - centerScreen.x),
-      raw: handle.axis === 'elevation' ? slTool.customElevation : slTool.customAngle,
-    };
+    if (!grabGizmo(slGizmoAim, clientX, clientY)) return;
+    slTool.drag = { kind: 'ring', tc: slGizmoAim, axis: handle.axis, start: handle.axis === 'elevation' ? slTool.customElevation : slTool.customAngle };
   }
-}
-
-// Where a centre-ball drag has carried its point: the point's own starting
-// position plus how far the finger has travelled since touch-down, both
-// measured on the camera-facing plane through that starting position.
-function slFreeDragPoint(g, clientX, clientY) {
-  const hit = new THREE.Vector3();
-  if (!rayFromClient(clientX, clientY).ray.intersectPlane(g.plane, hit)) return g.candidatePoint.clone();
-  return roundVec(hit.sub(g.grab).add(g.startPoint));
 }
 
 function updateSlDrag(clientX, clientY) {
   const g = slTool.drag;
+  dragGizmoTo(g.tc, clientX, clientY);
+  if (g.kind === 'ring') {
+    // How far the control has turned its ring since the grab — whole
+    // degrees, its own rotation snap — added to where H pointed then.
+    const angle = g.start + g.tc.rotationAngle;
+    if (g.axis === 'elevation') {
+      // Clamped just short of straight up/down — dead-on vertical makes the
+      // azimuth ring meaningless and the arrow would sit on top of Y.
+      slTool.customElevation = Math.max(-1.5, Math.min(1.5, angle));
+    } else {
+      slTool.customAngle = Math.atan2(Math.sin(angle), Math.cos(angle)); // kept within ±180°, like the "поворот" field
+    }
+    updateSlCustomArrow(); // also puts the rings' own proxy back upright — the control tilts it along with the ring it turns
+    touchDebugProgress(`H: нахил ${Math.round(THREE.MathUtils.radToDeg(slTool.customElevation))}°, поворот ${Math.round(THREE.MathUtils.radToDeg(slTool.customAngle))}°`);
+    return;
+  }
+  const at = g.tc.object.position; // where the control has carried its proxy
   if (g.kind === 'start') {
-    g.candidatePoint = slFreeDragPoint(g, clientX, clientY);
-    slTool.gizmo.group.position.copy(g.candidatePoint);
+    g.candidatePoint = roundVec(at);
+    slMoveGizmo(g.candidatePoint);
     touchDebugProgress(`точка зсунута на ${formatMm(g.candidatePoint.distanceTo(g.startPoint), 0)} мм`);
     return;
   }
   if (g.kind === 'center') {
-    const point = slFreeDragPoint(g, clientX, clientY);
+    const point = roundVec(at);
+    // (on screen only: a free drag moves in a plane facing the camera, so it reaches the first point as SEEN)
     const snap = slCloseSnapPoint(point, true);
     g.candidatePoint = snap || point;
     g.closes = !!snap;
-    slTool.gizmo.group.position.copy(g.candidatePoint); // the gizmo itself rides along under the finger
-    updateSlPreview();
-    updateSlOverlay();
-    return;
-  }
-  if (g.kind === 'axis') {
-    // Only the finger's movement ALONG the axis' own on-screen direction
-    // counts — whatever it does sideways is thrown away right here, which
-    // is the whole lock: there is no input left that could push the point
-    // off its axis.
-    const along = (clientX - g.startX) * g.axisScreenDir.x + (clientY - g.startY) * g.axisScreenDir.y;
-    let offset = g.length;
-    if (g.pxPerMm > 0) {
-      if (g.exact) {
-        // Slide the grab point along the axis' on-screen line by that
-        // amount, then ask which point of the real 3D axis sits under that
-        // spot. Unlike a fixed px-per-mm factor this stays glued to the
-        // finger under perspective (an axis running away from the camera
-        // covers fewer and fewer pixels per mm). Bidirectional and
-        // unbounded: dragging back past the origin is just as valid as
-        // extending forward.
-        const sx = g.grabScreen.x + g.axisScreenDir.x * along, sy = g.grabScreen.y + g.axisScreenDir.y * along;
-        const t = axisParamForRay(g.basePoint, g.axisWorld, rayFromClient(sx, sy).ray);
-        // Past the axis' vanishing point the solve flips to the far side —
-        // hold the last good value there rather than fling the point away.
-        if (t !== null && (along === 0 || Math.sign(t - g.startOffset) === Math.sign(along))) offset = t;
-      } else {
-        offset = g.startOffset + along / g.pxPerMm;
-      }
-    }
-    offset = Math.round(offset); // whole millimetres
+  } else {
+    // An arrow: the control has slid the proxy along that one axis — its
+    // own lock, there is no input left that could push the point off the
+    // axis. All that's read back is HOW FAR, as one number, in whole
+    // millimetres; the point is always rebuilt as base + axis × that
+    // number. Bidirectional and unbounded: dragging back past the origin is
+    // just as valid as extending forward.
+    const offset = Math.round(at.clone().sub(g.basePoint).dot(g.axisWorld));
     g.length = offset;
-    touchDebugProgress(g.pxPerMm > 0 ? `відрізок ${offset} мм` : 'вісь дивиться в камеру — руху немає');
+    touchDebugProgress(`відрізок ${offset} мм`);
     const point = g.basePoint.clone().addScaledVector(g.axisWorld, offset);
     const snap = slCloseSnapPoint(point);
     g.candidatePoint = snap || point;
     g.closes = !!snap;
-    slTool.gizmo.group.position.copy(g.candidatePoint);
-    updateSlPreview();
-    updateSlOverlay();
-    return;
   }
-  // ring
-  const angle = Math.atan2(clientY - g.centerScreen.y, clientX - g.centerScreen.x);
-  let step = angle - g.prevAngle;
-  if (step > Math.PI) step -= Math.PI * 2;
-  if (step < -Math.PI) step += Math.PI * 2;
-  g.prevAngle = angle;
-  // Accumulated unsnapped, then snapped for display/use — snapping each
-  // tiny per-event step on its own would round every one of them back to
-  // zero and a slow drag would never turn the arrow at all.
-  g.raw += step * ROTATE_DRAG_SENSITIVITY;
-  if (g.axis === 'elevation') {
-    // Clamped just short of straight up/down — dead-on vertical makes the
-    // azimuth ring meaningless and the arrow would sit on top of Y.
-    g.raw = Math.max(-1.5, Math.min(1.5, g.raw));
-    slTool.customElevation = snapAngleRad(g.raw);
-  } else {
-    slTool.customAngle = snapAngleRad(g.raw);
-  }
-  updateSlCustomArrow();
+  slMoveGizmo(g.candidatePoint); // the gizmo itself rides along under the finger
+  updateSlPreview();
+  updateSlOverlay();
 }
 
 // Where the gizmo belongs when nothing is being dragged: on the stretched
 // segment's end if there is one, else on the last fixed point.
 function slRestGizmo() {
-  if (slTool.gizmo && slTool.draft) slTool.gizmo.group.position.copy(slTool.pending ? slTool.pending.point : slLastPoint());
+  if (slTool.gizmo && slTool.draft) slMoveGizmo(slTool.pending ? slTool.pending.point : slLastPoint());
 }
 
 // Fixes the stretched segment as a real point of the chain. Returns true
@@ -1734,6 +1683,7 @@ function endSlDrag(clientX, clientY) {
   const g = slTool.drag;
   slTool.drag = null;
   if (!g) { updateSlPreview(); updateSlOverlay(); return; }
+  releaseGizmo(g.tc);
 
   const dx = clientX - downX, dy = clientY - downY;
   const isTap = dx * dx + dy * dy <= 49 && performance.now() - downTime <= 600;
@@ -1766,6 +1716,7 @@ function endSlDrag(clientX, clientY) {
 
 // pointercancel mid-drag: drop the gesture, keep whatever was there before it.
 function cancelSlDrag() {
+  if (slTool.drag) releaseGizmo(slTool.drag.tc);
   slTool.drag = null;
   slRestGizmo();
   updateSlPreview();
@@ -1939,6 +1890,8 @@ function renderSpatialLinePill() {
   const n = slTool.draft ? slTool.draft.points.length : 0;
   if (!slTool.gizmo) {
     label.textContent = 'Жила: торкніться екрана — з’явиться гізмо першої точки';
+  } else if (slTool.aiming) {
+    label.textContent = 'Напрям H: тягніть кільце — фіолетове повертає стрілку H, жовте нахиляє. Вимкніть «Напрям H», щоб повернути стрілки X / Y / Z';
   } else if (slTool.pending) {
     label.textContent = slTool.pending.closes
       ? 'Кінець на першій точці — торкніться екрана, щоб замкнути рамку'
@@ -1955,7 +1908,8 @@ function renderSpatialLinePill() {
   modePillEl.appendChild(pillNumberField('⌀', roundMm(slTool.radius * 2), 'мм', { min: 1, max: 400, step: 0.5 }, (v) => { slTool.radius = v / 2; }));
 
   // The H axis: tilt out of horizontal + which way it points on the floor
-  // plan. The two rings on the gizmo turn the same two values by hand.
+  // plan. "↻ Напрям H" swaps the X / Y / Z arrows for the two rings that
+  // turn the same two values by hand.
   modePillEl.appendChild(pillNumberField('H нахил', Math.round(THREE.MathUtils.radToDeg(slTool.customElevation)), '°', { min: -90, max: 90 }, (v) => {
     slTool.customElevation = THREE.MathUtils.degToRad(v);
     updateSlCustomArrow();
@@ -1964,6 +1918,17 @@ function renderSpatialLinePill() {
     slTool.customAngle = THREE.MathUtils.degToRad(v);
     updateSlCustomArrow();
   }));
+  if (slTool.gizmo) {
+    const aimBtn = document.createElement('button');
+    aimBtn.textContent = '↻ Напрям H';
+    if (slTool.aiming) aimBtn.classList.add('on');
+    aimBtn.addEventListener('click', () => {
+      slTool.aiming = !slTool.aiming;
+      slShowGizmo();
+      renderSpatialLinePill();
+    });
+    modePillEl.appendChild(aimBtn);
+  }
 
   if (slTool.draft && (slTool.pending || slTool.draft.points.length > 1)) {
     const undoBtn = document.createElement('button');
@@ -2055,11 +2020,11 @@ function slHandleTapRelease(clientX, clientY, onHandle = false) {
   if (!onHandle && slTool.draft && slTool.draft.points.length === 1 && slTool.gizmo) {
     // Only a tap clearly AWAY from the gizmo re-places the first point. One
     // that lands anywhere within the gizmo's own reach (out to a little
-    // past its rings) is a touch that was aimed at a handle and missed —
-    // and the gizmo leaping off to wherever that tap happened to hit is the
-    // last thing it should do.
-    const c = projectToScreenPx(slTool.gizmo.group.position);
-    if (Math.hypot(clientX - c.x, clientY - c.y) <= SL_GIZMO_PX * 1.5 * 1.25) return;
+    // past its arrowheads) is a touch that was aimed at a handle and missed
+    // — and the gizmo leaping off to wherever that tap happened to hit is
+    // the last thing it should do.
+    const c = projectToScreenPx(slProxy.position);
+    if (Math.hypot(clientX - c.x, clientY - c.y) <= gizmoReachPx() * 1.25) return;
     const point = slTapPoint(clientX, clientY);
     slTool.draft.points[0] = point;
     attachSlGizmo(point);
@@ -2072,6 +2037,7 @@ function resetSpatialLineTool() {
   slTool.draft = null;
   slTool.pending = null;
   slTool.drag = null;
+  slTool.aiming = false;
   slTool.lastTap.time = 0; // don't let a stray tap right after misread as a double-tap on the next line
   detachSlGizmo();
   clearSlPreview();
@@ -2549,40 +2515,15 @@ function gizmoDeliberatelyHidden() {
 }
 
 // Makes sure the selected object has its move/rotate gizmo (and vertex
-// dots) — builds them if they aren't there. Safe to call any time.
+// dots) — puts them on if they aren't there. Safe to call any time.
 function ensureObjectGizmo(record) {
   if (!record || record !== selected || !hasObjectGizmo(record) || gizmoDeliberatelyHidden()) return;
-  if (!gizmo || gizmo.parent !== record.root) {
-    if (gizmo) removeGizmo();
-    const built = buildGizmo(record);
-    gizmo = built.group;
-    gizmoMoveTargets = built.moveTargets;
-    gizmoRotateTargets = built.rotateTargets;
-    record.root.add(gizmo); // child — tracks position/rotation for free
+  if (objectGizmo.object !== record.root) {
+    if (objectGizmo.dragging) releaseGizmo(objectGizmo);
+    objectGizmo.attach(record.root);
   }
-  gizmo.visible = true;
-  record.root.updateWorldMatrix(true, false);
-  updateObjectGizmoScale(); // right size from the very first frame — and for a touch that arrives before one
+  showEl(gizmoModesEl);
   if (!vertexHandles || vertexHandles.record !== record) attachVertexHandles(record); // draggable vertex dots — only for the kinds canVertexEdit allows
-}
-
-// The gizmo's size ON SCREEN in CSS pixels (arrows reach 1.18× this, the
-// rings sit at 0.85×) — the same for every object, at any distance and any
-// field of view. It used to be 0.6 of the object's own size, in the
-// object's own space: a 1 m cube seen from ten metres with the field of
-// view opened to 100–120° had arrows of 15–20 px — to all intents the
-// gizmo "wasn't there", and no amount of tapping the cube could bring it
-// back, because it was there all along, just too small to see or touch.
-const OBJECT_GIZMO_PX = 78;
-function updateObjectGizmoScale() {
-  if (!gizmo || !selected) return;
-  const root = selected.root;
-  const k = (worldPerPixelAt(root.getWorldPosition(new THREE.Vector3())) * OBJECT_GIZMO_PX) / gizmo.userData.gizmoSize;
-  // The gizmo is a child of the object, so the object's own scale (per
-  // axis — objects get resized unevenly) is divided back out: the arrows
-  // stay equal and unstretched however the object has been resized.
-  const s = root.scale;
-  gizmo.scale.set(k / (Math.abs(s.x) || 1), k / (Math.abs(s.y) || 1), k / (Math.abs(s.z) || 1));
 }
 
 function deselect() {
@@ -2647,161 +2588,65 @@ function getObjectSizeMm(record) {
   return size;
 }
 
-// The local (unscaled) half-extent to size the AxesHelper — as a child of
-// the object it inherits the object's own scale, so this length grows or
-// shrinks automatically as the object is resized without touching the
-// helper again.
-function axisGizmoLocalSize(record) {
-  if (record.kind === 'window') {
-    const p = record.root.userData.windowParams;
-    return Math.max(p.width, p.height, p.thickness) * 0.6;
-  }
-  const size = localBoundingBox(record.root).getSize(new THREE.Vector3());
-  return Math.max(size.x, size.y, size.z) * 0.6;
-}
-
 // ---------------------------------------------------------------------------
-// Move + rotate gizmo — real 3D handles on the selected object (both
-// children of record.root, so they track its transform for free):
-//   - three thick arrows along local X/Y/Z: drag one to slide the object
-//     along that single axis (closest-point-between-two-lines math, the
-//     standard technique — robust from any camera angle).
-//   - three rings (a torus per axis, 3ds Max style): drag one to spin the
-//     object around that local axis, angle tracked in the ring's own plane.
-// Built once per selection at whatever size fits the object; since both
-// live under the object as children, resizing it afterward stretches them
-// along with it with no extra bookkeeping.
+// Move + rotate gizmo of the selected object — one TransformControls (see
+// "The gizmo" above), attached to the object's root:
+//   - "Рух": three arrows — drag one to slide the object along that single
+//     axis, in whole millimetres;
+//   - "Обертання": three rings — drag one to turn the object about that
+//     axis, in whole degrees.
+// One or the other at a time, switched with the two buttons that appear with
+// the gizmo (#gizmoModes). The axes are the object's OWN (a turned wall
+// slides along itself, a window along its wall), as they always were here.
 // ---------------------------------------------------------------------------
-let gizmo = null;              // THREE.Group, child of selected.root
-let gizmoMoveTargets = [];     // meshes tagged with userData.gizmoAxis for move-drag hit testing
-let gizmoRotateTargets = [];   // meshes tagged with userData.gizmoAxis for rotate-drag hit testing
-let moveDragGizmo = null;      // { axisWorld, startPoint, startObjectPos }
-let rotateDragGizmo = null;    // { axisWorld, centerScreen, prevAngle, accumAngle, startQuaternion }
+const objectGizmo = createGizmo('local', { translate: ['X', 'Y', 'Z'], rotate: ['X', 'Y', 'Z'] });
+tintGizmo(objectGizmo, { X: AXIS_COLOR.x, Y: AXIS_COLOR.y, Z: AXIS_COLOR.z });
+objectGizmo.setTranslationSnap(1); // whole millimetres
 
-function buildGizmo(record) {
-  const size = axisGizmoLocalSize(record);
-  const group = new THREE.Group();
-  group.userData.isHelper = true; // never a "part" — explode/parts-of code must skip it
-  const moveTargets = [];
-  const rotateTargets = [];
-
-  // --- move arrows ---
-  const shaftLen = size * 0.9, shaftR = size * 0.035, headLen = size * 0.28, headR = size * 0.09;
-  // Invisible, fully transparent — but still raycastable (mesh.visible must
-  // stay true, only opacity goes to 0) — proxy material shared by every
-  // fattened hit target below.
-  const hitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, depthTest: false });
-  const AXES = ['x', 'y', 'z'];
-  for (const axis of AXES) {
-    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 });
-    const arrow = new THREE.Group();
-    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(shaftR, shaftR, shaftLen, 10), mat);
-    shaft.position.y = shaftLen / 2;
-    shaft.renderOrder = 999;
-    const head = new THREE.Mesh(new THREE.ConeGeometry(headR, headLen, 10), mat);
-    head.position.y = shaftLen + headLen / 2;
-    head.renderOrder = 999;
-    arrow.add(shaft, head);
-    if (axis === 'x') arrow.rotation.z = -Math.PI / 2;
-    else if (axis === 'z') arrow.rotation.x = Math.PI / 2;
-    shaft.userData.isHelper = true;
-    head.userData.isHelper = true;
-
-    // The painted shaft/head are too thin a target for a fingertip — a
-    // touch that visually lands right on the arrow often misses the exact
-    // geometry and falls through to "look around" instead, which is what
-    // made dragging feel unreliable. Hit-testing goes against these much
-    // fatter invisible proxies instead; the visible meshes stay slim.
-    const shaftHit = new THREE.Mesh(new THREE.CylinderGeometry(shaftR * 3.5, shaftR * 3.5, shaftLen, 8), hitMat);
-    shaftHit.position.y = shaftLen / 2;
-    const headHit = new THREE.Mesh(new THREE.ConeGeometry(headR * 1.5, headLen * 1.3, 8), hitMat);
-    headHit.position.y = shaftLen + headLen / 2;
-    shaftHit.userData.gizmoAxis = axis;
-    headHit.userData.gizmoAxis = axis;
-    shaftHit.userData.isHelper = true;
-    headHit.userData.isHelper = true;
-    arrow.add(shaftHit, headHit);
-    moveTargets.push(shaftHit, headHit);
-    group.add(arrow);
-  }
-
-  // --- rotate rings ---
-  const ringR = size * 0.85, tubeR = size * 0.03;
-  for (const axis of AXES) {
-    const mat = new THREE.MeshBasicMaterial({ color: AXIS_COLOR[axis], depthTest: false, depthWrite: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
-    const torus = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR, 8, 48), mat);
-    torus.renderOrder = 998;
-    if (axis === 'y') torus.rotateX(-Math.PI / 2);   // normal -> +Y (lies flat, spins around vertical)
-    else if (axis === 'x') torus.rotateY(Math.PI / 2); // normal -> +X
-    // z: default torus normal is already +Z
-    torus.userData.isHelper = true;
-    group.add(torus);
-
-    // Same reasoning as the move arrows: a fatter invisible tube around the
-    // painted ring so a finger doesn't have to land exactly on the thin
-    // torus to grab it.
-    const torusHit = new THREE.Mesh(new THREE.TorusGeometry(ringR, tubeR * 4, 8, 48), hitMat);
-    torusHit.renderOrder = 998;
-    torusHit.rotation.copy(torus.rotation);
-    torusHit.userData.gizmoAxis = axis;
-    torusHit.userData.isHelper = true;
-    rotateTargets.push(torusHit);
-    group.add(torusHit);
-  }
-
-  group.userData.gizmoSize = size; // local length unit the arrows/rings were built from — see pickObjectGizmo
-  return { group, moveTargets, rotateTargets };
+const gizmoModesEl = document.getElementById('gizmoModes');
+const gizmoModeBtns = { translate: document.getElementById('gizmoMoveBtn'), rotate: document.getElementById('gizmoRotateBtn') };
+function setObjectGizmoMode(gizmoMode) {
+  if (objectGizmo.dragging) return;
+  objectGizmo.setMode(gizmoMode);
+  for (const key of Object.keys(gizmoModeBtns)) gizmoModeBtns[key].classList.toggle('on', key === gizmoMode);
 }
-
-// What a touch on the selected object's gizmo landed on: { kind: 'move' |
-// 'rotate', axis } or null. Arrows are picked in screen space, by distance
-// from the finger to each arrow's own on-screen line, and they come FIRST;
-// a rotate ring is only what's hit where no arrow is near. A plain 3D
-// raycast (what this replaces) answers "which hit target is nearest the
-// camera along this ray" — and the three rings cross every arrow at 85% of
-// its length, with fat invisible hit tubes that are often nearer the camera
-// than the arrow's own. So a finger put squarely on an arrow there grabbed
-// a ring, and the first twitch of the finger ROTATED the object instead of
-// sliding it: the gizmo visibly leapt aside the moment it was touched.
-const GIZMO_ARROW_HIT_PX = 28;       // fingertip tolerance either side of an arrow's line
-const GIZMO_ARROW_MIN_SCREEN_PX = 14; // an arrow aimed at the camera has no line to grab
-const GIZMO_ARROW_FROM = 0.15;       // the first bit by the centre, where all three arrows meet, belongs to none of them
-function pickObjectGizmo(clientX, clientY) {
-  if (!gizmo || !selected) return null;
-  const size = gizmo.userData.gizmoSize;
-  const origin = new THREE.Vector3().setFromMatrixPosition(gizmo.matrixWorld);
-  let bestAxis = null, bestDist = Infinity;
-  for (const axis of ['x', 'y', 'z']) {
-    const from = LOCAL_AXES[axis].clone().multiplyScalar(size * 1.18 * GIZMO_ARROW_FROM).applyMatrix4(gizmo.matrixWorld);
-    const tip = LOCAL_AXES[axis].clone().multiplyScalar(size * 1.18).applyMatrix4(gizmo.matrixWorld);
-    const ndc = tip.clone().project(camera);
-    if (ndc.z < -1 || ndc.z > 1) continue;
-    const a = projectToScreenPx(from), b = projectToScreenPx(tip), o = projectToScreenPx(origin);
-    if (Math.hypot(b.x - o.x, b.y - o.y) < GIZMO_ARROW_MIN_SCREEN_PX) continue;
-    const d = distToSegmentPx(clientX, clientY, a.x, a.y, b.x, b.y);
-    if (d < bestDist) { bestDist = d; bestAxis = axis; }
-  }
-  if (bestDist <= GIZMO_ARROW_HIT_PX) return { kind: 'move', axis: bestAxis };
-  const ringHit = rayFromClient(clientX, clientY).intersectObjects(gizmoRotateTargets, false)[0];
-  if (ringHit) return { kind: 'rotate', axis: ringHit.object.userData.gizmoAxis };
-  return null;
-}
+gizmoModeBtns.translate.addEventListener('click', () => setObjectGizmoMode('translate'));
+gizmoModeBtns.rotate.addEventListener('click', () => setObjectGizmoMode('rotate'));
 
 function removeGizmo() {
   removeVertexHandles(); // every tool that hides the arrows wants the vertex dots gone too
-  if (!gizmo) return;
-  gizmo.parent?.remove(gizmo);
-  gizmo.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
-  gizmo = null;
-  gizmoMoveTargets = [];
-  gizmoRotateTargets = [];
-  moveDragGizmo = null;
-  rotateDragGizmo = null;
+  if (objectGizmo.dragging) releaseGizmo(objectGizmo);
+  objectGizmo.detach();
+  hideEl(gizmoModesEl);
+}
+
+// Every edit-mode frame: the gizmo stays on the selected object's root
+// (and goes if that's gone), and an object that is turning by itself
+// ("Обертання" on, or a wheel driven by another) gets the world's axes
+// instead of its own — its own whirl round with it, and arrows that fly
+// past can't be grabbed.
+function updateObjectGizmo() {
+  if (!objectGizmo.object) return;
+  if (!selected || !selected.root.parent) { removeGizmo(); return; }
+  if (objectGizmo.object !== selected.root) objectGizmo.attach(selected.root);
+  if (!objectGizmo.dragging) objectGizmo.setSpace((selected.spin && selected.spin.on) || selected.spinOmega ? 'world' : 'local');
+}
+
+// A move of the finger that is dragging an arrow or a ring. The control
+// keeps the object on its axis by itself: an arrow changes one coordinate
+// along the axis and nothing else, a ring turns about its axis and nothing
+// else, both counted from where the object stood when the handle was
+// grabbed — so nothing accumulates and nothing drifts.
+function dragObjectGizmo(clientX, clientY) {
+  dragGizmoTo(objectGizmo, clientX, clientY);
+  outlineHelper?.update();
+  touchDebugProgress(objectGizmo.mode === 'rotate'
+    ? `поворот ${Math.round(THREE.MathUtils.radToDeg(objectGizmo.rotationAngle))}°`
+    : `зсув ${formatMm(selected.root.position.distanceTo(objectGizmo._positionStart), 0)} мм`);
 }
 
 // Projects a world point to renderer-canvas client pixels — the inverse of
-// rayFromClient's NDC conversion, used to track the rotate gizmo in screen
-// space (see beginRotateDrag below).
+// rayFromClient's NDC conversion.
 function projectToScreenPx(worldPoint) {
   const p = worldPoint.clone().project(camera);
   const rect = renderer.domElement.getBoundingClientRect();
@@ -2809,68 +2654,6 @@ function projectToScreenPx(worldPoint) {
 }
 
 const LOCAL_AXES = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) };
-
-// An arrow moves the object along ITS axis and nothing else. The drag is
-// reduced to one number — how far along the axis (measured from where the
-// object stood when the arrow was grabbed, a line that never moves during
-// the drag) — and the position is always rebuilt as start + axis × that
-// number. Rounding that one number (not x/y/z separately, which nudged a
-// turned object sideways by a fraction of a mm per step) and ignoring any
-// moment the finger's ray runs nearly parallel to the axis (where the
-// "closest point" maths has no real answer and used to fling the object)
-// leaves no way for it to drift off the axis.
-function beginMoveDrag(axisLetter, ray) {
-  // The arrow's own world direction (the gizmo's matrix, not the object's:
-  // while the object spins its gizmo is held still — see spinRecord).
-  const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(gizmo.matrixWorld).normalize();
-  // An unrotated object's axis should be exactly (1,0,0) etc. — strip float dust so the other two coordinates stay untouched to the last digit
-  for (const k of ['x', 'y', 'z']) if (Math.abs(axisWorld[k]) < 1e-9) axisWorld[k] = 0;
-  const origin = selected.root.position.clone();
-  moveDragGizmo = { axisWorld, origin, startT: axisParamForRay(origin, axisWorld, ray.ray) };
-}
-
-function updateMoveDrag(ray) {
-  const g = moveDragGizmo;
-  const t = axisParamForRay(g.origin, g.axisWorld, ray.ray);
-  if (t === null) return; // no trustworthy reading right now — hold position
-  if (g.startT === null) g.startT = t; // the grab itself had no reading — start counting from the first good one
-  selected.root.position.copy(g.origin).addScaledVector(g.axisWorld, roundMm(t - g.startT));
-  touchDebugProgress(`зсув ${formatMm(roundMm(t - g.startT))} мм`);
-  outlineHelper?.update();
-}
-
-// Rotate-drag tracking is pure screen-space angle around the object's
-// projected centre, not a 3D ray/plane intersection: a ray/plane hit makes
-// the finger match one exact point in space, but a metre-scale ring then
-// needs a proportionally huge sweep on screen to turn all the way round —
-// that reads as sluggish. Screen-space angle stays comfortable regardless
-// of the object's size or camera distance, and the multiplier below keeps
-// it snappy rather than a 1:1 crawl.
-const ROTATE_DRAG_SENSITIVITY = 1.8;
-
-function beginRotateDrag(axisLetter, clientX, clientY) {
-  const root = selected.root;
-  const axisWorld = LOCAL_AXES[axisLetter].clone().transformDirection(gizmo.matrixWorld).normalize();
-  const centerScreen = projectToScreenPx(root.position);
-  const startAngle = Math.atan2(clientY - centerScreen.y, clientX - centerScreen.x);
-  rotateDragGizmo = { axisWorld, centerScreen, prevAngle: startAngle, accumAngle: 0, startQuaternion: root.quaternion.clone() };
-  return true;
-}
-
-function updateRotateDrag(clientX, clientY) {
-  const g = rotateDragGizmo;
-  const angle = Math.atan2(clientY - g.centerScreen.y, clientX - g.centerScreen.x);
-  let step = angle - g.prevAngle;
-  // Shortest-path wrap so crossing the ±π seam behind the cursor doesn't
-  // snap the object around instead of continuing the turn smoothly.
-  if (step > Math.PI) step -= Math.PI * 2;
-  if (step < -Math.PI) step += Math.PI * 2;
-  g.prevAngle = angle;
-  g.accumAngle += step * ROTATE_DRAG_SENSITIVITY;
-  const deltaQuat = new THREE.Quaternion().setFromAxisAngle(g.axisWorld, g.accumAngle);
-  selected.root.quaternion.multiplyQuaternions(deltaQuat, g.startQuaternion);
-  outlineHelper?.update();
-}
 
 // ---------------------------------------------------------------------------
 // Dimensions ON the selected object, drawn the way a drawing shows them: for
@@ -4296,18 +4079,12 @@ function wheelRadius(record) { return (record.wheel.diameter / 2) * Math.abs(rec
 function wheelDiameterNow(record) { return roundMm(wheelRadius(record) * 2); }
 function wheelAxisWorld(record) { return new THREE.Vector3(0, 0, 1).transformDirection(record.root.matrixWorld).normalize(); }
 
-const _spinQuat = new THREE.Quaternion();
-// Turns the object itself. Its move/rotate gizmo is a child of it, so it
-// would whirl along — it's turned back by the same amount, staying put on
-// screen with its arrows where they can actually be grabbed.
+// Turns the object itself. (Its gizmo doesn't whirl along: while an object
+// is turning the gizmo shows the world's axes — see updateObjectGizmo.)
 function spinRecord(record, axisKey, angle) {
   if (!angle) return;
-  const axis = LOCAL_AXES[axisKey];
-  record.root.rotateOnAxis(axis, angle);
-  if (selected === record) {
-    if (gizmo) gizmo.quaternion.premultiply(_spinQuat.setFromAxisAngle(axis, -angle));
-    outlineHelper?.update();
-  }
+  record.root.rotateOnAxis(LOCAL_AXES[axisKey], angle);
+  if (selected === record) outlineHelper?.update();
 }
 
 // Called every frame. Wheels joined by links move as one drive: the first
@@ -4315,7 +4092,7 @@ function spinRecord(record, axisKey, angle) {
 // connected to it turns at driver-rim-speed / its-own-radius. Everything
 // else with "Обертання" on just spins by itself.
 function updateSpins(dt) {
-  if (moveDragGizmo || rotateDragGizmo || vertexDrag) return; // hands on the object — hold still
+  if (objectGizmo.dragging || vertexDrag) return; // hands on the object — hold still
   const links = objects.filter((r) => isLinkKind(r.kind));
   const driven = new Set();
   for (const r of objects) if (r.kind === 'wheel') r.spinOmega = 0; // rad/s about its own axle this frame — read by the links and the panel
@@ -4595,8 +4372,7 @@ function armLongPress(clientX, clientY) {
     // grab of an arrow/ring/vertex dot that then never moved — is dropped.
     lookPointerId = null;
     if (vertexDrag) endVertexDrag(true);
-    moveDragGizmo = null;
-    rotateDragGizmo = null;
+    if (objectGizmo.dragging) releaseGizmo(objectGizmo);
     showPropsIcon(clientX, clientY);
   }, LONG_PRESS_MS);
 }
@@ -6712,7 +6488,7 @@ let downX = 0, downY = 0, downTime = 0;
 // fine-grained up close or brisk out in the open (same idea as the
 // touch pinch-to-move gesture below).
 canvas.addEventListener('wheel', (e) => {
-  if (mode !== 'edit' || moveMode || paperDrawing) return;
+  if (mode !== 'edit' || moveMode || paperDrawing || gizmoDragActive()) return;
   e.preventDefault();
   const dir = new THREE.Vector3();
   camera.getWorldDirection(dir);
@@ -6723,9 +6499,12 @@ canvas.addEventListener('wheel', (e) => {
 // Is a finger currently dragging any gizmo handle (the "Жила" gizmo, an
 // object's move arrow or rotate ring, a vertex dot)? While it is, that
 // touch is the gizmo's only: no second finger turns it into a pinch, and
-// neither the flight controls nor a look-drag move the camera under it.
+// the camera stays where it is — flight (joystick, Вгору/Вниз, keys), the
+// zoom buttons, the wheel and a look-drag are all off until it's let go.
+// A drag measures the finger against the axis as seen from where the
+// camera IS; a camera moving under it would move the object by itself.
 function gizmoDragActive() {
-  return !!(slTool.drag || moveDragGizmo || rotateDragGizmo || vertexDrag);
+  return !!(slTool.drag || objectGizmo.dragging || vertexDrag);
 }
 
 // ---------------------------------------------------------------------------
@@ -6796,26 +6575,22 @@ canvas.addEventListener('pointerdown', (e) => {
     // run yet — force it current before raycasting, same as the paper-draw
     // hit-test below does. Without this, a click that visually lands right
     // on a ring can silently miss it and fall through to "look around".
-    if (mode === 'edit' && selected && gizmo) scene.updateMatrixWorld(true);
-    let gizmoHit = mode === 'edit' && selected && gizmo ? pickObjectGizmo(e.clientX, e.clientY) : null;
+    const gizmoOn = mode === 'edit' && selected && objectGizmo.object;
+    if (gizmoOn) scene.updateMatrixWorld(true);
+    let gizmoHit = gizmoOn ? pickGizmo(objectGizmo, e.clientX, e.clientY) : null;
     // Who gets a touch, in order: an ARROW the finger is on (always — moving
     // the object must never turn into something else); then a vertex dot
     // under the finger; then a rotate ring. A ring comes last because its
     // touch zone is a wide invisible band right round the object — plenty
     // of the object's own corners lie inside it — whereas a dot is a small
     // thing the finger was plainly aimed at.
-    const vertexHit = !(gizmoHit && gizmoHit.kind === 'move') && vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY) : -1;
+    const arrowHit = !!gizmoHit && objectGizmo.mode === 'translate';
+    const vertexHit = !arrowHit && vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY) : -1;
     if (vertexHit >= 0) gizmoHit = null;
-    if (gizmoHit) {
-      // Nothing moves here: the drag only records where the object is and
-      // where the finger came down (see beginMoveDrag / beginRotateDrag).
-      if (gizmoHit.kind === 'move') {
-        touchDebug('сцена', `стрілка ${gizmoHit.axis.toUpperCase()} (переміщення об’єкта)`);
-        beginMoveDrag(gizmoHit.axis, rayFromClient(e.clientX, e.clientY));
-      } else {
-        touchDebug('сцена', `кільце ${gizmoHit.axis.toUpperCase()} (обертання об’єкта)`);
-        beginRotateDrag(gizmoHit.axis, e.clientX, e.clientY);
-      }
+    // Nothing moves on the way down: the grab only records where the object
+    // is and where the finger landed (see grabGizmo).
+    if (gizmoHit && grabGizmo(objectGizmo, e.clientX, e.clientY)) {
+      touchDebug('сцена', arrowHit ? `стрілка ${objectGizmo.axis} (переміщення об’єкта)` : `кільце ${objectGizmo.axis} (обертання об’єкта)`);
       armLongPress(e.clientX, e.clientY);
     } else if (vertexHit >= 0) {
       touchDebug('сцена', 'вершина об’єкта');
@@ -6840,8 +6615,7 @@ canvas.addEventListener('pointerdown', (e) => {
       }
     } else if (mode === 'edit' && slTool.active && slTool.gizmo) {
       scene.updateMatrixWorld(true);
-      // slPickHandle checks centre/arrows/ring in that priority order — see
-      // its own comment for why (screen-space distance, not a 3D raycast).
+      // Which handle of the "Жила" gizmo the finger is on, if any.
       const handle = slPickHandle(e.clientX, e.clientY);
       touchDebug('сцена', describeSlHandle(handle));
       if (handle) {
@@ -6873,7 +6647,7 @@ canvas.addEventListener('pointerdown', (e) => {
         applySculptAt(hits[0].point);
       }
     } else if (!moveMode && !paperDrawing) {
-      touchDebug('сцена', selected && gizmo ? 'нічого (поворот камери)' : selected ? 'у виділеного об’єкта гізмо немає (поворот камери)' : 'нічого не виділено (поворот камери)');
+      touchDebug('сцена', selected && objectGizmo.object ? 'нічого (поворот камери)' : selected ? 'у виділеного об’єкта гізмо немає (поворот камери)' : 'нічого не виділено (поворот камери)');
       startLookDrag(e.pointerId, e.clientX, e.clientY);
       armLongPress(e.clientX, e.clientY); // held still on the selected object → "Властивості"
     }
@@ -6904,12 +6678,8 @@ canvas.addEventListener('pointermove', (e) => {
   if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (longPressTimer && (activePointers.size > 1 || Math.hypot(e.clientX - downX, e.clientY - downY) > LONG_PRESS_SLOP_PX)) cancelLongPress();
 
-  if (moveDragGizmo && e.pointerId === primaryPointerId) {
-    updateMoveDrag(rayFromClient(e.clientX, e.clientY));
-    return;
-  }
-  if (rotateDragGizmo && e.pointerId === primaryPointerId) {
-    updateRotateDrag(e.clientX, e.clientY);
+  if (objectGizmo.dragging && e.pointerId === primaryPointerId) {
+    dragObjectGizmo(e.clientX, e.clientY);
     return;
   }
   if (vertexDrag && e.pointerId === primaryPointerId) {
@@ -7038,7 +6808,7 @@ canvas.addEventListener('pointermove', (e) => {
 
 function endPointer(e) {
   const wasPinching = activePointers.size >= 2 && pinchStartDist > 0;
-  const wasGizmoDrag = !!(moveDragGizmo || rotateDragGizmo);
+  const wasGizmoDrag = objectGizmo.dragging;
   cancelLongPress();
   activePointers.delete(e.pointerId);
   if (activePointers.size < 2) {
@@ -7049,7 +6819,7 @@ function endPointer(e) {
     walkTouchForward = 0; walkPinchAnchorY = null;
   }
   if (lookPointerId === e.pointerId) lookPointerId = null;
-  if (e.pointerId === primaryPointerId) { moveDragGizmo = null; rotateDragGizmo = null; }
+  if (e.pointerId === primaryPointerId && objectGizmo.dragging) releaseGizmo(objectGizmo); // let go (or the touch was taken away) — the object stays where the drag left it
   if (vertexDrag && e.pointerId === primaryPointerId) { endVertexDrag(e.type === 'pointercancel'); return; } // a vertex drag is never a tap
   if (clayTool.stroke && e.pointerId === primaryPointerId) { endClayStroke(); renderClayPill(); return; } // nor is a stroke on clay
   if (tapeTool.stroke && e.pointerId === primaryPointerId) { endTapeStroke(e.type === 'pointercancel'); return; } // the tape decides tap-or-drag itself
@@ -7231,6 +7001,7 @@ function wireZoomButton(btn, stepSign) {
   // actually ahead (forwardHitDistance), same as the wheel/pinch dolly, so
   // a press feels equally fine near a wall and brisk out in the open.
   const step = () => {
+    if (gizmoDragActive()) return; // the camera stays put under a gizmo drag
     const dir = new THREE.Vector3();
     camera.getWorldDirection(dir);
     const refDist = forwardHitDistance();
@@ -7388,7 +7159,16 @@ function setFlyVisible(on) {
 // the room minimap…) — re-measured a few times a second, not every frame.
 const FLY_BOTTOM_OBSTACLES = ['toolbar', 'modePill', 'selectionPanel', 'popover', 'propsPanel', 'minimapWrap'];
 let flyLayoutAt = 0;
+let flyPaused = false;
 function layoutFlyUi(force = false) {
+  // Flight is off while a gizmo handle is being dragged (see
+  // updateFreeCamera) — the controls fade for that long, so it shows.
+  const paused = gizmoDragActive();
+  if (paused !== flyPaused) {
+    flyPaused = paused;
+    flyLeftEl.classList.toggle('paused', paused);
+    flyRightEl.classList.toggle('paused', paused);
+  }
   if (!flyTool.visible || mode !== 'edit') return;
   const now = performance.now();
   if (!force && now - flyLayoutAt < 250) return;
@@ -7762,14 +7542,15 @@ function updateFreeCamera(dt, refDist) {
   // so it deliberately keeps its own free instant-response feel (including
   // full WASD/arrow strafe, which touch's pinch-based navigation never
   // had) rather than the walk-mode human model above.
+  // Flight is OFF altogether while a finger is dragging a gizmo handle —
+  // stick, Вгору/Вниз and keys alike (see gizmoDragActive). It picks up
+  // again by itself the moment the handle is let go.
+  if (gizmoDragActive()) return;
   mx = Math.max(-1, Math.min(1, mx));
   my = Math.max(-1, Math.min(1, my));
   // The on-screen "Політ" controls: stick (analog — how far it's pushed is
   // how fast) and the two vertical buttons.
-  // ...held still while a finger is dragging a gizmo handle: a drag measures
-  // the finger against the axis as seen from where the camera IS, and the
-  // touch that started on a gizmo belongs to the gizmo alone.
-  const flying = flyTool.visible && !gizmoDragActive();
+  const flying = flyTool.visible;
   const fx = flying ? flyTool.x : 0, fy = flying ? flyTool.y : 0;
   const fv = flying ? (flyTool.up ? 1 : 0) - (flyTool.down ? 1 : 0) : 0;
   if (mx === 0 && my === 0 && fx === 0 && fy === 0 && fv === 0) return;
@@ -8614,8 +8395,7 @@ function animate() {
       updateFreeCamera(dt, refDist);
     }
     layoutFlyUi();
-    updateSlGizmoScale();
-    updateObjectGizmoScale();
+    updateObjectGizmo();
     updateSlOverlay();
     updateVertexHandleVisibility();
     updateAxisLabels();
@@ -8654,14 +8434,15 @@ window.__creslarnet3d = {
   commitTileArea, cancelTileArea,
   // Test/debug access to pieces with no other handle from outside.
   addObject, finishSpatialLine, cancelSpatialLine, buildSpatialLineRunGroup, setSpatialLineRadius, projectToScreenPx,
-  get gizmoTargets() { return { move: gizmoMoveTargets, rotate: gizmoRotateTargets }; },
   get vertexHandles() { return vertexHandles; },
   get contour() { return contour; },
   enterContourMode, exitContourMode, cutByContour, undoPointEdit, deselect,
   updateSpins, updateLinks, createLink, setWheelSize, openPropsPanel, removeObject,
   clayTool, enterClayMode, exitClayMode, setClayTool, clayHeightAt, clayUndo, refreshClayShape,
   flyTool, updateFreeCamera, get mode() { return mode; },
-  get gizmo() { return gizmo; },
+  // The gizmos (TransformControls) — the selected object's, and the three
+  // that make up the "Жила" one.
+  objectGizmo, setObjectGizmoMode, slGizmo, slGizmoH, slGizmoAim, slProxy, pickGizmo, gizmoReachPx, gizmoDragActive,
   // "Просторова лінія" internals — same introspection purpose as the rest
   // of this hook, read-only. slTool itself is exposed directly (not spread
   // into individual getters) since it's already the single source of truth.
@@ -8674,23 +8455,12 @@ window.__creslarnet3d = {
     camera.position.copy(target).add(offset);
     faceDirection(new THREE.Vector3().subVectors(target, camera.position).normalize());
   },
-  pickObjectGizmo, slPickHandle, removeGizmo, openPopover, dimGroups,
+  slPickHandle, removeGizmo, openPopover, dimGroups,
   tapeTool, snapTapePoint, enterTapeMode, exitTapeMode, selectMeasure, measureEls,
   get measures() { return measures; },
   // put the camera at one point looking at another (tests/debugging)
   lookFrom(from, target) {
     camera.position.set(from.x, from.y, from.z);
     faceDirection(new THREE.Vector3(target.x - from.x, target.y - from.y, target.z - from.z).normalize());
-  },
-  debugGizmo(x, y) {
-    scene.updateMatrixWorld(true);
-    const hits = rayFromClient(x, y).intersectObjects(gizmoMoveTargets.concat(gizmoRotateTargets), false);
-    return {
-      moveTargetCount: gizmoMoveTargets.length,
-      rotateTargetCount: gizmoRotateTargets.length,
-      hits: hits.map((h) => ({ axis: h.object.userData.gizmoAxis, isRotate: gizmoRotateTargets.includes(h.object), distance: h.distance })),
-      moveDragActive: !!moveDragGizmo,
-      rotateDragActive: !!rotateDragGizmo,
-    };
   },
 };
