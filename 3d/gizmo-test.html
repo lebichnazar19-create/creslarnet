@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>Creslarnet — тест гізмо (TransformControls)</title>
+<meta name="theme-color" content="#8338ec">
+<!--
+  A deliberately bare test page for the gizmo ALONE: a grid, one cube, the
+  stock three.js TransformControls on it and OrbitControls for the camera.
+  No flight controls, no joystick, no tools — and not a single pointer or
+  touch handler of our own that could act on anything: the only listeners
+  this page adds to the canvas just WRITE DOWN what happened, for the debug
+  readout. If the gizmo misbehaves here, it's the controls or the browser;
+  if it behaves, the main app's own touch handling was the problem.
+
+  Units are millimetres, as everywhere in the app: the cube is 1000 mm.
+-->
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    background: #0d0d0f;
+    color: #f4f2f8;
+    font-family: "Public Sans", "Segoe UI", system-ui, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  #view {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none; /* every touch goes to the page's controls — the browser neither scrolls nor zooms */
+  }
+  #debug {
+    position: fixed;
+    top: env(safe-area-inset-top, 0px);
+    left: 0;
+    right: 0;
+    z-index: 5;
+    margin: 0;
+    padding: 6px 10px 7px;
+    background: rgba(0, 0, 0, 0.78);
+    border-bottom: 1px solid rgba(57, 255, 122, 0.45);
+    color: #39ff7a;
+    font: 12px/1.4 "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    pointer-events: none; /* never in the way of a touch */
+  }
+  #modes {
+    position: fixed;
+    left: 50%;
+    bottom: max(12px, env(safe-area-inset-bottom));
+    transform: translateX(-50%);
+    z-index: 5;
+    display: flex;
+    gap: 6px;
+    padding: 5px;
+    max-width: calc(100vw - 12px);
+    background: rgba(20, 18, 26, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 16px;
+  }
+  #modes button {
+    border: none;
+    border-radius: 11px;
+    padding: 11px 13px;
+    background: #262330;
+    color: #f4f2f8;
+    font: inherit;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  #modes button.on { background: #8338ec; color: #fff; }
+  #modes button.plain { background: transparent; color: #b3aec0; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/three.module.min.js"
+  }
+}
+</script>
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <pre id="debug">завантаження…</pre>
+  <div id="modes">
+    <button data-mode="translate" class="on">Рух</button>
+    <button data-mode="rotate">Обертання</button>
+    <button data-mode="scale">Масштаб</button>
+    <button id="reset" class="plain">Скинути</button>
+  </div>
+
+<script type="module">
+import * as THREE from 'three';
+import { TransformControls } from './vendor/three/TransformControls.js';
+import { OrbitControls } from './vendor/three/OrbitControls.js';
+
+const canvas = document.getElementById('view');
+const debugEl = document.getElementById('debug');
+
+// ---- scene: grid + one cube (mm) -------------------------------------------
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0d0d0f);
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 10, 200000);
+camera.position.set(3200, 2800, 4200);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a7a63, 1.0));
+const sun = new THREE.DirectionalLight(0xfff3e0, 1.4);
+sun.position.set(6000, 9000, 4000);
+scene.add(sun);
+scene.add(new THREE.GridHelper(10000, 20, 0x8a8a92, 0x3a3a42)); // 10 m across, 500 mm cells
+
+const CUBE_START = new THREE.Vector3(0, 500, 0); // standing on the grid
+const cube = new THREE.Mesh(
+  new THREE.BoxGeometry(1000, 1000, 1000),
+  new THREE.MeshStandardMaterial({ color: 0xcfcfd6, roughness: 0.75, metalness: 0.05 }),
+);
+cube.position.copy(CUBE_START);
+scene.add(cube);
+
+// ---- the gizmo: stock TransformControls -------------------------------------
+// Created BEFORE OrbitControls on purpose: listeners on one element run in
+// the order they were added, so on a touch the gizmo looks first, and if it
+// took the touch its 'dragging-changed' has already switched the camera
+// controls off by the time OrbitControls gets the very same event — the
+// orbit never even starts.
+const gizmo = new TransformControls(camera, canvas);
+gizmo.setSize(1.35);                 // a little larger than default: handles sized for a fingertip
+gizmo.setSpace('world');
+gizmo.setTranslationSnap(1);         // whole millimetres
+gizmo.setRotationSnap(THREE.MathUtils.degToRad(1));
+gizmo.setScaleSnap(0.01);
+gizmo.attach(cube);
+scene.add(gizmo);
+
+// One fix on top of the stock control, for TOUCH. TransformControls measures
+// a drag on a helper plane that it turns to suit the axis being dragged —
+// but it only re-turns that plane when a frame is rendered. With a mouse
+// that's fine: the pointer hovers over an arrow (plane turned, frames pass)
+// long before the button goes down. A finger has no hover: "which axis" and
+// "drag starts here" happen inside one and the same pointerdown, so the
+// start point gets measured on the plane as it was turned for NO axis, the
+// next frame turns the plane, and the first movement is measured on a
+// different plane — the object leaps along the axis (hundreds of mm at this
+// scale) from a 1 px move. Bringing the plane up to date before the stock
+// pointerDown runs removes that leap entirely.
+// Axes only. The stock gizmo also carries handles that are NOT one axis:
+// squares that slide in a plane (XY/YZ/XZ), a centre handle that moves or
+// scales freely, and in rotate mode a free-rotate ball plus a big outer
+// "turn about the view" ring that on a phone held upright spans the whole
+// width of the screen. Any of those under a fingertip would break the one
+// thing this page is here to prove — a touch on an arrow moves along that
+// arrow's axis and nothing else — so they're taken off, both the drawn
+// handle and its (invisible) touch target.
+for (const mode of ['translate', 'rotate', 'scale']) {
+  for (const group of [gizmo._gizmo.gizmo[mode], gizmo._gizmo.picker[mode]]) {
+    for (const child of [...group.children]) if (!['X', 'Y', 'Z'].includes(child.name)) group.remove(child);
+  }
+}
+
+const stockPointerDown = gizmo.pointerDown.bind(gizmo);
+gizmo.pointerDown = (pointer) => {
+  gizmo._plane.updateMatrixWorld(true);
+  stockPointerDown(pointer);
+};
+
+const orbit = new OrbitControls(camera, canvas);
+orbit.target.set(0, 500, 0);
+orbit.update();
+
+gizmo.addEventListener('dragging-changed', (e) => {
+  orbit.enabled = !e.value; // while the gizmo is being dragged the camera does not move
+  if (e.value) touchStart.copy(cube.position);
+  note(e.value ? 'dragging-changed: тягне' : 'dragging-changed: відпущено');
+});
+
+// ---- mode buttons -------------------------------------------------------------
+const MODE_NAMES = { translate: 'рух', rotate: 'обертання', scale: 'масштаб' };
+const modeButtons = [...document.querySelectorAll('#modes button[data-mode]')];
+for (const btn of modeButtons) {
+  btn.addEventListener('click', () => {
+    gizmo.setMode(btn.dataset.mode);
+    for (const b of modeButtons) b.classList.toggle('on', b === btn);
+  });
+}
+document.getElementById('reset').addEventListener('click', () => {
+  cube.position.copy(CUBE_START);
+  cube.rotation.set(0, 0, 0);
+  cube.scale.set(1, 1, 1);
+  touchStart.copy(cube.position);
+});
+
+// ---- debug readout ------------------------------------------------------------
+// These listeners only record what the browser delivered. Capture phase, so
+// they see an event before either control does, and nothing here ever calls
+// preventDefault / stopPropagation or touches the scene.
+let lastEvent = '—', eventCount = 0, lastNote = '';
+const touchStart = cube.position.clone(); // where the cube was when the current/last drag began
+function note(text) { lastNote = text; }
+for (const type of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'lostpointercapture']) {
+  canvas.addEventListener(type, (e) => {
+    eventCount++;
+    lastEvent = `${type} (${e.pointerType || '?'}, палець ${e.pointerId})`;
+    if (type === 'pointerdown') touchStart.copy(cube.position);
+  }, true);
+}
+
+const mm = (v) => (Math.round(v * 10) / 10).toString().replace('.', ',');
+const deg = (r) => Math.round(THREE.MathUtils.radToDeg(r));
+function renderDebug() {
+  const p = cube.position, r = cube.rotation, s = cube.scale;
+  const axis = gizmo.axis ? gizmo.axis : 'жодна';
+  debugEl.textContent =
+    `подія ${eventCount}: ${lastEvent}\n` +
+    `вісь: ${axis} · тягне: ${gizmo.dragging ? 'так' : 'ні'} · режим: ${MODE_NAMES[gizmo.mode]}${lastNote ? ` · ${lastNote}` : ''}\n` +
+    `куб, мм:  X ${mm(p.x)}  Y ${mm(p.y)}  Z ${mm(p.z)}\n` +
+    `зсув від дотику, мм:  X ${mm(p.x - touchStart.x)}  Y ${mm(p.y - touchStart.y)}  Z ${mm(p.z - touchStart.z)}\n` +
+    `поворот °: ${deg(r.x)} ${deg(r.y)} ${deg(r.z)} · масштаб: ${s.x.toFixed(2)} ${s.y.toFixed(2)} ${s.z.toFixed(2)}`;
+}
+
+// ---- frame loop -----------------------------------------------------------------
+function resize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function frame() {
+  requestAnimationFrame(frame);
+  renderer.render(scene, camera);
+  renderDebug();
+}
+frame();
+
+// For checking from the browser console / automated checks.
+window.__gizmoTest = { THREE, scene, camera, cube, gizmo, orbit, renderDebug, CUBE_START };
+</script>
+</body>
+</html>
