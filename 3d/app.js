@@ -6667,10 +6667,12 @@ setFov(preferredFov);
 // "Політ" — on-screen flight controls for touch, next to the zoom buttons
 // (which stay exactly as they were):
 //   - a joystick bottom-left: forward / back / left / right, relative to
-//     where the camera is looking (forward flies along the view itself,
-//     pitch included — the same "true fly" the desktop W/A/S/D keys do);
+//     where the camera is facing — in the horizontal plane only: looking
+//     down and pushing forward glides level over the scene, it never dives
+//     (unlike the desktop W/A/S/D keys, which fly along the view itself);
 //   - "Вгору" / "Вниз" bottom-right: straight up or down for as long as
-//     they're held, whatever the camera is looking at;
+//     they're held, whatever the camera is looking at — the ONLY thing
+//     that changes height;
 //   - a speed slider, logarithmic: 20 mm/s for working on a small detail up
 //     to 20 m/s for crossing a big scene;
 //   - one finger on the free part of the screen still turns the view, as
@@ -7113,7 +7115,13 @@ function updateFreeCamera(dt, refDist) {
   camera.getWorldDirection(forward);
   if (fx !== 0 || fy !== 0 || fv !== 0) {
     const step = flyTool.speed * dt; // the user's own chosen speed — not scaled by what's ahead, so it's predictable
-    camera.position.addScaledVector(forward, -fy * step).addScaledVector(right, fx * step);
+    // The stick moves the camera in the horizontal plane ONLY: "forward" is
+    // the way the camera faces on the floor plan (its heading, from yaw —
+    // so it still works looking straight down, where the view direction
+    // itself has no horizontal part left), never along the view's tilt.
+    // Height changes with the two buttons and nothing else.
+    const heading = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+    camera.position.addScaledVector(heading, -fy * step).addScaledVector(right, fx * step);
     camera.position.y += fv * step; // straight up/down in the world, whatever the camera is looking at
   }
   // smoothedRefDist (kept current every edit-mode frame in animate(), and
