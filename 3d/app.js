@@ -1521,8 +1521,11 @@ function axisParamForRay(lineOrigin, lineDir, ray) {
 // sides), and only when it's near BOTH on screen and in actual distance —
 // screen-only would also catch a point that merely lines up with the first
 // one from this camera angle while being far behind or in front of it.
+// (`onScreenOnly`: a free centre-ball drag moves in a plane facing the
+// camera, so it reaches the first point as SEEN — bringing the ball onto
+// the green dot is the whole gesture, whatever the depth between them.)
 const SL_CLOSE_SNAP_PX = 26;
-function slCloseSnapPoint(candidate) {
+function slCloseSnapPoint(candidate, onScreenOnly = false) {
   const pts = slTool.draft.points;
   if (pts.length < 3) return null;
   const first = pts[0];
@@ -1530,7 +1533,7 @@ function slCloseSnapPoint(candidate) {
   if (fs.behind) return null;
   const cs = slProjectToScreen(candidate);
   if (Math.hypot(cs.x - fs.x, cs.y - fs.y) > SL_CLOSE_SNAP_PX) return null;
-  if (candidate.distanceTo(first) > camera.position.distanceTo(first) * 0.06) return null;
+  if (!onScreenOnly && candidate.distanceTo(first) > camera.position.distanceTo(first) * 0.06) return null;
   return first.clone();
 }
 
@@ -1541,14 +1544,21 @@ function slCloseSnapPoint(candidate) {
 // state exactly as it was; endSlDrag is the one place the result lands.
 function beginSlDrag(handle, clientX, clientY) {
   if (handle.kind === 'center') {
-    if (slTool.draft.points.length === 1 && !slTool.pending) {
-      // Nothing drawn yet — the ball moves the first point itself.
-      const p = slTool.draft.points[0].clone();
-      slTool.drag = { kind: 'start', basePoint: p, candidatePoint: p.clone() };
-      return;
-    }
-    const base = slLastPoint().clone();
-    slTool.drag = { kind: 'center', basePoint: base, candidatePoint: (slTool.pending ? slTool.pending.point : base).clone(), closes: false };
+    // The ball is dragged by DISPLACEMENT, never by "put it where the finger
+    // is": the touch-down itself moves nothing — it only records where the
+    // point is and where, on the plane through it facing the camera, the
+    // finger landed. From then on the point is start + (finger now − finger
+    // then). (It used to jump straight to whatever surface lay under the
+    // finger the moment it moved — a finger is never dead-centre on the
+    // ball, and the surface behind an in-the-air point can be metres away.)
+    const moving = slTool.draft.points.length === 1 && !slTool.pending;
+    const startPoint = (slTool.pending ? slTool.pending.point : slLastPoint()).clone();
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new THREE.Vector3()), startPoint);
+    const grab = new THREE.Vector3();
+    if (!rayFromClient(clientX, clientY).ray.intersectPlane(plane, grab)) grab.copy(startPoint);
+    slTool.drag = moving
+      ? { kind: 'start', basePoint: startPoint.clone(), startPoint, plane, grab, candidatePoint: startPoint.clone() } // nothing drawn yet — the ball moves the first point itself
+      : { kind: 'center', basePoint: slLastPoint().clone(), startPoint, plane, grab, candidatePoint: startPoint.clone(), closes: false };
     return;
   }
   if (handle.kind === 'axis') {
@@ -1601,27 +1611,26 @@ function beginSlDrag(handle, clientX, clientY) {
   }
 }
 
-// Where the finger's ray lands for a free (centre-handle) drag: real scene
-// geometry if there is any under it, otherwise out along the ray to the
-// depth the dragged point is already at — so it tracks the finger through
-// open space too instead of sticking.
-function slFreePointUnderPointer(clientX, clientY, depthRef) {
-  const ray = rayFromClient(clientX, clientY);
-  const hits = ray.intersectObjects(raycastTargets, false);
-  if (hits.length) return hits[0].point.clone();
-  return ray.ray.origin.clone().addScaledVector(ray.ray.direction, camera.position.distanceTo(depthRef) || 1500);
+// Where a centre-ball drag has carried its point: the point's own starting
+// position plus how far the finger has travelled since touch-down, both
+// measured on the camera-facing plane through that starting position.
+function slFreeDragPoint(g, clientX, clientY) {
+  const hit = new THREE.Vector3();
+  if (!rayFromClient(clientX, clientY).ray.intersectPlane(g.plane, hit)) return g.candidatePoint.clone();
+  return roundVec(hit.sub(g.grab).add(g.startPoint));
 }
 
 function updateSlDrag(clientX, clientY) {
   const g = slTool.drag;
   if (g.kind === 'start') {
-    g.candidatePoint = roundVec(slFreePointUnderPointer(clientX, clientY, g.candidatePoint));
+    g.candidatePoint = slFreeDragPoint(g, clientX, clientY);
     slTool.gizmo.group.position.copy(g.candidatePoint);
+    touchDebugProgress(`точка зсунута на ${formatMm(g.candidatePoint.distanceTo(g.startPoint), 0)} мм`);
     return;
   }
   if (g.kind === 'center') {
-    const point = roundVec(slFreePointUnderPointer(clientX, clientY, g.candidatePoint));
-    const snap = slCloseSnapPoint(point);
+    const point = slFreeDragPoint(g, clientX, clientY);
+    const snap = slCloseSnapPoint(point, true);
     g.candidatePoint = snap || point;
     g.closes = !!snap;
     slTool.gizmo.group.position.copy(g.candidatePoint); // the gizmo itself rides along under the finger
@@ -2043,7 +2052,14 @@ function slHandleTapRelease(clientX, clientY, onHandle = false) {
     return;
   }
   slTool.lastTap = { time: now, x: clientX, y: clientY };
-  if (!onHandle && slTool.draft && slTool.draft.points.length === 1) {
+  if (!onHandle && slTool.draft && slTool.draft.points.length === 1 && slTool.gizmo) {
+    // Only a tap clearly AWAY from the gizmo re-places the first point. One
+    // that lands anywhere within the gizmo's own reach (out to a little
+    // past its rings) is a touch that was aimed at a handle and missed —
+    // and the gizmo leaping off to wherever that tap happened to hit is the
+    // last thing it should do.
+    const c = projectToScreenPx(slTool.gizmo.group.position);
+    if (Math.hypot(clientX - c.x, clientY - c.y) <= SL_GIZMO_PX * 1.5 * 1.25) return;
     const point = slTapPoint(clientX, clientY);
     slTool.draft.points[0] = point;
     attachSlGizmo(point);
@@ -2686,7 +2702,42 @@ function buildGizmo(record) {
     group.add(torusHit);
   }
 
+  group.userData.gizmoSize = size; // local length unit the arrows/rings were built from — see pickObjectGizmo
   return { group, moveTargets, rotateTargets };
+}
+
+// What a touch on the selected object's gizmo landed on: { kind: 'move' |
+// 'rotate', axis } or null. Arrows are picked in screen space, by distance
+// from the finger to each arrow's own on-screen line, and they come FIRST;
+// a rotate ring is only what's hit where no arrow is near. A plain 3D
+// raycast (what this replaces) answers "which hit target is nearest the
+// camera along this ray" — and the three rings cross every arrow at 85% of
+// its length, with fat invisible hit tubes that are often nearer the camera
+// than the arrow's own. So a finger put squarely on an arrow there grabbed
+// a ring, and the first twitch of the finger ROTATED the object instead of
+// sliding it: the gizmo visibly leapt aside the moment it was touched.
+const GIZMO_ARROW_HIT_PX = 28;       // fingertip tolerance either side of an arrow's line
+const GIZMO_ARROW_MIN_SCREEN_PX = 14; // an arrow aimed at the camera has no line to grab
+const GIZMO_ARROW_FROM = 0.15;       // the first bit by the centre, where all three arrows meet, belongs to none of them
+function pickObjectGizmo(clientX, clientY) {
+  if (!gizmo || !selected) return null;
+  const size = gizmo.userData.gizmoSize;
+  const origin = new THREE.Vector3().setFromMatrixPosition(gizmo.matrixWorld);
+  let bestAxis = null, bestDist = Infinity;
+  for (const axis of ['x', 'y', 'z']) {
+    const from = LOCAL_AXES[axis].clone().multiplyScalar(size * 1.18 * GIZMO_ARROW_FROM).applyMatrix4(gizmo.matrixWorld);
+    const tip = LOCAL_AXES[axis].clone().multiplyScalar(size * 1.18).applyMatrix4(gizmo.matrixWorld);
+    const ndc = tip.clone().project(camera);
+    if (ndc.z < -1 || ndc.z > 1) continue;
+    const a = projectToScreenPx(from), b = projectToScreenPx(tip), o = projectToScreenPx(origin);
+    if (Math.hypot(b.x - o.x, b.y - o.y) < GIZMO_ARROW_MIN_SCREEN_PX) continue;
+    const d = distToSegmentPx(clientX, clientY, a.x, a.y, b.x, b.y);
+    if (d < bestDist) { bestDist = d; bestAxis = axis; }
+  }
+  if (bestDist <= GIZMO_ARROW_HIT_PX) return { kind: 'move', axis: bestAxis };
+  const ringHit = rayFromClient(clientX, clientY).intersectObjects(gizmoRotateTargets, false)[0];
+  if (ringHit) return { kind: 'rotate', axis: ringHit.object.userData.gizmoAxis };
+  return null;
 }
 
 function removeGizmo() {
@@ -3626,7 +3677,6 @@ function renderSculptPill() {
 const VERTEX_HANDLE_MAX = 64;   // dots shown at most — beyond that, an evenly spread subset
 const VERTEX_PICK_PX = 20;      // how close a touch must be to a dot to grab it
 const VERTEX_PICK_MIN_PX = 9;    // ...and never smaller than this, however crowded the dots are
-const VERTEX_PICK_TIGHT_PX = 10; // ...when a move/rotate arrow is under the same touch: only a touch right on the dot takes it from the arrow
 const VERTEX_MIN_SCREEN_PX = 90; // an object smaller than this on screen hides its dots — too crowded to pick, and they'd bury the arrows
 const VERTEX_FALLOFF = 0.35;    // influence radius as a fraction of the object's own diagonal (a cube's nearest other corner is 0.58 away — untouched)
 const POINT_UNDO_MAX = 8;
@@ -6233,26 +6283,29 @@ canvas.addEventListener('pointerdown', (e) => {
     // hit-test below does. Without this, a click that visually lands right
     // on a ring can silently miss it and fall through to "look around".
     if (mode === 'edit' && selected && gizmo) scene.updateMatrixWorld(true);
-    const gizmoHit = mode === 'edit' && selected && gizmo
-      ? rayFromClient(e.clientX, e.clientY).intersectObjects(gizmoMoveTargets.concat(gizmoRotateTargets), false)
-      : [];
-    // A touch right on a vertex dot takes it even with an arrow underneath;
-    // a touch merely near one leaves the arrow its drag.
-    const vertexHit = vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY, gizmoHit.length ? VERTEX_PICK_TIGHT_PX : VERTEX_PICK_PX) : -1;
-    if (vertexHit >= 0) {
+    let gizmoHit = mode === 'edit' && selected && gizmo ? pickObjectGizmo(e.clientX, e.clientY) : null;
+    // Who gets a touch, in order: an ARROW the finger is on (always — moving
+    // the object must never turn into something else); then a vertex dot
+    // under the finger; then a rotate ring. A ring comes last because its
+    // touch zone is a wide invisible band right round the object — plenty
+    // of the object's own corners lie inside it — whereas a dot is a small
+    // thing the finger was plainly aimed at.
+    const vertexHit = !(gizmoHit && gizmoHit.kind === 'move') && vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY) : -1;
+    if (vertexHit >= 0) gizmoHit = null;
+    if (gizmoHit) {
+      // Nothing moves here: the drag only records where the object is and
+      // where the finger came down (see beginMoveDrag / beginRotateDrag).
+      if (gizmoHit.kind === 'move') {
+        touchDebug('сцена', `стрілка ${gizmoHit.axis.toUpperCase()} (переміщення об’єкта)`);
+        beginMoveDrag(gizmoHit.axis, rayFromClient(e.clientX, e.clientY));
+      } else {
+        touchDebug('сцена', `кільце ${gizmoHit.axis.toUpperCase()} (обертання об’єкта)`);
+        beginRotateDrag(gizmoHit.axis, e.clientX, e.clientY);
+      }
+      armLongPress(e.clientX, e.clientY);
+    } else if (vertexHit >= 0) {
       touchDebug('сцена', 'вершина об’єкта');
       beginVertexDrag(vertexHit);
-      armLongPress(e.clientX, e.clientY);
-    } else if (gizmoHit.length) {
-      const hitMesh = gizmoHit[0].object;
-      const axisLetter = hitMesh.userData.gizmoAxis;
-      if (gizmoMoveTargets.includes(hitMesh)) {
-        touchDebug('сцена', `стрілка ${axisLetter.toUpperCase()} (переміщення об’єкта)`);
-        beginMoveDrag(axisLetter, rayFromClient(e.clientX, e.clientY));
-      } else {
-        touchDebug('сцена', `кільце ${axisLetter.toUpperCase()} (обертання об’єкта)`);
-        beginRotateDrag(axisLetter, e.clientX, e.clientY);
-      }
       armLongPress(e.clientX, e.clientY);
     } else if (mode === 'edit' && moveMode && selected) {
       moveDragging = true;
@@ -8082,6 +8135,12 @@ window.__creslarnet3d = {
     const offset = new THREE.Vector3(0.35, 0.35, 1).normalize().multiplyScalar(distance);
     camera.position.copy(target).add(offset);
     faceDirection(new THREE.Vector3().subVectors(target, camera.position).normalize());
+  },
+  pickObjectGizmo, slPickHandle,
+  // put the camera at one point looking at another (tests/debugging)
+  lookFrom(from, target) {
+    camera.position.set(from.x, from.y, from.z);
+    faceDirection(new THREE.Vector3(target.x - from.x, target.y - from.y, target.z - from.z).normalize());
   },
   debugGizmo(x, y) {
     scene.updateMatrixWorld(true);
