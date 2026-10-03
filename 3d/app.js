@@ -1164,6 +1164,7 @@ function convertSketchLine(record, targetKind) {
 // ---------------------------------------------------------------------------
 const GIZMO_SIZE = 1.35; // as on the test page — handles sized for a fingertip
 const GIZMO_MODES = ['translate', 'rotate', 'scale'];
+const gizmos = []; // every control made by createGizmo — resized together, see updateGizmoSize
 
 // `handles` — which of the control's stock handles stay, per mode, e.g.
 // { translate: ['X', 'Y', 'Z'] }. The stock gizmo also carries handles that
@@ -1177,7 +1178,7 @@ function createGizmo(space, handles) {
   canvas.removeEventListener('pointerdown', tc._onPointerDown);
   canvas.removeEventListener('pointermove', tc._onPointerHover);
   canvas.removeEventListener('pointerup', tc._onPointerUp);
-  tc.setSize(GIZMO_SIZE);
+  tc.setSize(gizmoSizeNow());
   tc.setSpace(space);
   tc.setRotationSnap(THREE.MathUtils.degToRad(1)); // whole degrees
   for (const m of GIZMO_MODES) {
@@ -1186,6 +1187,7 @@ function createGizmo(space, handles) {
     }
   }
   scene.add(tc);
+  gizmos.push(tc);
   return tc;
 }
 
@@ -1267,11 +1269,29 @@ function releaseGizmo(tc) {
 }
 
 // How far from its centre a gizmo's arrows reach on screen (to the tip of an
-// arrowhead), CSS px — the control sizes its handles as a fixed share of the
-// viewport's height.
+// arrowhead), CSS px. The control sizes its handles as a share of the
+// viewport's HEIGHT — and on a phone held upright that share is more than
+// the narrow side has room for: with the test page's size the arrows
+// spanned ~310 of 360 px, so the heads of the horizontal arrows lay right
+// under the "+ / −" buttons on the right and the "Жила" button on the left,
+// and a touch on an arrowhead went to the button, never to the scene (the
+// test page had no buttons at the sides). The reach is therefore capped at
+// a third of the WIDTH as well: tips stay clear of both edges.
+const GIZMO_REACH_UNITS = 0.6 * (1.9 / 8); // an arrowhead's tip, in "viewport heights per unit of size"
 function gizmoReachPx() {
+  const viewW = renderer.domElement.clientWidth || window.innerWidth || 1;
   const viewH = renderer.domElement.clientHeight || window.innerHeight || 1;
-  return 0.6 * (1.9 / 8) * GIZMO_SIZE * viewH;
+  return Math.min(GIZMO_REACH_UNITS * GIZMO_SIZE * viewH, 0.33 * viewW);
+}
+function gizmoSizeNow() {
+  const viewW = renderer.domElement.clientWidth || window.innerWidth || 1;
+  const viewH = renderer.domElement.clientHeight || window.innerHeight || 1;
+  return Math.min(GIZMO_SIZE, (0.33 * viewW) / (GIZMO_REACH_UNITS * viewH));
+}
+// Every edit-mode frame — the screen may have been turned.
+function updateGizmoSize() {
+  const size = gizmoSizeNow();
+  for (const tc of gizmos) if (tc.size !== size) tc.setSize(size);
 }
 
 // ---------------------------------------------------------------------------
@@ -8395,6 +8415,7 @@ function animate() {
       updateFreeCamera(dt, refDist);
     }
     layoutFlyUi();
+    updateGizmoSize();
     updateObjectGizmo();
     updateSlOverlay();
     updateVertexHandleVisibility();
