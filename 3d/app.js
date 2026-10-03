@@ -4376,9 +4376,9 @@ function cancelLongPress() {
 
 // Armed on a finger going down ON the selected object; fires if the finger
 // then stays put. Until then the same finger is whatever it would have been
-// anyway — a look-drag, or a grab of an arrow/ring/vertex dot that happens
-// to sit over the object — and moving it more than a few pixels calls the
-// long press off.
+// anyway — a look-drag, or a grab of a vertex dot that happens to sit over
+// the object — and moving it more than a few pixels calls the long press
+// off.
 function armLongPress(clientX, clientY) {
   cancelLongPress();
   longPressFired = false;
@@ -4389,10 +4389,10 @@ function armLongPress(clientX, clientY) {
     longPressTimer = null;
     longPressFired = true;
     // Whatever the finger had started on the way down — a look-drag, or a
-    // grab of an arrow/ring/vertex dot that then never moved — is dropped.
+    // grab of a vertex dot that then never moved — is dropped. (A finger on
+    // an arrow or a ring never arms this: it is the gizmo's alone.)
     lookPointerId = null;
     if (vertexDrag) endVertexDrag(true);
-    if (objectGizmo.dragging) releaseGizmo(objectGizmo);
     showPropsIcon(clientX, clientY);
   }, LONG_PRESS_MS);
 }
@@ -6536,6 +6536,19 @@ function gizmoDragActive() {
 // Tap the line itself to hide it. To be removed once touch handling is
 // confirmed on the device.
 // ---------------------------------------------------------------------------
+// Which build is on screen, small in the corner: this file's own version
+// (bumped together with CACHE_NAME in service-worker.js) and the cache(s)
+// the installed copy actually holds. If the two disagree, or the number is
+// not the latest one, the phone is showing an old copy.
+const APP_VERSION = 'v19';
+const appVersionEl = document.getElementById('appVersion');
+appVersionEl.textContent = APP_VERSION;
+if (window.caches && window.caches.keys) {
+  window.caches.keys()
+    .then((names) => { appVersionEl.textContent = `${APP_VERSION} · кеш: ${names.map((n) => n.replace('creslarnet-', '')).join(', ') || 'немає'}`; })
+    .catch(() => {});
+}
+
 const touchDebugEl = document.getElementById('touchDebug');
 let touchDebugCount = 0, touchDebugBase = '';
 function touchDebug(target, part) {
@@ -6579,6 +6592,86 @@ function currentPinchMidpoint() {
   return { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
 }
 
+// ---------------------------------------------------------------------------
+// The object gizmo gets a touch FIRST and keeps it to itself — as on the
+// test page (gizmo-test.html), where the control had the canvas to itself.
+// These listeners run before the pointer pipeline below (capture phase, and
+// registered ahead of it); a finger that lands on an arrow or a ring is
+// taken here and hidden from everything else from touch-down to lift-off:
+// the pipeline never learns that finger exists, so no look-drag, pinch,
+// long press, tap-to-select or tool can act on it. In the pipeline the same
+// finger used to arm the long press as well — an arrow lies over its own
+// object, so a drag that began slowly (under 8 px in the first half second)
+// was let go of mid-way and the "Властивості" chip popped up instead.
+// While a handle is held, any other finger on the scene does nothing.
+// ---------------------------------------------------------------------------
+let gizmoPointerId = null;               // the finger holding an arrow/ring of the object gizmo
+const gizmoBlockedPointers = new Set();  // fingers that came down during that drag — nobody's
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.isPrimary && e.pointerType === 'touch') {
+    // The first finger of a new touch: no other finger is on the screen, so
+    // anything still on record is a touch whose end never arrived. Left in
+    // place it would turn every later single touch into a "pinch" (the
+    // gizmo is never asked, the selected object gets resized instead).
+    activePointers.clear();
+    gizmoBlockedPointers.clear();
+    pinchStartDist = 0; pinchStartScale = null; lookPointerId = null;
+    if (gizmoPointerId !== null) { gizmoPointerId = null; if (objectGizmo.dragging) releaseGizmo(objectGizmo); }
+  }
+  if (gizmoPointerId !== null) {
+    gizmoBlockedPointers.add(e.pointerId);
+    e.stopImmediatePropagation();
+    return;
+  }
+  if (activePointers.size > 0 || mode !== 'edit' || !selected || !objectGizmo.object) return;
+  // A gizmo just attached (no frame drawn since) can still have a stale
+  // matrixWorld — force it current before raycasting.
+  scene.updateMatrixWorld(true);
+  if (!pickGizmo(objectGizmo, e.clientX, e.clientY)) return;
+  // An ARROW under the finger always wins — moving the object must never
+  // turn into something else. A rotate ring gives way to a vertex dot: its
+  // touch zone is a wide invisible band right round the object, plenty of
+  // the object's own corners lie inside it, whereas a dot is a small thing
+  // the finger was plainly aimed at.
+  const arrow = objectGizmo.mode === 'translate';
+  if (!arrow && vertexEditAllowed() && pickVertexHandle(e.clientX, e.clientY) >= 0) return;
+  // Nothing moves on the way down: the grab only records where the object
+  // is and where the finger landed (see grabGizmo).
+  if (!grabGizmo(objectGizmo, e.clientX, e.clientY)) return;
+  gizmoPointerId = e.pointerId;
+  e.stopImmediatePropagation();
+  try { canvas.setPointerCapture?.(e.pointerId); } catch (err) { /* the touch is the canvas's anyway */ }
+  if (autoRotateActive) setAutoRotate(false);
+  hidePropsIcon();
+  cancelLongPress();
+  longPressFired = false;
+  touchDebug('сцена', arrow ? `стрілка ${objectGizmo.axis} (переміщення об’єкта)` : `кільце ${objectGizmo.axis} (обертання об’єкта)`);
+}, true);
+
+canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerId === gizmoPointerId) {
+    e.stopImmediatePropagation();
+    if (objectGizmo.dragging) dragObjectGizmo(e.clientX, e.clientY);
+  } else if (gizmoBlockedPointers.has(e.pointerId)) {
+    e.stopImmediatePropagation();
+  }
+}, true);
+
+// Lift-off, or the touch was taken away: the object stays where the drag
+// left it. Not a tap — the pipeline's endPointer never sees it.
+function endGizmoPointer(e) {
+  if (e.pointerId === gizmoPointerId) {
+    gizmoPointerId = null;
+    if (objectGizmo.dragging) releaseGizmo(objectGizmo);
+    e.stopImmediatePropagation();
+  } else if (gizmoBlockedPointers.delete(e.pointerId)) {
+    e.stopImmediatePropagation();
+  }
+}
+window.addEventListener('pointerup', endGizmoPointer, true);
+window.addEventListener('pointercancel', endGizmoPointer, true);
+
 canvas.addEventListener('pointerdown', (e) => {
   if (autoRotateActive) setAutoRotate(false); // any touch takes control back, even a plain tap with no drag
   activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -6590,29 +6683,11 @@ canvas.addEventListener('pointerdown', (e) => {
     primaryPointerId = e.pointerId;
     downX = e.clientX; downY = e.clientY; downTime = performance.now();
 
-    // A gizmo just attached this frame (or one that hasn't been touched
-    // since) can still have a stale/identity matrixWorld if no render has
-    // run yet — force it current before raycasting, same as the paper-draw
-    // hit-test below does. Without this, a click that visually lands right
-    // on a ring can silently miss it and fall through to "look around".
-    const gizmoOn = mode === 'edit' && selected && objectGizmo.object;
-    if (gizmoOn) scene.updateMatrixWorld(true);
-    let gizmoHit = gizmoOn ? pickGizmo(objectGizmo, e.clientX, e.clientY) : null;
-    // Who gets a touch, in order: an ARROW the finger is on (always — moving
-    // the object must never turn into something else); then a vertex dot
-    // under the finger; then a rotate ring. A ring comes last because its
-    // touch zone is a wide invisible band right round the object — plenty
-    // of the object's own corners lie inside it — whereas a dot is a small
-    // thing the finger was plainly aimed at.
-    const arrowHit = !!gizmoHit && objectGizmo.mode === 'translate';
-    const vertexHit = !arrowHit && vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY) : -1;
-    if (vertexHit >= 0) gizmoHit = null;
-    // Nothing moves on the way down: the grab only records where the object
-    // is and where the finger landed (see grabGizmo).
-    if (gizmoHit && grabGizmo(objectGizmo, e.clientX, e.clientY)) {
-      touchDebug('сцена', arrowHit ? `стрілка ${objectGizmo.axis} (переміщення об’єкта)` : `кільце ${objectGizmo.axis} (обертання об’єкта)`);
-      armLongPress(e.clientX, e.clientY);
-    } else if (vertexHit >= 0) {
+    // A touch on an arrow or a ring of the object gizmo never gets here —
+    // it was taken above (see "The object gizmo gets a touch FIRST"). Next
+    // in line is a vertex dot under the finger.
+    const vertexHit = vertexEditAllowed() ? pickVertexHandle(e.clientX, e.clientY) : -1;
+    if (vertexHit >= 0) {
       touchDebug('сцена', 'вершина об’єкта');
       beginVertexDrag(vertexHit);
       armLongPress(e.clientX, e.clientY);
@@ -6698,10 +6773,6 @@ canvas.addEventListener('pointermove', (e) => {
   if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (longPressTimer && (activePointers.size > 1 || Math.hypot(e.clientX - downX, e.clientY - downY) > LONG_PRESS_SLOP_PX)) cancelLongPress();
 
-  if (objectGizmo.dragging && e.pointerId === primaryPointerId) {
-    dragObjectGizmo(e.clientX, e.clientY);
-    return;
-  }
   if (vertexDrag && e.pointerId === primaryPointerId) {
     updateVertexDrag(e.clientX, e.clientY);
     return;
@@ -6828,7 +6899,6 @@ canvas.addEventListener('pointermove', (e) => {
 
 function endPointer(e) {
   const wasPinching = activePointers.size >= 2 && pinchStartDist > 0;
-  const wasGizmoDrag = objectGizmo.dragging;
   cancelLongPress();
   activePointers.delete(e.pointerId);
   if (activePointers.size < 2) {
@@ -6839,7 +6909,6 @@ function endPointer(e) {
     walkTouchForward = 0; walkPinchAnchorY = null;
   }
   if (lookPointerId === e.pointerId) lookPointerId = null;
-  if (e.pointerId === primaryPointerId && objectGizmo.dragging) releaseGizmo(objectGizmo); // let go (or the touch was taken away) — the object stays where the drag left it
   if (vertexDrag && e.pointerId === primaryPointerId) { endVertexDrag(e.type === 'pointercancel'); return; } // a vertex drag is never a tap
   if (clayTool.stroke && e.pointerId === primaryPointerId) { endClayStroke(); renderClayPill(); return; } // nor is a stroke on clay
   if (tapeTool.stroke && e.pointerId === primaryPointerId) { endTapeStroke(e.type === 'pointercancel'); return; } // the tape decides tap-or-drag itself
@@ -6854,7 +6923,6 @@ function endPointer(e) {
   }
 
   if (longPressFired) { longPressFired = false; return; } // the long press already did its thing — its release isn't a tap
-  if (wasGizmoDrag) return; // a gizmo drag is never a tap
   if (mode === 'edit' && moveMode) { moveDragging = false; return; }
   if (mode === 'edit' && paperDrawing) {
     if (paperDrawDragging && drawStartWorld && selected && e.pointerId === primaryPointerId) {

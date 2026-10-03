@@ -3,7 +3,8 @@
 // purges the cache-first bucket below. Everyday app files (html/css/js/json)
 // no longer need a version bump to show up: they're served network-first,
 // so a plain reload while online always gets the latest copy.
-const CACHE_NAME = 'creslarnet-v18';
+// (Keep APP_VERSION in 3d/app.js in step — it is what the 3D screen shows.)
+const CACHE_NAME = 'creslarnet-v19';
 
 // Everything the installed app needs to run with no connection at all —
 // the 2D sheet AND the whole 3D mode with its three.js files. All of it is

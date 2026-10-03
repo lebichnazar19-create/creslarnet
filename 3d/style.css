@@ -513,6 +513,20 @@ html, body {
   white-space: normal;
 }
 
+/* ---------- which build is open (bottom right corner, under the axes widget) ---------- */
+.app-version {
+  position: fixed;
+  right: max(4px, env(safe-area-inset-right));
+  bottom: max(2px, env(safe-area-inset-bottom));
+  z-index: 30;
+  pointer-events: none;
+  color: rgba(255, 255, 255, 0.6);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 9px;
+  line-height: 1.2;
+  text-shadow: 0 0 2px #000;
+}
+
 /* ---------- "Просторова лінія" — own corner button, not in the toolbar ---------- */
 .fab {
   position: fixed;
