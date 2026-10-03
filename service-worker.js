@@ -3,8 +3,14 @@
 // purges the cache-first bucket below. Everyday app files (html/css/js/json)
 // no longer need a version bump to show up: they're served network-first,
 // so a plain reload while online always gets the latest copy.
-const CACHE_NAME = 'creslarnet-v17';
+const CACHE_NAME = 'creslarnet-v18';
 
+// Everything the installed app needs to run with no connection at all —
+// the 2D sheet AND the whole 3D mode with its three.js files. All of it is
+// fetched the moment the service worker installs (i.e. on the first visit
+// while online), so "Встановити застосунок" on the phone gives a copy that
+// works offline right away, not only for the pages that happened to be
+// opened online before.
 const APP_SHELL = [
   './',
   './index.html',
@@ -14,12 +20,28 @@ const APP_SHELL = [
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/icon-maskable-512.png',
+  './icons/apple-touch-icon.png',
+  './3d/index.html',
+  './3d/style.css',
+  './3d/app.js',
+  './3d/csg.js',
+  './3d/materials.js',
+  './3d/gizmo-test.html',
+  './3d/vendor/three/three.module.min.js',
+  './3d/vendor/three/TransformControls.js',
+  './3d/vendor/three/OrbitControls.js',
+  './3d/vendor/three/RoomEnvironment.js',
 ];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME)
-      .then((cache) => cache.addAll(APP_SHELL))
+      // One file at a time rather than cache.addAll: with addAll a single
+      // file that fails to download (a flaky connection mid-install) throws
+      // the whole install away, and the app isn't installable at all until
+      // the next try. Whatever did download is kept; a missing file is
+      // fetched and cached the first time it's actually requested.
+      .then((cache) => Promise.allSettled(APP_SHELL.map((url) => cache.add(url))))
       .then(() => self.skipWaiting()) // activate this version immediately, don't wait for old tabs to close
   );
 });
